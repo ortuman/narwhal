@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Ok;
+use async_broadcast;
+use async_channel;
 use async_lock::RwLock;
-use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
+use futures::FutureExt;
 use tracing::{error, trace, warn};
 
 use narwhal_common::conn::{ConnTx, State};
@@ -22,11 +23,11 @@ use narwhal_protocol::{
 use narwhal_util::pool::PoolBuffer;
 use narwhal_util::string_atom::StringAtom;
 
-use crate::client::M2sClient;
 use crate::modulator::{
   AuthRequest, AuthResult, ForwardBroadcastPayloadRequest, ForwardBroadcastPayloadResult, ForwardEventRequest,
   Operation, OutboundPrivatePayload, ReceivePrivatePayloadRequest, SendPrivatePayloadRequest, SendPrivatePayloadResult,
 };
+use narwhal_client::compio::m2s::M2sClient;
 
 use crate::{M2sServerConfig, Modulator, S2mServerConfig};
 
@@ -42,14 +43,14 @@ pub struct M2sDispatcherFactory(Arc<RwLock<M2sDispatcherFactoryInner>>);
 // ===== impl M2sDispatcherFactory =====
 
 impl M2sDispatcherFactory {
-  pub fn new(config: Arc<M2sServerConfig>, payload_tx: broadcast::Sender<OutboundPrivatePayload>) -> Self {
+  pub fn new(config: Arc<M2sServerConfig>, payload_tx: async_broadcast::Sender<OutboundPrivatePayload>) -> Self {
     let inner = M2sDispatcherFactoryInner { config, payload_tx };
 
     Self(Arc::new(RwLock::new(inner)))
   }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl narwhal_common::conn::DispatcherFactory<M2sDispatcher> for M2sDispatcherFactory {
   async fn create(&mut self, handler: usize, tx: ConnTx) -> M2sDispatcher {
     let inner = self.0.read().await;
@@ -72,7 +73,7 @@ pub struct M2sDispatcherFactoryInner {
   config: Arc<M2sServerConfig>,
 
   /// The broadcast sender for outbound private payloads.
-  payload_tx: broadcast::Sender<OutboundPrivatePayload>,
+  payload_tx: async_broadcast::Sender<OutboundPrivatePayload>,
 }
 
 /// A M2S dispatcher that handles incoming messages.
@@ -87,7 +88,7 @@ pub struct M2sDispatcher {
   tx: ConnTx,
 
   /// The broadcast sender for outbound private payloads.
-  payload_tx: broadcast::Sender<OutboundPrivatePayload>,
+  payload_tx: async_broadcast::Sender<OutboundPrivatePayload>,
 }
 
 impl Debug for M2sDispatcher {
@@ -104,13 +105,13 @@ impl M2sDispatcher {
     handler: usize,
     config: Arc<M2sServerConfig>,
     tx: ConnTx,
-    payload_tx: broadcast::Sender<OutboundPrivatePayload>,
+    payload_tx: async_broadcast::Sender<OutboundPrivatePayload>,
   ) -> Self {
     Self { handler, config, tx, payload_tx }
   }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl narwhal_common::conn::Dispatcher for M2sDispatcher {
   /// Dispatches incoming messages based on the current connection state.
   ///
@@ -275,7 +276,7 @@ impl M2sDispatcher {
 
     // Send the payload through the broadcast channel
     // Ignore errors if there are no receivers
-    let _ = self.payload_tx.send(outbound_payload);
+    let _ = self.payload_tx.try_broadcast(outbound_payload);
 
     // Send acknowledgment
     let ack_msg = Message::M2sModDirectAck(M2sModDirectAckParameters { id: params.id });
@@ -308,22 +309,26 @@ pub struct S2mDispatcherFactoryInner<M: Modulator> {
   m2s_client: Option<M2sClient>,
 
   /// Handle to the private payload reader task.
-  payload_reader_handle: Option<tokio::task::JoinHandle<()>>,
+  payload_reader_handle: Option<compio::runtime::JoinHandle<()>>,
 
-  /// Cancellation token for graceful shutdown.
-  cancellation_token: CancellationToken,
+  /// Shutdown sender for graceful shutdown.
+  shutdown_tx: async_channel::Sender<()>,
+
+  /// Shutdown receiver for graceful shutdown.
+  shutdown_rx: async_channel::Receiver<()>,
 }
 
 // ===== impl S2mDispatcherFactory =====
 
 impl<M: Modulator> S2mDispatcherFactory<M> {
   pub fn new(config: Arc<S2mServerConfig>, modulator: Arc<M>) -> Self {
-    let cancellation_token = CancellationToken::new();
+    let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
 
     let inner = S2mDispatcherFactoryInner {
       config,
       modulator,
-      cancellation_token: cancellation_token.clone(),
+      shutdown_tx,
+      shutdown_rx,
       payload_reader_handle: None,
       m2s_client: None,
     };
@@ -332,13 +337,13 @@ impl<M: Modulator> S2mDispatcherFactory<M> {
   }
 
   async fn payload_reader_loop(
-    mut rx: broadcast::Receiver<OutboundPrivatePayload>,
+    mut rx: async_broadcast::Receiver<OutboundPrivatePayload>,
     m2s_client: M2sClient,
-    cancellation_token: CancellationToken,
+    shutdown_rx: async_channel::Receiver<()>,
   ) {
     loop {
-      tokio::select! {
-        result = rx.recv() => {
+      futures::select! {
+        result = rx.recv().fuse() => {
           match result {
             std::result::Result::Ok(outbound) => {
                 match m2s_client.route_private_payload(outbound.payload, outbound.targets).await {
@@ -346,15 +351,15 @@ impl<M: Modulator> S2mDispatcherFactory<M> {
                     Err(err) => warn!("failed to route private payload: {}", err),
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => {
+            Err(async_broadcast::RecvError::Overflowed(_)) => {
               continue;
             }
-            Err(broadcast::error::RecvError::Closed) => {
+            Err(async_broadcast::RecvError::Closed) => {
               break;
             }
           }
         }
-        _ = cancellation_token.cancelled() => {
+        _ = shutdown_rx.recv().fuse() => {
           break;
         }
       }
@@ -362,7 +367,7 @@ impl<M: Modulator> S2mDispatcherFactory<M> {
   }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl<M: Modulator> narwhal_common::conn::DispatcherFactory<S2mDispatcher<M>> for S2mDispatcherFactory<M> {
   async fn create(&mut self, handler: usize, tx: ConnTx) -> S2mDispatcher<M> {
     let inner = self.0.read().await;
@@ -373,19 +378,19 @@ impl<M: Modulator> narwhal_common::conn::DispatcherFactory<S2mDispatcher<M>> for
   async fn bootstrap(&mut self) -> anyhow::Result<()> {
     let mut inner = self.0.write().await;
 
-    assert!(!inner.cancellation_token.is_cancelled());
+    assert!(!inner.shutdown_tx.is_closed());
 
     if inner.modulator.operations().await?.contains(Operation::ReceivePrivatePayload) {
       // Initialize the M2S client
-      let m2s_client = M2sClient::new(inner.config.m2s_client.clone())?;
+      let m2s_client = M2sClient::new(inner.config.m2s_client.clone().into())?;
       inner.m2s_client = Some(m2s_client.clone());
 
       // Spawn the payload reader loop
       let response = inner.modulator.receive_private_payload(ReceivePrivatePayloadRequest {}).await?;
       let rx = response.receiver;
-      let cancellation_token = inner.cancellation_token.clone();
+      let shutdown_rx = inner.shutdown_rx.clone();
 
-      let handle = tokio::spawn(Self::payload_reader_loop(rx, m2s_client.clone(), cancellation_token));
+      let handle = compio::runtime::spawn(Self::payload_reader_loop(rx, m2s_client.clone(), shutdown_rx));
       inner.payload_reader_handle = Some(handle);
     }
     Ok(())
@@ -394,9 +399,7 @@ impl<M: Modulator> narwhal_common::conn::DispatcherFactory<S2mDispatcher<M>> for
   async fn shutdown(&mut self) -> anyhow::Result<()> {
     let mut inner = self.0.write().await;
 
-    assert!(!inner.cancellation_token.is_cancelled());
-
-    inner.cancellation_token.cancel();
+    inner.shutdown_tx.close();
 
     if let Some(handle) = inner.payload_reader_handle.take() {
       let _ = handle.await;
@@ -437,7 +440,7 @@ impl<M: Modulator> S2mDispatcher<M> {
   }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl<M: Modulator> narwhal_common::conn::Dispatcher for S2mDispatcher<M> {
   /// Dispatches incoming messages based on the current connection state.
   ///

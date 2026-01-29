@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ListenerConfig {
@@ -25,6 +25,11 @@ pub struct ListenerConfig {
   /// The port to bind to.
   #[serde(default = "default_port")]
   pub port: u16,
+
+  /// The number of worker threads for the connection pool.
+  /// When set to 0 (default), uses the number of available CPU cores.
+  #[serde(default = "default_workers_count")]
+  pub workers_count: usize,
 }
 
 impl Default for ListenerConfig {
@@ -35,6 +40,7 @@ impl Default for ListenerConfig {
       key_file: String::new(),
       bind_address: default_bind_address(),
       port: default_port(),
+      workers_count: default_workers_count(),
     }
   }
 }
@@ -100,6 +106,10 @@ fn default_bind_address() -> String {
 
 fn default_port() -> u16 {
   22622
+}
+
+fn default_workers_count() -> usize {
+  0
 }
 
 fn default_connect_timeout() -> Duration {

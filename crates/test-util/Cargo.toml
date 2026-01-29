@@ -5,18 +5,18 @@ edition = "2024"
 license = "BSD-3-Clause"
 
 [dependencies]
-anyhow = "1.0.98"
-async-trait = "0.1.88"
-core_affinity = "0.8.1"
-futures = "0.3"
-tokio = { version = "1.48.0", features = ["full"] }
-tokio-util = "0.7.16"
-tokio-rustls = "0.26.4"
+anyhow = "1.0.101"
+async-trait = "0.1.89"
+compio = { version = "0.18.0", features = ["net", "time"] }
+compio-tls = { version = "0.9.0", features = ["rustls"] }
+futures = "0.3.32"
+async-broadcast = "0.7.2"
+async-channel = "2.5.0"
+narwhal-client = { path = "../client" }
 narwhal-common = { path = "../common" }
 narwhal-modulator = { path = "../modulator" }
 narwhal-protocol = { path = "../protocol" }
 narwhal-server = { path = "../server" }
 narwhal-util = { path = "../util" }
-rustls = "0.23.32"
-webpki-roots = "1.0.3"
-pki-types = { package = "rustls-pki-types", version = "1" }
+rustls = "0.23.36"
+webpki-roots = "1.0.6"

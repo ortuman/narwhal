@@ -2,7 +2,7 @@
 
 pub mod config;
 
-pub mod client;
+mod client;
 pub mod conn;
 pub mod listener;
 pub mod modulator;
@@ -10,17 +10,17 @@ pub mod modulator;
 use std::sync::Arc;
 
 use anyhow::Ok;
-use serde_derive::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use narwhal_common::conn::ConnManager;
 use narwhal_common::service::{M2sService, S2mService};
 
-use crate::client::S2mClient;
 pub use crate::config::*;
 pub use crate::listener::{M2sListener, S2mListener};
 pub use crate::modulator::{Modulator, OutboundPrivatePayload};
+use narwhal_client::compio::s2m::S2mClient;
 
 /// The S2M modulator type.
 pub const S2M_CLIENT_MODULATOR: &str = "s2m";
@@ -59,7 +59,7 @@ pub struct ModulatorService {
   pub modulator: Option<Arc<dyn Modulator>>,
 
   /// The M2S private payload receiver, if applicable
-  pub m2s_payload_rx: Option<broadcast::Receiver<OutboundPrivatePayload>>,
+  pub m2s_payload_rx: Option<async_broadcast::Receiver<OutboundPrivatePayload>>,
 
   /// The maximum size of a message that can be sent to the modulator.
   pub adjusted_max_message_size: u32,
@@ -156,7 +156,6 @@ pub async fn init_modulator(
   config: Config,
   c2s_max_message_size: u32,
   c2s_max_payload_size: u32,
-  worker_threads: usize,
 ) -> anyhow::Result<ModulatorService> {
   if config.r#type.is_empty() {
     return Ok(ModulatorService {
@@ -170,13 +169,13 @@ pub async fn init_modulator(
 
   match config.r#type.as_str() {
     S2M_CLIENT_MODULATOR => {
-      let s2m_client = S2mClient::new(config.s2m_client.clone())?;
+      let s2m_client = S2mClient::new(config.s2m_client.clone().into())?;
 
       // Test the connection to the modulator.
-      let session_info =
+      let (session_info, _) =
         s2m_client.session_info().await.map_err(|e| anyhow::anyhow!("failed to connect to s2m server: {}", e))?;
 
-      let is_tcp_socket = config.s2m_client.network == narwhal_common::client::TCP_NETWORK;
+      let is_tcp_socket = config.s2m_client.network == narwhal_client::TCP_NETWORK;
 
       if is_tcp_socket {
         info!(network = config.s2m_client.network, address = config.s2m_client.address, "s2m connection established");
@@ -214,7 +213,7 @@ pub async fn init_modulator(
       }
 
       let mut m2s_ln: Option<M2sListener> = None;
-      let mut m2s_payload_rx: Option<broadcast::Receiver<OutboundPrivatePayload>> = None;
+      let mut m2s_payload_rx: Option<async_broadcast::Receiver<OutboundPrivatePayload>> = None;
 
       if config.m2s_server.is_configured() {
         let mut m2s_config = config.m2s_server.clone();
@@ -222,9 +221,9 @@ pub async fn init_modulator(
         m2s_config.limits.max_message_size = m2s_config.limits.max_message_size.min(adjusted_max_message_size);
         m2s_config.limits.max_payload_size = m2s_config.limits.max_payload_size.min(adjusted_max_payload_size);
 
-        let (payload_tx, payload_rx) = broadcast::channel(M2S_SERVER_QUEUE_SIZE);
+        let (payload_tx, payload_rx) = async_broadcast::broadcast(M2S_SERVER_QUEUE_SIZE);
 
-        m2s_ln = Some(create_m2s_listener(m2s_config, payload_tx, worker_threads).await?);
+        m2s_ln = Some(create_m2s_listener(m2s_config, payload_tx).await?);
         m2s_payload_rx = Some(payload_rx);
       }
 
@@ -260,11 +259,7 @@ pub async fn init_modulator(
 ///
 /// Returns an `S2mListener` on success, or an error if:
 /// - Configuration validation fails
-pub async fn create_s2m_listener<M>(
-  config: S2mServerConfig,
-  modulator: M,
-  worker_threads: usize,
-) -> anyhow::Result<S2mListener<M>>
+pub async fn create_s2m_listener<M>(config: S2mServerConfig, modulator: M) -> anyhow::Result<S2mListener<M>>
 where
   M: Modulator,
 {
@@ -276,9 +271,9 @@ where
 
   let server_config = arc_config.server.clone();
 
-  let conn_mng = ConnManager::<S2mService>::new(&server_config);
+  let conn_mng = ConnManager::<S2mService>::new(&server_config).await;
 
-  Ok(S2mListener::new(arc_config.server.listener.clone(), conn_mng, dispatcher_factory, worker_threads))
+  Ok(S2mListener::new(arc_config.server.listener.clone(), conn_mng, dispatcher_factory))
 }
 
 /// Creates an M2S listener.
@@ -295,8 +290,7 @@ where
 /// - Configuration validation fails
 pub async fn create_m2s_listener(
   config: M2sServerConfig,
-  payload_tx: broadcast::Sender<OutboundPrivatePayload>,
-  worker_threads: usize,
+  payload_tx: async_broadcast::Sender<OutboundPrivatePayload>,
 ) -> anyhow::Result<M2sListener> {
   config.validate().map_err(|e| anyhow::anyhow!("failed to validate m2s server configuration: {}", e))?;
 
@@ -304,7 +298,7 @@ pub async fn create_m2s_listener(
 
   let dispatcher_factory = conn::M2sDispatcherFactory::new(arc_config.clone(), payload_tx);
 
-  let conn_mng = ConnManager::<M2sService>::new(arc_config.as_ref());
+  let conn_mng = ConnManager::<M2sService>::new(arc_config.as_ref()).await;
 
-  Ok(M2sListener::new(arc_config.listener.clone(), conn_mng, dispatcher_factory, worker_threads))
+  Ok(M2sListener::new(arc_config.listener.clone(), conn_mng, dispatcher_factory))
 }

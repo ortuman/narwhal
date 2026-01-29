@@ -31,14 +31,6 @@ use crate::transmitter::{Resource, Transmitter};
 /// The C2S connection manager.
 pub type C2sConnManager = narwhal_common::conn::ConnManager<C2sService>;
 
-/// The C2S connection worker pool type.
-pub type C2sConnWorkerPool = narwhal_common::conn::ConnWorkerPool<
-  c2s::MaybeKtlsStream,
-  c2s::conn::C2sDispatcher,
-  c2s::conn::C2sDispatcherFactory,
-  C2sService,
->;
-
 #[derive(Clone)]
 /// A transmitter implementation for C2S connections.
 ///
@@ -104,7 +96,7 @@ impl C2sDispatcherFactory {
   }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl narwhal_common::conn::DispatcherFactory<C2sDispatcher> for C2sDispatcherFactory {
   async fn create(&mut self, handler: usize, tx: ConnTx) -> C2sDispatcher {
     let inner = self.0.read().await;
@@ -993,7 +985,7 @@ impl C2sDispatcherInner {
   }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl narwhal_common::conn::Dispatcher for C2sDispatcher {
   async fn dispatch_message(
     &mut self,

@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
-use pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
-use rustls::{DigitallySignedStruct, Error, SignatureScheme};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error, RootCertStore, SignatureScheme};
 
 #[derive(Debug)]
 pub struct NoCertificateVerification {}

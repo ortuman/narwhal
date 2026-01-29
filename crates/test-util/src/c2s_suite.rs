@@ -5,15 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use tokio::net::TcpStream;
-use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
-use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
-use tokio_util::sync::CancellationToken;
+use async_broadcast;
+use async_channel;
+use compio::net::TcpStream;
+use compio_tls::{TlsConnector, TlsStream};
 
-use narwhal_modulator::client::S2mClient;
+use narwhal_client::compio::s2m::S2mClient;
 use narwhal_modulator::{Modulator, OutboundPrivatePayload};
 use narwhal_protocol::{
   AclAction, AclType, BroadcastParameters, ConnectParameters, IdentifyParameters, JoinChannelParameters,
@@ -39,33 +36,31 @@ pub struct C2sSuite {
   local_router: c2s::Router,
 
   /// The M2S payload receiver.
-  m2s_payload_rx: Option<broadcast::Receiver<OutboundPrivatePayload>>,
+  m2s_payload_rx: Option<async_broadcast::Receiver<OutboundPrivatePayload>>,
 
   /// The M2S payload router task handle.
-  m2s_router_task_handle: Option<(JoinHandle<()>, CancellationToken)>,
+  m2s_router_task_handle: Option<(compio::runtime::JoinHandle<()>, async_channel::Sender<()>)>,
 
   /// Authenticated clients by username.
-  clients: HashMap<String, TestConn<Compat<TlsStream<TcpStream>>>>,
+  clients: HashMap<String, TestConn<TlsStream<TcpStream>>>,
 }
 
 // ===== impl C2sSuite =====
 
-impl Default for C2sSuite {
-  fn default() -> Self {
-    Self::new(c2s::Config::default())
-  }
-}
-
 impl C2sSuite {
-  pub fn new(config: c2s::Config) -> Self {
-    Self::with_modulator(config, None, None)
+  pub async fn default() -> anyhow::Result<Self> {
+    Self::new(c2s::Config::default()).await
   }
 
-  pub fn with_modulator(
+  pub async fn new(config: c2s::Config) -> anyhow::Result<Self> {
+    Self::with_modulator(config, None, None).await
+  }
+
+  pub async fn with_modulator(
     config: c2s::Config,
     s2m_client: Option<S2mClient>,
-    m2s_payload_rx: Option<broadcast::Receiver<OutboundPrivatePayload>>,
-  ) -> Self {
+    m2s_payload_rx: Option<async_broadcast::Receiver<OutboundPrivatePayload>>,
+  ) -> anyhow::Result<Self> {
     let arc_config = Arc::new(config);
 
     let local_domain = StringAtom::from("localhost");
@@ -91,14 +86,6 @@ impl C2sSuite {
       max_payload_size,
     );
 
-    let dispatcher_factory = tokio::task::block_in_place(|| {
-      tokio::runtime::Handle::current().block_on(async {
-        c2s::conn::C2sDispatcherFactory::new(arc_config.clone(), channel_mng.clone(), c2s_router.clone(), modulator)
-          .await
-      })
-    })
-    .expect("failed to create C2sDispatcherFactory");
-
     let conn_cfg = narwhal_common::conn::Config {
       max_connections: arc_config.limits.max_connections,
       max_message_size: arc_config.limits.max_message_size,
@@ -113,18 +100,22 @@ impl C2sSuite {
       rate_limit: arc_config.limits.rate_limit,
     };
 
-    let conn_mng = c2s::conn::C2sConnManager::new(conn_cfg);
+    let conn_mng = c2s::conn::C2sConnManager::new(conn_cfg).await;
 
-    let ln = c2s::C2sListener::new(arc_config.listener.clone(), conn_mng.clone(), dispatcher_factory, 1);
+    let dispatcher_factory =
+      c2s::conn::C2sDispatcherFactory::new(arc_config.clone(), channel_mng.clone(), c2s_router.clone(), modulator)
+        .await?;
 
-    Self {
+    let ln = c2s::C2sListener::new(arc_config.listener.clone(), conn_mng.clone(), dispatcher_factory);
+
+    Ok(Self {
       config: arc_config,
       ln,
       m2s_payload_rx,
       m2s_router_task_handle: None,
       local_router: c2s_router,
       clients: HashMap::new(),
-    }
+    })
   }
 
   pub fn config(&self) -> Arc<c2s::Config> {
@@ -143,14 +134,14 @@ impl C2sSuite {
   pub async fn teardown(&mut self) -> anyhow::Result<()> {
     self.ln.shutdown().await?;
 
-    if let Some((handle, cancellation_token)) = self.m2s_router_task_handle.take() {
-      cancellation_token.cancel();
+    if let Some((handle, shutdown_tx)) = self.m2s_router_task_handle.take() {
+      shutdown_tx.close();
       let _ = handle.await;
     }
     Ok(())
   }
 
-  pub async fn tls_socket_connect(&self) -> anyhow::Result<TestConn<Compat<TlsStream<TcpStream>>>> {
+  pub async fn tls_socket_connect(&self) -> anyhow::Result<TestConn<TlsStream<TcpStream>>> {
     let domain = self.config.listener.domain.clone();
     assert_eq!(self.config.listener.domain, "localhost", "domain is not localhost");
 
@@ -159,11 +150,9 @@ impl C2sSuite {
     let tcp_stream = TcpStream::connect(&addr).await?;
 
     let client_config = crate::tls::make_tls_client_config();
+    let connector = TlsConnector::from(client_config);
 
-    let domain = pki_types::ServerName::try_from(domain)?.to_owned();
-    let config = TlsConnector::from(client_config);
-
-    let tls_stream = config.connect(domain, tcp_stream).await?.compat();
+    let tls_stream = connector.connect(&domain, tcp_stream).await?;
 
     let max_message_size = self.config().limits.max_message_size as usize;
 
@@ -182,7 +171,11 @@ impl C2sSuite {
       .await?;
 
     let client_connected_msg = tls_socket.read_message().await?;
-    assert!(matches!(client_connected_msg, Message::ConnectAck { .. }));
+    assert!(
+      matches!(client_connected_msg, Message::ConnectAck { .. }),
+      "expected ConnectAck, got: {:?}",
+      client_connected_msg
+    );
 
     tls_socket.write_message(Message::Identify(IdentifyParameters { username: StringAtom::from(username) })).await?;
 
@@ -332,19 +325,10 @@ impl C2sSuite {
 
   pub async fn expect_read_timeout(&mut self, username: &str, timeout: Duration) -> anyhow::Result<()> {
     let tls_socket = self.get_tls_socket(username)?;
-
-    let reader = &mut tls_socket.reader;
-
-    // Set a timeout for reading the message
-    match tokio::time::timeout(timeout, reader.next()).await {
-      Ok(Ok(true)) => Err(anyhow!("expected timeout, but received a message")),
-      Ok(Ok(false)) => Err(anyhow!("no message received")),
-      Ok(Err(e)) => Err(anyhow!("error reading from stream: {}", e)),
-      Err(_) => Ok(()),
-    }
+    tls_socket.expect_read_timeout(timeout).await
   }
 
-  fn get_tls_socket(&mut self, username: &str) -> anyhow::Result<&mut TestConn<Compat<TlsStream<TcpStream>>>> {
+  fn get_tls_socket(&mut self, username: &str) -> anyhow::Result<&mut TestConn<TlsStream<TcpStream>>> {
     self.clients.get_mut(username).ok_or_else(|| anyhow!("client not found"))
   }
 }
@@ -353,6 +337,7 @@ pub fn default_c2s_config() -> c2s::Config {
   c2s::Config {
     listener: c2s::ListenerConfig {
       port: 0, // use a random port
+      workers_count: 1,
       ..Default::default()
     },
     limits: c2s::Limits {

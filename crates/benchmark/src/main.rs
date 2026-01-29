@@ -1,24 +1,25 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
 
 use futures::future::join_all;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt, select};
 
 use async_lock::Mutex;
-use narwhal_client::c2s::{AuthMethod, C2sClient, C2sConfig};
+use narwhal_client::compio::c2s::C2sClient;
+use narwhal_client::{AuthMethod, C2sConfig};
 use narwhal_protocol::Nid;
 use narwhal_protocol::{AclAction, AclType, QoS};
 use narwhal_util::pool::Pool;
 use narwhal_util::string_atom::StringAtom;
 use rand::prelude::*;
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
+use std::net::SocketAddr;
+use std::str::FromStr;
 use tracing::{error, info, warn};
 
 /// Command line arguments
@@ -50,10 +51,6 @@ struct Cli {
   /// Maximum size of message payload in bytes
   #[arg(long, default_value = "16384")]
   max_payload_size: usize,
-
-  /// Number of worker threads to use
-  #[arg(short = 'w', long, default_value = "0")]
-  worker_threads: usize,
 }
 
 /// Parse duration from string (supports: 30s, 5m, 1h)
@@ -78,26 +75,15 @@ fn main() {
 
   let cli = Cli::parse();
 
-  let worker_threads = if cli.worker_threads == 0 {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-  } else {
-    cli.worker_threads
-  };
-
-  info!("starting narwhal-bench");
+  info!("starting narwhal-bench...");
   info!("server: {}", cli.server);
   info!("producer(s): {}", cli.producers);
   info!("consumer(s): {}", cli.consumers);
   info!("channel(s): {}", cli.channels);
   info!("duration: {:?}", cli.duration);
-  info!("worker threads: {}", worker_threads);
 
-  // Initialize tokio runtime
-  let rt = if worker_threads == 1 {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-  } else {
-    tokio::runtime::Builder::new_multi_thread().worker_threads(worker_threads).enable_all().build().unwrap()
-  };
+  // Initialize compio runtime
+  let rt = compio::runtime::Runtime::new().unwrap();
 
   // Run the benchmark
   rt.block_on(async {
@@ -166,22 +152,22 @@ impl BenchmarkMetrics {
 
 /// Spawns inbound message drainer tasks for all clients.
 ///
-/// Returns a vector of spawned tokio task handles that resolve to message counts.
+/// Returns a vector of spawned task handles that resolve to message counts.
 async fn spawn_inbound_drainers(
   clients: &[C2sClient],
-  cancel_token: &CancellationToken,
-) -> Vec<tokio::task::JoinHandle<u64>> {
+  shutdown_rx: &async_channel::Receiver<()>,
+) -> Vec<compio::runtime::JoinHandle<u64>> {
   let mut drainer_tasks = Vec::with_capacity(clients.len());
 
   for client in clients.iter() {
     let inbound_stream = client.inbound_stream().await;
-    let token_clone = cancel_token.clone();
+    let shutdown = shutdown_rx.clone();
 
-    let drainer_task = tokio::spawn(async move {
+    let drainer_task = compio::runtime::spawn(async move {
       let mut count = 0u64;
       loop {
-        tokio::select! {
-          msg = inbound_stream.recv() => {
+        select! {
+          msg = inbound_stream.recv().fuse() => {
             match msg {
               Ok((message, _payload)) => {
                 match &message {
@@ -193,8 +179,8 @@ async fn spawn_inbound_drainers(
               Err(_) => break, // Channel closed
             }
           },
-          _ = token_clone.cancelled() => {
-            // Cancellation requested
+          _ = shutdown.recv().fuse() => {
+            // Shutdown requested
             break;
           }
         }
@@ -209,8 +195,6 @@ async fn spawn_inbound_drainers(
 }
 
 /// Gracefully leaves a channel for all clients.
-///
-/// Returns the number of clients that successfully left the channel.
 async fn leave_channel_gracefully(clients: &[C2sClient], channel: StringAtom) {
   info!("clients leaving channel(s)...");
 
@@ -361,7 +345,7 @@ async fn broadcast_messages(
 ) -> (u64, hdrhistogram::Histogram<u64>) {
   info!("broadcasting messages across channels for {:?}...", duration);
 
-  let deadline = tokio::time::Instant::now() + duration;
+  let end_time = Instant::now() + duration;
   let mut broadcast_tasks = Vec::new();
 
   // Create a histogram for tracking latencies (max 60s, 3 significant digits)
@@ -370,7 +354,6 @@ async fn broadcast_messages(
   for (client_idx, client) in clients.iter().enumerate() {
     let client = client.clone();
     let client_channels: Vec<StringAtom> = channels.to_vec();
-    let end_time = deadline;
 
     let max_inflight_requests =
       client.session_info().await.ok().map(|(info, _)| info.max_inflight_requests).unwrap_or(1);
@@ -378,54 +361,47 @@ async fn broadcast_messages(
     let client_pool = Pool::new(max_inflight_requests as usize, max_payload_size);
     let client_hist = arc_histogram.clone();
 
-    let task = tokio::spawn(async move {
+    let task = compio::runtime::spawn(async move {
       let mut count = 0u64;
       let mut channel_idx = 0usize;
 
-      let mut task_set = JoinSet::new();
+      let mut task_set = FuturesUnordered::new();
 
+      // Seed with initial concurrent requests
       for _ in 0..max_inflight_requests {
         let task_channel = client_channels[channel_idx % client_channels.len()].clone();
         let task_client = client.clone();
         let task_payload_pool = client_pool.clone();
 
-        task_set.spawn(async move {
-          broadcast_message(task_channel, task_client, task_payload_pool, max_payload_size).await
-        });
+        task_set.push(broadcast_message(task_channel, task_client, task_payload_pool, max_payload_size));
 
         channel_idx += 1;
       }
 
-      while let Some(res) = task_set.join_next().await {
-        match res {
-          Ok(Ok(elapsed_ms)) => {
+      while let Some(result) = task_set.next().await {
+        match result {
+          Ok(elapsed_ms) => {
             {
               let mut h = client_hist.lock().await;
               let _ = h.record(elapsed_ms);
             }
             count += 1;
           },
-          Ok(Err(e)) => {
-            error!("(client {}): {}", client_idx, e);
-            std::process::exit(1);
-          },
           Err(e) => {
-            error!("task failed (client {}): {}", client_idx, e);
+            error!("(client {}): {}", client_idx, e);
             std::process::exit(1);
           },
         }
 
         // If we haven't reached the deadline... broadcast a new message
-        if tokio::time::Instant::now() < end_time {
+        if Instant::now() < end_time {
           let task_channel = client_channels[channel_idx % client_channels.len()].clone();
           let task_client = client.clone();
           let task_payload_pool = client_pool.clone();
 
           channel_idx += 1;
 
-          task_set.spawn(async move {
-            broadcast_message(task_channel, task_client, task_payload_pool, max_payload_size).await
-          });
+          task_set.push(broadcast_message(task_channel, task_client, task_payload_pool, max_payload_size));
         }
       }
 
@@ -459,7 +435,7 @@ async fn broadcast_message(
   let random_size = rand::rng().random_range(1..=max_payload_size);
   let payload = payload_buffer.freeze(random_size);
 
-  let start = tokio::time::Instant::now();
+  let start = Instant::now();
 
   client.broadcast(channel, Some(QoS::AckOnReceived), payload).await?;
   let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -484,7 +460,7 @@ async fn run_benchmark(cli: Cli) -> Result<BenchmarkMetrics> {
   // Print additional information
   info!("max payload size: {} bytes", cli.max_payload_size);
 
-  let start_time = tokio::time::Instant::now();
+  let start_time = Instant::now();
 
   info!("running benchmark...");
   perform_benchmark(&cli, &mut metrics).await?;
@@ -541,11 +517,11 @@ async fn perform_benchmark(cli: &Cli, metrics: &mut BenchmarkMetrics) -> Result<
   all_clients.extend_from_slice(&producer_clients);
   all_clients.extend_from_slice(&consumer_clients);
 
-  // Create a shared cancellation token for all drainer tasks
-  let drainer_cancel_token = CancellationToken::new();
+  // Create a shutdown channel for all drainer tasks
+  let (drainer_shutdown_tx, drainer_shutdown_rx) = async_channel::bounded::<()>(1);
 
   // Spawn inbound message drainer tasks for all clients
-  let drainer_tasks = spawn_inbound_drainers(&all_clients, &drainer_cancel_token).await;
+  let drainer_tasks = spawn_inbound_drainers(&all_clients, &drainer_shutdown_rx).await;
 
   // Create channels and have all clients join all channels
   let mut channels = Vec::with_capacity(cli.channels);
@@ -576,20 +552,20 @@ async fn perform_benchmark(cli: &Cli, metrics: &mut BenchmarkMetrics) -> Result<
     let _ = client.shutdown().await;
   }
 
-  // Cancel all drainer tasks to ensure they complete
+  // Signal all drainer tasks to stop
   info!("cancelling message drainers...");
-  drainer_cancel_token.cancel();
+  drainer_shutdown_tx.close();
 
   // Wait for drainer tasks to complete and collect received message counts
   info!("collecting received message counts...");
   let mut total_received = 0u64;
   for task in drainer_tasks {
-    match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
+    match compio::time::timeout(std::time::Duration::from_secs(5), task).await {
       Ok(Ok(count)) => {
         total_received += count;
       },
       Ok(Err(e)) => {
-        warn!("drainer task error: {}", e);
+        warn!("drainer task panicked: {:?}", e);
       },
       Err(_) => {
         warn!("drainer task timed out after 5 seconds");

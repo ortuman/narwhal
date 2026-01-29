@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::collections::HashMap;
 use std::fmt;
 use std::io::Cursor;
 use std::marker::PhantomData;
@@ -8,70 +7,26 @@ use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, atomic};
 use std::time::Duration;
 
+use ::tokio::task::JoinHandle;
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender, bounded};
-use async_lock::{Mutex, Semaphore, SemaphoreGuardArc};
-use deadpool::managed::Object;
-use deadpool::{Runtime, managed};
+use async_lock::{Mutex, Semaphore};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use futures_channel::oneshot;
-use parking_lot::Mutex as PlMutex;
-use parking_lot::RwLock as PlRwLock;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, trace, warn};
 
+use super::dialer::Dialer;
+use crate::config::{Config, SessionInfo};
+use crate::conn_state::{ErrorState, INBOUND_QUEUE_SIZE, OUTBOUND_QUEUE_SIZE, PendingRequest, PendingRequests};
+use crate::object_pool;
 use narwhal_protocol::{Message, PongParameters, deserialize, serialize};
 use narwhal_util::backoff::ExponentialBackoff;
-use narwhal_util::codec::StreamReader;
-use narwhal_util::conn::Dialer;
+use narwhal_util::codec_tokio::StreamReader;
 use narwhal_util::pool::{MutablePoolBuffer, Pool, PoolBuffer};
 
-use crate::service::Service;
-
-/// Type alias for response sender used in pending requests.
-type ResponseSender = oneshot::Sender<anyhow::Result<(Message, Option<PoolBuffer>)>>;
-
-/// TCP network type.
-pub const TCP_NETWORK: &str = "tcp";
-
-/// Unix domain socket network type.
-pub const UNIX_NETWORK: &str = "unix";
-
-const OUTBOUND_QUEUE_SIZE: usize = 4 * 1024;
-
-const INBOUND_QUEUE_SIZE: usize = 16 * 1024;
-
-// Narwhal client configuration.
-#[derive(Clone, Debug)]
-pub struct Config {
-  /// The maximum number of idle connections to keep in the pool.
-  pub max_idle_connections: usize,
-
-  /// The heartbeat interval for the client that should be negotiated
-  /// with the server.
-  pub heartbeat_interval: Duration,
-
-  /// The client connection timeout.
-  /// This is the timeout for establishing a connection to the server.
-  pub connect_timeout: Duration,
-
-  /// The client write/read timeout.
-  pub timeout: Duration,
-
-  /// The timeout for reading a payload from the server.
-  pub payload_read_timeout: Duration,
-
-  /// The initial delay for the backoff strategy.
-  pub backoff_initial_delay: Duration,
-
-  /// The maximum delay for the backoff strategy.
-  pub backoff_max_delay: Duration,
-
-  /// The maximum number of retries for the backoff strategy.
-  pub backoff_max_retries: usize,
-}
+use narwhal_common::service::Service;
 
 /// A trait representing the logic required to perform a handshake with the Narwhal server.
 ///
@@ -301,7 +256,7 @@ where
   conn: Option<Arc<ClientConn<S, HS, ST>>>,
 
   /// Connection pool for managing connections (only used when max_idle_connections > 1).
-  conn_pool: Option<managed::Pool<ClientConnManager<S, HS, ST>>>,
+  conn_pool: Option<object_pool::ObjectPool<ClientConnManager<S, HS, ST>>>,
 
   /// Phantom data for the service type.
   _service_type: PhantomData<ST>,
@@ -359,14 +314,13 @@ where
     handshaker: HS,
   ) -> anyhow::Result<Self> {
     let max_idle_connections = config.max_idle_connections;
-    let connect_timeout = config.connect_timeout;
 
     let arc_client_id = Arc::new(client_id.into());
     let arc_config = Arc::new(config);
 
     let (inbound_tx, inbound_rx) = bounded(INBOUND_QUEUE_SIZE);
 
-    let conn_pool = managed::Pool::builder(ClientConnManager::new(
+    let conn_pool = object_pool::ObjectPool::builder(ClientConnManager::new(
       arc_client_id.clone(),
       arc_config.clone(),
       dialer.clone(),
@@ -374,9 +328,8 @@ where
       inbound_tx.clone(),
     ))
     .max_size(max_idle_connections)
-    .create_timeout(Some(connect_timeout))
-    .runtime(Runtime::Tokio1)
-    .build()?;
+    .build()
+    .map_err(|e| anyhow!("failed to build connection pool: {}", e))?;
 
     Ok(Self {
       client_id: arc_client_id,
@@ -421,7 +374,7 @@ where
     Ok(conn)
   }
 
-  async fn get_connection(&self) -> anyhow::Result<Object<ClientConnManager<S, HS, ST>>> {
+  async fn get_connection(&self) -> anyhow::Result<object_pool::ObjectPoolObject<ClientConnManager<S, HS, ST>>> {
     debug_assert!(
       self.config.max_idle_connections > 1,
       "get_connection should only be called in pooled mode (max_idle_connections > 1)"
@@ -440,9 +393,9 @@ where
 
   async fn get_connection_from_pool(
     &self,
-    conn_pool: &managed::Pool<ClientConnManager<S, HS, ST>>,
-  ) -> anyhow::Result<Object<ClientConnManager<S, HS, ST>>> {
-    let get_pool_conn = || async { conn_pool.get().await.map_err(|e| anyhow!(" {}", e)) };
+    conn_pool: &object_pool::ObjectPool<ClientConnManager<S, HS, ST>>,
+  ) -> anyhow::Result<object_pool::ObjectPoolObject<ClientConnManager<S, HS, ST>>> {
+    let get_pool_conn = || async { conn_pool.get().await.map_err(|e| anyhow!("{}", e)) };
 
     match get_pool_conn().await {
       Ok(conn) => {
@@ -450,7 +403,7 @@ where
           return Ok(conn);
         }
         // Filter out unhealthy connections and retry.
-        conn_pool.retain(|c, _| !c.is_unhealthy());
+        conn_pool.retain(|c| !c.is_unhealthy());
         get_pool_conn().await
       },
       Err(e) => Err(e),
@@ -482,7 +435,7 @@ where
       Ok(())
     } else {
       if let Some(conn_pool) = &self.conn_pool {
-        conn_pool.retain(|_, _| false);
+        conn_pool.retain(|_| false);
         conn_pool.close();
       }
       Ok(())
@@ -515,7 +468,7 @@ where
   /// The client configuration.
   config: Arc<Config>,
 
-  /// unique connection ID generator.
+  /// Unique connection ID generator.
   next_conn_id: atomic::AtomicU32,
 
   /// The dialer used to establish connections.
@@ -556,7 +509,7 @@ where
   }
 }
 
-impl<S, HS, ST> managed::Manager for ClientConnManager<S, HS, ST>
+impl<S, HS, ST> object_pool::Manager for ClientConnManager<S, HS, ST>
 where
   S: AsyncRead + AsyncWrite + Send + Sync + 'static,
   HS: Handshaker<S>,
@@ -582,15 +535,11 @@ where
     Ok(conn)
   }
 
-  async fn recycle(
-    &self,
-    conn: &mut ClientConn<S, HS, ST>,
-    _: &managed::Metrics,
-  ) -> managed::RecycleResult<Self::Error> {
+  async fn recycle(&self, conn: &mut ClientConn<S, HS, ST>) -> object_pool::RecycleResult<Self::Error> {
     // Check if the connection is still healthy, and if not, shutdown it.
     if conn.is_unhealthy() {
-      conn.shutdown().await?;
-      return Err(managed::RecycleError::Backend(conn.error_state.take_error().unwrap()));
+      conn.shutdown().await.ok();
+      return Err(object_pool::RecycleError::Backend(conn.error_state.take_error().unwrap()));
     }
     Ok(())
   }
@@ -617,85 +566,6 @@ where
         }
       })
     });
-  }
-}
-
-#[derive(Clone, Debug)]
-struct ErrorState(Arc<PlMutex<Option<anyhow::Error>>>);
-
-// === impl ErrorState ===
-
-impl ErrorState {
-  pub fn new() -> Self {
-    Self(Arc::new(PlMutex::new(None)))
-  }
-
-  #[inline]
-  pub fn set_error(&self, error: anyhow::Error) {
-    let mut state = self.0.lock();
-    state.replace(error);
-  }
-
-  #[inline]
-  pub fn has_error(&self) -> bool {
-    let state = self.0.lock();
-    state.is_some()
-  }
-
-  #[inline]
-  pub fn take_error(&self) -> Option<anyhow::Error> {
-    let mut state = self.0.lock();
-    state.take()
-  }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct SessionInfo {
-  /// the heartbeat interval negotiated with the modulator server
-  pub heartbeat_interval: u32,
-
-  /// the maximum number of inflight requests allowed by the modulator server
-  pub max_inflight_requests: u32,
-
-  /// the maximum message size allowed by the modulator server
-  pub max_message_size: u32,
-
-  /// the maximum payload size allowed by the modulator server
-  pub max_payload_size: u32,
-}
-
-struct PendingRequest {
-  /// The sender for the response.
-  sender: Option<ResponseSender>,
-
-  /// The owned semaphore permit for inflight requests.
-  _permit: SemaphoreGuardArc,
-}
-
-#[derive(Clone)]
-struct PendingRequests(Arc<PlRwLock<HashMap<u32, PendingRequest>>>);
-
-// == impl PendingRequests ===
-
-impl PendingRequests {
-  fn new() -> Self {
-    Self(Arc::new(PlRwLock::new(HashMap::new())))
-  }
-
-  #[inline]
-  fn insert(&self, correlation_id: u32, request: PendingRequest) {
-    self.0.write().insert(correlation_id, request);
-  }
-
-  #[inline]
-  fn take_response_sender(&self, correlation_id: u32) -> Option<ResponseSender> {
-    let mut pending_requests = self.0.write();
-    pending_requests.get_mut(&correlation_id).and_then(|request| request.sender.take())
-  }
-
-  #[inline]
-  fn remove(&self, correlation_id: &u32) -> Option<PendingRequest> {
-    self.0.write().remove(correlation_id)
   }
 }
 

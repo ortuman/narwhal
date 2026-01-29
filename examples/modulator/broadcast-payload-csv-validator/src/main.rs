@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use clap::Parser;
 use csv::Reader;
 
-use tokio::signal;
+use futures::{select, FutureExt};
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -41,7 +41,7 @@ const MODULATOR_PROTOCOL_NAME: &str = "broadcast-payload-csv-validator/1.0";
 #[derive(Debug)]
 struct CsvPayloadValidator {}
 
-#[async_trait]
+#[async_trait(?Send)]
 impl narwhal_modulator::Modulator for CsvPayloadValidator {
   /// Returns the unique name of this modulator.
   async fn protocol_name(&self) -> anyhow::Result<StringAtom> {
@@ -124,8 +124,7 @@ struct Cli {
   config: Option<String>,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
   let env_filter = EnvFilter::builder().with_default_directive(LevelFilter::INFO.into()).from_env_lossy();
 
   tracing_subscriber::fmt().with_env_filter(env_filter).init();
@@ -139,10 +138,14 @@ async fn main() {
 
   let modulator = CsvPayloadValidator {};
 
-  match run_s2m_server(config, modulator).await {
-    Ok(_) => {},
-    Err(e) => eprintln!("error: {}", e),
-  }
+  let rt = compio::runtime::Runtime::new().unwrap();
+
+  rt.block_on(async {
+    match run_s2m_server(config, modulator).await {
+      Ok(_) => {},
+      Err(e) => eprintln!("error: {}", e),
+    }
+  });
 }
 
 async fn run_s2m_server<M>(config: S2mServerConfig, modulator: M) -> anyhow::Result<()>
@@ -151,7 +154,7 @@ where
 {
   let protocol_name = modulator.protocol_name().await?;
 
-  let mut ln = create_s2m_listener(config, modulator, 1).await?;
+  let mut ln = create_s2m_listener(config, modulator).await?;
 
   info!(protocol_name = protocol_name.as_ref(), "📡 starting s2m server...");
 
@@ -185,12 +188,10 @@ fn load_config(config_file: Option<String>) -> anyhow::Result<S2mServerConfig> {
 }
 
 async fn wait_for_stop_signal() -> anyhow::Result<()> {
-  let mut sig_term = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+  let sig_term = compio_signal::unix::signal(libc::SIGTERM);
 
-  tokio::select! {
-    _ = signal::ctrl_c() => Ok(()),
-    _ = sig_term.recv() => {
-      Ok(())
-    },
+  select! {
+    _ = compio_signal::ctrl_c().fuse() => Ok(()),
+    _ = sig_term.fuse() => Ok(()),
   }
 }

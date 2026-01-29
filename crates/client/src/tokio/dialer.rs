@@ -1,35 +1,69 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+//! Dialer types for the Tokio-based client.
+//!
+//! This module contains the [`Dialer`] trait and concrete implementations
+//! for TCP, Unix domain socket, and TLS transports built on Tokio and
+//! futures-io.
+
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use ::tokio::net::{TcpStream, UnixStream};
 use anyhow::anyhow;
 use futures::io::{AsyncRead, AsyncWrite};
 use rustls::ClientConfig;
-use tokio::net::{TcpStream, UnixStream};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
-use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+
+/// A trait for establishing network connections and returning a stream.
+///
+/// The `Dialer` trait abstracts the connection logic, allowing different implementations
+/// for various transport types (TCP, Unix sockets, etc.) or custom connection strategies.
+#[async_trait::async_trait]
+pub trait Dialer: Send + Sync + 'static {
+  /// The type of stream returned by this dialer.
+  ///
+  /// Must implement `AsyncRead + AsyncWrite` for bidirectional I/O operations.
+  type Stream: AsyncRead + AsyncWrite + Send + Sync + 'static;
+
+  /// Establishes a connection and returns a stream.
+  ///
+  /// # Returns
+  ///
+  /// Returns a `Stream` on successful connection, or an error if the connection fails.
+  async fn dial(&self) -> anyhow::Result<Self::Stream>;
+}
 
 /// A unified stream type that can represent either TCP or Unix domain socket connections.
 ///
 /// This enum abstracts over the underlying transport mechanism, allowing applications
 /// to work with both network and local socket connections transparently.
-///
-/// The implementation delegates all I/O operations to the underlying stream type,
-/// maintaining their respective characteristics and behaviors.
 pub enum Stream {
   /// A TCP network connection.
   ///
   /// Used for remote connections over IP networks.
-  Tcp(tokio_util::compat::Compat<TcpStream>),
+  Tcp(Compat<TcpStream>),
 
   /// A Unix domain socket connection.
   ///
   /// Used for high-performance local inter-process communication.
-  Unix(tokio_util::compat::Compat<UnixStream>),
+  Unix(Compat<UnixStream>),
+}
+
+impl Stream {
+  /// Wraps a Tokio [`TcpStream`] into a [`Stream::Tcp`].
+  pub fn from_tcp(stream: TcpStream) -> Self {
+    Stream::Tcp(stream.compat())
+  }
+
+  /// Wraps a Tokio [`UnixStream`] into a [`Stream::Unix`].
+  pub fn from_unix(stream: UnixStream) -> Self {
+    Stream::Unix(stream.compat())
+  }
 }
 
 impl std::fmt::Debug for Stream {
@@ -40,8 +74,6 @@ impl std::fmt::Debug for Stream {
     }
   }
 }
-
-// ===== impl Stream =====
 
 impl AsyncRead for Stream {
   fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
@@ -75,25 +107,6 @@ impl AsyncWrite for Stream {
   }
 }
 
-/// A trait for establishing network connections and returning a stream.
-///
-/// The `Dialer` trait abstracts the connection logic, allowing different implementations
-/// for various transport types (TCP, Unix sockets, etc.) or custom connection strategies.
-#[async_trait::async_trait]
-pub trait Dialer: Send + Sync + 'static {
-  /// The type of stream returned by this dialer.
-  ///
-  /// Must implement `AsyncRead + AsyncWrite` for bidirectional I/O operations.
-  type Stream: AsyncRead + AsyncWrite + Send + Sync + 'static;
-
-  /// Establishes a connection and returns a stream.
-  ///
-  /// # Returns
-  ///
-  /// Returns a `Stream` on successful connection, or an error if the connection fails.
-  async fn dial(&self) -> anyhow::Result<Self::Stream>;
-}
-
 /// TCP dialer implementation.
 #[derive(Clone, Debug)]
 pub struct TcpDialer {
@@ -107,7 +120,7 @@ impl TcpDialer {
   }
 }
 
-// ===== impl TcpDialer =====
+// === impl TcpDialer ===
 
 #[async_trait::async_trait]
 impl Dialer for TcpDialer {
@@ -116,8 +129,6 @@ impl Dialer for TcpDialer {
   async fn dial(&self) -> anyhow::Result<Stream> {
     let tcp_stream =
       TcpStream::connect(&self.address).await.map_err(|e| anyhow!("failed to connect to {}: {}", self.address, e))?;
-
-    tcp_stream.set_nodelay(true)?;
 
     Ok(Stream::Tcp(tcp_stream.compat()))
   }
@@ -129,7 +140,7 @@ pub struct UnixDialer {
   socket_path: String,
 }
 
-// ===== impl UnixDialer =====
+// === impl UnixDialer ===
 
 impl UnixDialer {
   /// Creates a new Unix dialer with the specified socket path.
@@ -159,7 +170,7 @@ pub struct TlsDialer {
   server_name: rustls::pki_types::ServerName<'static>,
 }
 
-// ===== impl TlsDialer =====
+// === impl TlsDialer ===
 
 impl TlsDialer {
   /// Creates a new TLS dialer with the specified address and certificate verification enabled.

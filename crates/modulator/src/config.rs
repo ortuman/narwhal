@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 /// TCP network type.
 pub const TCP_NETWORK: &str = "tcp";
@@ -155,13 +155,23 @@ pub struct ListenerConfig {
   /// This is used when the network type is "unix".
   #[serde(default)]
   pub socket_path: String,
+
+  /// The number of worker threads for the connection pool.
+  /// When set to 0 (default), uses the number of available CPU cores.
+  #[serde(default = "default_workers_count")]
+  pub workers_count: usize,
 }
 
-// ===== impl ListenerConfig =====
+// === impl ListenerConfig ===
 
 impl Default for ListenerConfig {
   fn default() -> Self {
-    Self { network: default_network(), bind_address: String::new(), socket_path: String::new() }
+    Self {
+      network: default_network(),
+      bind_address: String::new(),
+      socket_path: String::new(),
+      workers_count: default_workers_count(),
+    }
   }
 }
 
@@ -409,6 +419,10 @@ fn default_request_timeout() -> Duration {
   Duration::from_secs(10)
 }
 
+fn default_workers_count() -> usize {
+  0
+}
+
 /// S2M server configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct S2mServerConfig {
@@ -423,7 +437,7 @@ pub struct S2mServerConfig {
   pub m2s_client: M2sClientConfig,
 }
 
-// ===== impl S2mServerConfig =====
+// === impl S2mServerConfig ===
 
 impl S2mServerConfig {
   /// Validates the configuration.
@@ -450,6 +464,44 @@ pub type M2sServerConfig = ServerConfig;
 
 /// M2s client configuration.
 pub type M2sClientConfig = ClientConfig;
+
+impl From<ClientConfig> for narwhal_client::S2mConfig {
+  fn from(config: ClientConfig) -> Self {
+    Self {
+      network: config.network,
+      address: config.address,
+      socket_path: config.socket_path,
+      shared_secret: config.shared_secret,
+      max_idle_connections: config.max_idle_connections,
+      heartbeat_interval: config.heartbeat_interval,
+      connect_timeout: config.connect_timeout,
+      timeout: config.timeout,
+      payload_read_timeout: config.payload_read_timeout,
+      backoff_initial_delay: config.backoff_initial_delay,
+      backoff_max_delay: config.backoff_max_delay,
+      backoff_max_retries: config.backoff_max_retries,
+    }
+  }
+}
+
+impl From<ClientConfig> for narwhal_client::M2sConfig {
+  fn from(config: ClientConfig) -> Self {
+    Self {
+      network: config.network,
+      address: config.address,
+      socket_path: config.socket_path,
+      shared_secret: config.shared_secret,
+      max_idle_connections: config.max_idle_connections,
+      heartbeat_interval: config.heartbeat_interval,
+      connect_timeout: config.connect_timeout,
+      timeout: config.timeout,
+      payload_read_timeout: config.payload_read_timeout,
+      backoff_initial_delay: config.backoff_initial_delay,
+      backoff_max_delay: config.backoff_max_delay,
+      backoff_max_retries: config.backoff_max_retries,
+    }
+  }
+}
 
 #[cfg(test)]
 mod tests {

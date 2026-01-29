@@ -19,13 +19,10 @@ use crate::notifier::Notifier;
 use crate::router::GlobalRouter;
 use crate::version::{GIT_BRANCH_NAME, GIT_COMMIT_HASH, VERSION};
 
+use futures::{FutureExt, select};
 use rlimit::Resource;
-use serde_derive::{Deserialize, Serialize};
-use tokio::signal;
-use tokio::task::JoinHandle;
-use tokio_tracing::info;
-use tokio_util::sync::CancellationToken;
-use tracing as tokio_tracing;
+use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use narwhal_util::string_atom::StringAtom;
 
@@ -47,26 +44,19 @@ struct Config {
 ///
 /// # Arguments
 ///
-/// * `worker_threads` - The number of worker threads to use for the tokio runtime
 ///
 /// # Returns
 ///
 /// Returns `Ok(())` on successful shutdown, or an error if any step fails during
 /// startup or shutdown.
-pub async fn run(config_file: Option<String>, conn_worker_threads: usize) -> anyhow::Result<()> {
+pub async fn run(config_file: Option<String>) -> anyhow::Result<()> {
   // Parse the configuration file.
   let mut cfg = load_config(config_file)?;
 
   // Initialize the telemetry subscriber.
   telemetry::init(cfg.telemetry)?;
 
-  info!(
-    version = VERSION,
-    worker_threads = conn_worker_threads,
-    branch = GIT_BRANCH_NAME,
-    commit = GIT_COMMIT_HASH,
-    "🚀 narwhal server is starting..."
-  );
+  info!(version = VERSION, branch = GIT_BRANCH_NAME, commit = GIT_COMMIT_HASH, "narwhal server is starting...");
 
   // Set file descriptor limit based on configuration.
   let max_connections = cfg.c2s_server.limits.max_connections;
@@ -78,7 +68,6 @@ pub async fn run(config_file: Option<String>, conn_worker_threads: usize) -> any
     cfg.modulator.clone(),
     cfg.c2s_server.limits.max_message_size,
     cfg.c2s_server.limits.max_payload_size,
-    conn_worker_threads,
   )
   .await?;
 
@@ -117,13 +106,12 @@ pub async fn run(config_file: Option<String>, conn_worker_threads: usize) -> any
   )
   .await?;
 
-  let c2s_conn_mng = c2s::conn::C2sConnManager::new(c2s_config.as_ref());
+  let c2s_conn_mng = c2s::conn::C2sConnManager::new(c2s_config.as_ref()).await;
 
-  let mut c2s_ln =
-    c2s::C2sListener::new(c2s_config.listener.clone(), c2s_conn_mng, c2s_dispatcher_factory, conn_worker_threads);
+  let mut c2s_ln = c2s::C2sListener::new(c2s_config.listener.clone(), c2s_conn_mng, c2s_dispatcher_factory);
 
   // Start routing task for modulator private payloads.
-  let mut route_m2s_payload_handle = Option::<(JoinHandle<()>, CancellationToken)>::None;
+  let mut route_m2s_payload_handle = Option::<(compio::runtime::JoinHandle<()>, async_channel::Sender<()>)>::None;
 
   if let Some(m2s_payload_rx) = modulator_service.m2s_payload_rx.take() {
     route_m2s_payload_handle = Some(c2s::route_m2s_private_payload(m2s_payload_rx, c2s_router));
@@ -140,12 +128,12 @@ pub async fn run(config_file: Option<String>, conn_worker_threads: usize) -> any
   c2s_ln.shutdown().await?;
   modulator_service.shutdown().await?;
 
-  if let Some((handle, cancellation_token)) = route_m2s_payload_handle {
-    cancellation_token.cancel();
+  if let Some((handle, shutdown_tx)) = route_m2s_payload_handle {
+    shutdown_tx.close();
     let _ = handle.await;
   }
 
-  info!("👋 hasta la vista, baby");
+  info!("hasta la vista, baby");
 
   Ok(())
 }
@@ -193,13 +181,11 @@ fn load_config(config_file: Option<String>) -> anyhow::Result<Config> {
 }
 
 async fn wait_for_stop_signal() -> anyhow::Result<()> {
-  let mut sig_term = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+  let sig_term = compio_signal::unix::signal(libc::SIGTERM);
 
-  tokio::select! {
-    _ = signal::ctrl_c() => Ok(()),
-    _ = sig_term.recv() => {
-      Ok(())
-    },
+  select! {
+    _ = compio_signal::ctrl_c().fuse() => Ok(()),
+    _ = sig_term.fuse() => Ok(()),
   }
 }
 

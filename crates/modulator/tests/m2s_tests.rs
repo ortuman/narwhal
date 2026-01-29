@@ -2,24 +2,25 @@
 
 use std::time::Duration;
 
+use futures::FutureExt;
 use narwhal_protocol::{ErrorParameters, Message};
 use narwhal_test_util::{M2sSuite, assert_message, default_m2s_config};
 use narwhal_util::string_atom::StringAtom;
 
-#[tokio::test]
+#[compio::test]
 async fn test_m2s_connect_timeout() -> anyhow::Result<()> {
   // Set the connection timeout to 50ms.
   let mut config = default_m2s_config();
   config.connect_timeout = Duration::from_millis(50);
 
-  let mut suite = M2sSuite::with_config(config);
+  let mut suite = M2sSuite::with_config(config).await;
   suite.setup().await?;
 
   // Connect to the server but don't send M2sConnect message.
   let mut socket = suite.socket_connect().await?;
 
   // Wait for the connection to timeout.
-  tokio::time::sleep(Duration::from_millis(250)).await;
+  compio::time::sleep(Duration::from_millis(250)).await;
 
   // Verify that the connection timed out and the server sent an error message.
   assert_message!(
@@ -37,27 +38,27 @@ async fn test_m2s_connect_timeout() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_m2s_ping_timeout() -> anyhow::Result<()> {
   // Configure keep-alive parameters.
   let mut config = default_m2s_config();
   config.keep_alive_interval = Duration::from_millis(100);
   config.min_keep_alive_interval = Duration::from_millis(100);
 
-  let mut suite = M2sSuite::with_config(config);
+  let mut suite = M2sSuite::with_config(config).await;
   suite.setup().await?;
 
   // Connect to the server.
   let mut conn = suite.connect(None).await?;
 
   // Wait until ping is received.
-  tokio::time::sleep(Duration::from_millis(150)).await;
+  compio::time::sleep(Duration::from_millis(150)).await;
 
   let ping_msg = conn.read_message().await?;
   assert!(matches!(ping_msg, Message::Ping { .. }));
 
   // Wait for keep-alive timeout.
-  tokio::time::sleep(Duration::from_millis(200)).await;
+  compio::time::sleep(Duration::from_millis(200)).await;
 
   // Verify that the server sent the proper error message.
   assert_message!(
@@ -75,23 +76,17 @@ async fn test_m2s_ping_timeout() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_m2s_max_connection_limit_reached() -> anyhow::Result<()> {
   // Set the maximum number of connections to 1.
   let mut config = default_m2s_config();
   config.limits.max_connections = 1;
 
-  let mut suite = M2sSuite::with_config(config);
+  let mut suite = M2sSuite::with_config(config).await;
   suite.setup().await?;
 
-  // Establish a first connection.
-  let (tx, rx) = tokio::sync::oneshot::channel();
-
-  let mut socket = suite.socket_connect().await?;
-  tokio::spawn(async move {
-    let _ = rx.await;
-    socket.shutdown().await.ok();
-  });
+  // Establish a first connection — keep it alive as a local variable.
+  let _first = suite.socket_connect().await?;
 
   // Connect to the server again and expect an error.
   let mut socket = suite.socket_connect().await?;
@@ -109,18 +104,16 @@ async fn test_m2s_max_connection_limit_reached() -> anyhow::Result<()> {
 
   suite.teardown().await?;
 
-  tx.send(()).unwrap();
-
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_m2s_max_message_size_exceeded() -> anyhow::Result<()> {
   // Set the maximum message size to 1024 bytes.
   let mut config = default_m2s_config();
   config.limits.max_message_size = 1024;
 
-  let mut suite = M2sSuite::with_config(config);
+  let mut suite = M2sSuite::with_config(config).await;
   suite.setup().await?;
 
   // Connect to the server.
@@ -151,9 +144,9 @@ async fn test_m2s_max_message_size_exceeded() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_m2s_mod_direct_message() -> anyhow::Result<()> {
-  let mut suite = M2sSuite::with_config(default_m2s_config());
+  let mut suite = M2sSuite::with_config(default_m2s_config()).await;
   suite.setup().await?;
 
   // Connect to the server
@@ -186,8 +179,8 @@ async fn test_m2s_mod_direct_message() -> anyhow::Result<()> {
   );
 
   // Verify the payload was broadcast to the channel
-  tokio::select! {
-    result = payload_rx.recv() => {
+  futures::select! {
+    result = payload_rx.recv().fuse() => {
       let received = result?;
       assert_eq!(received.targets.len(), 2);
       assert_eq!(&*received.targets[0], "user1@localhost");
@@ -197,7 +190,7 @@ async fn test_m2s_mod_direct_message() -> anyhow::Result<()> {
       let payload_data = received.payload.as_slice();
       assert_eq!(payload_data, PAYLOAD);
     }
-    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+    _ = compio::time::sleep(Duration::from_millis(100)).fuse() => {
       panic!("timeout waiting for outbound payload broadcast");
     }
   }

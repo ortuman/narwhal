@@ -95,7 +95,7 @@ impl GlobalRouter {
     Ok(())
   }
 
-  /// Returns a reference to the underlying C2S (client-to-server) router.
+  /// Returns a reference to the underlying C2S router.
   ///
   /// This provides access to the C2S router for operations that need direct
   /// interaction with the client-to-server routing layer.

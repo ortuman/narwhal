@@ -6,6 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use compio_buf::{IoBuf, IoBufMut, SetLen};
 use crossbeam_queue::ArrayQueue;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -318,7 +319,8 @@ impl PoolBufferInner {
 
 impl Drop for PoolBufferInner {
   fn drop(&mut self) {
-    if let (Some(buffer), Some(pool)) = (self.data.take(), self.pool.take()) {
+    if let (Some(mut buffer), Some(pool)) = (self.data.take(), self.pool.take()) {
+      unsafe { buffer.set_len(pool.buffer_size) };
       pool.available.force_push(buffer);
     }
   }
@@ -360,6 +362,44 @@ impl MutablePoolBuffer {
     let inner = PoolBufferInner { data, pool, permit };
 
     PoolBuffer { inner: Arc::new(inner), len: size }
+  }
+}
+
+impl Deref for MutablePoolBuffer {
+  type Target = BytesMut;
+
+  fn deref(&self) -> &Self::Target {
+    debug_assert!(self.0.data.is_some(), "MutablePoolBuffer has been consumed");
+    self.0.data.as_ref().unwrap()
+  }
+}
+
+impl DerefMut for MutablePoolBuffer {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    debug_assert!(self.0.data.is_some(), "MutablePoolBuffer has been consumed");
+    self.0.data.as_mut().unwrap()
+  }
+}
+
+impl IoBuf for MutablePoolBuffer {
+  fn as_init(&self) -> &[u8] {
+    (**self).as_init()
+  }
+
+  fn buf_len(&self) -> usize {
+    (**self).buf_len()
+  }
+}
+
+impl IoBufMut for MutablePoolBuffer {
+  fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
+    (**self).as_uninit()
+  }
+}
+
+impl SetLen for MutablePoolBuffer {
+  unsafe fn set_len(&mut self, len: usize) {
+    unsafe { (**self).set_len(len) }
   }
 }
 
@@ -416,9 +456,20 @@ impl Deref for PoolBuffer {
   }
 }
 
+impl IoBuf for PoolBuffer {
+  fn as_init(&self) -> &[u8] {
+    self.as_slice()
+  }
+
+  fn buf_len(&self) -> usize {
+    self.len
+  }
+}
+
 #[cfg(test)]
 mod pool_tests {
   use super::*;
+  use compio_buf::{IoBuf, IoBufMut};
 
   #[tokio::test]
   async fn test_buffer_pool() {
@@ -442,6 +493,45 @@ mod pool_tests {
     assert_eq!(pool.available_count(), 4);
 
     drop(buf2);
+  }
+
+  #[tokio::test]
+  async fn test_io_buf_mut_conformance() {
+    let pool = Pool::new(1, 1024);
+    let mut buf = pool.acquire_buffer().await;
+
+    // Test IoBuf trait - as_init() should return initialized bytes
+    let init = buf.as_init();
+    let initial_len = buf.buf_len();
+    assert!(init.len() == initial_len);
+    assert_eq!(buf.buf_capacity(), 1024);
+
+    // Clear the buffer to get uninit space
+    buf.clear();
+    assert_eq!(buf.buf_len(), 0);
+
+    // Test IoBufMut trait - as_uninit() should return full buffer as uninit
+    let uninit = buf.as_uninit();
+    assert_eq!(uninit.len(), 1024);
+
+    // Test SetLen trait - set_len should work
+    unsafe {
+      buf.set_len(10);
+    }
+    assert_eq!(buf.buf_len(), 10);
+
+    // Test that we can write to the buffer through IoBufMut
+    // as_uninit() returns the FULL buffer including initialized bytes
+    let uninit_slice = buf.as_uninit();
+    assert_eq!(uninit_slice.len(), 1024); // Full capacity as MaybeUninit
+    // Write to the uninit portion (after the initialized 10 bytes)
+    if uninit_slice.len() > 10 {
+      uninit_slice[10].write(42);
+    }
+
+    // Verify deref works - we should be able to use BytesMut methods
+    buf.clear();
+    assert_eq!(buf.len(), 0);
   }
 
   #[tokio::test]

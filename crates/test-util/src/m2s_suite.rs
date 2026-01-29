@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use tokio::net::TcpStream;
-use tokio::sync::broadcast;
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+use async_broadcast;
+use compio::net::TcpStream;
 
 use narwhal_modulator::{M2sListener, OutboundPrivatePayload};
 use narwhal_protocol::{M2sConnectParameters, Message};
@@ -20,29 +19,31 @@ pub struct M2sSuite {
   ln: M2sListener,
 
   /// The broadcast sender for outbound private payloads.
-  payload_tx: broadcast::Sender<OutboundPrivatePayload>,
+  payload_tx: async_broadcast::Sender<OutboundPrivatePayload>,
 
   /// The broadcast receiver for outbound private payloads (optional, for testing).
-  payload_rx: Option<broadcast::Receiver<OutboundPrivatePayload>>,
+  payload_rx: Option<async_broadcast::Receiver<OutboundPrivatePayload>>,
 }
 
 // ===== impl M2sSuite =====
 
 impl M2sSuite {
   /// Creates a new M2sSuite with the given configuration.
-  pub fn with_config(config: narwhal_modulator::M2sServerConfig) -> Self {
+  ///
+  /// This is `async` because `ConnManager::new` (conn) is async.
+  pub async fn with_config(config: narwhal_modulator::M2sServerConfig) -> Self {
     let arc_config = Arc::new(config);
 
     // Create the broadcast channel for outbound payloads
-    let (payload_tx, payload_rx) = broadcast::channel(1024);
+    let (payload_tx, payload_rx) = async_broadcast::broadcast(1024);
 
     let dispatcher_factory = narwhal_modulator::conn::M2sDispatcherFactory::new(arc_config.clone(), payload_tx.clone());
 
     let server_config = (*arc_config).clone();
 
-    let conn_mng = narwhal_modulator::conn::M2sConnManager::new(&server_config);
+    let conn_mng = narwhal_modulator::conn::M2sConnManager::new(&server_config).await;
 
-    let ln = M2sListener::new(server_config.listener.clone(), conn_mng.clone(), dispatcher_factory, 1);
+    let ln = M2sListener::new(server_config.listener.clone(), conn_mng, dispatcher_factory);
 
     Self { config: arc_config, ln, payload_tx, payload_rx: Some(payload_rx) }
   }
@@ -53,12 +54,12 @@ impl M2sSuite {
   }
 
   /// Returns a clone of the broadcast sender for outbound payloads.
-  pub fn payload_sender(&self) -> broadcast::Sender<OutboundPrivatePayload> {
+  pub fn payload_sender(&self) -> async_broadcast::Sender<OutboundPrivatePayload> {
     self.payload_tx.clone()
   }
 
   /// Takes the payload receiver if available (can only be called once).
-  pub fn take_payload_receiver(&mut self) -> Option<broadcast::Receiver<OutboundPrivatePayload>> {
+  pub fn take_payload_receiver(&mut self) -> Option<async_broadcast::Receiver<OutboundPrivatePayload>> {
     self.payload_rx.take()
   }
 
@@ -75,10 +76,13 @@ impl M2sSuite {
   }
 
   /// Creates a new socket connection to the server without authentication.
-  pub async fn socket_connect(&self) -> anyhow::Result<TestConn<Compat<TcpStream>>> {
+  ///
+  /// Uses `compio::net::TcpStream` so the returned `TestConn` works
+  /// natively with compio's completion-based I/O.
+  pub async fn socket_connect(&self) -> anyhow::Result<TestConn<TcpStream>> {
     let addr = self.ln.local_address().expect("local address not set");
 
-    let tcp_stream = TcpStream::connect(&addr).await?.compat();
+    let tcp_stream = TcpStream::connect(addr).await?;
 
     let max_message_size = self.config().limits.max_message_size as usize;
 
@@ -94,7 +98,7 @@ impl M2sSuite {
   /// # Arguments
   ///
   /// * `secret` - The secret to use for authentication (can be None if no secret is required)
-  pub async fn connect(&mut self, secret: Option<&str>) -> anyhow::Result<TestConn<Compat<TcpStream>>> {
+  pub async fn connect(&mut self, secret: Option<&str>) -> anyhow::Result<TestConn<TcpStream>> {
     let mut socket = self.socket_connect().await?;
 
     socket
@@ -121,7 +125,7 @@ impl M2sSuite {
     &mut self,
     secret: Option<&str>,
     heartbeat_interval: u32,
-  ) -> anyhow::Result<TestConn<Compat<TcpStream>>> {
+  ) -> anyhow::Result<TestConn<TcpStream>> {
     let mut socket = self.socket_connect().await?;
 
     socket
@@ -145,6 +149,7 @@ pub fn default_m2s_config() -> narwhal_modulator::M2sServerConfig {
     listener: narwhal_modulator::ListenerConfig {
       network: narwhal_modulator::TCP_NETWORK.to_string(),
       bind_address: "127.0.0.1:0".to_string(), // use a random port
+      workers_count: 1,
       ..Default::default()
     },
     limits: narwhal_modulator::Limits {

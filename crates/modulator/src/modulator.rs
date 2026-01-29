@@ -2,8 +2,8 @@
 
 use std::fmt::Debug;
 
+use async_broadcast;
 use async_trait::async_trait;
-use tokio::sync::broadcast;
 
 use narwhal_protocol::{Event, Nid};
 use narwhal_util::pool::PoolBuffer;
@@ -274,7 +274,7 @@ pub struct ReceivePrivatePayloadRequest {}
 #[derive(Debug)]
 pub struct ReceivePrivatePayloadResponse {
   /// The broadcast receiver for outbound private payloads
-  pub receiver: broadcast::Receiver<OutboundPrivatePayload>,
+  pub receiver: async_broadcast::Receiver<OutboundPrivatePayload>,
 }
 
 /// Represents an outbound private payload from the modulator to one or more clients.
@@ -297,7 +297,7 @@ pub struct OutboundPrivatePayload {
 ///
 /// This trait requires its implementors to be [`Send`] and [`Sync`], making it safe to use
 /// across thread boundaries. It also requires a `'static` lifetime.
-#[async_trait]
+#[async_trait(?Send)]
 pub trait Modulator: Debug + Send + Sync + 'static {
   /// Returns the modulator's protocol identifier.
   ///
@@ -409,7 +409,7 @@ pub trait Modulator: Debug + Send + Sync + 'static {
   /// # Returns
   ///
   /// A `Result` containing a [`ReceivePrivatePayloadResponse`] that includes a
-  /// [`tokio::sync::broadcast::Receiver`] for receiving [`OutboundPrivatePayload`] messages
+  /// [`async_broadcast::Receiver`] for receiving [`OutboundPrivatePayload`] messages
   /// representing direct communications from the modulator to specified client targets.
   async fn receive_private_payload(
     &self,

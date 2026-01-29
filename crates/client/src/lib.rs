@@ -4,48 +4,50 @@
 //!
 //! This crate provides client implementations for connecting to Narwhal servers.
 //!
+//! ## I/O Models
+//!
+//! Two runtime back-ends are available as public modules — pick the one that
+//! matches your application's async runtime:
+//!
+//! - **[`tokio`]** — poll/readiness-based (Tokio)
+//! - **[`compio`]** — completion-based (compio)
+//!
+//! Import the client types you need directly from the corresponding module,
+//! e.g. `narwhal_client::tokio::C2sClient` or `narwhal_client::compio::C2sClient`.
+//!
 //! ## Client Types
 //!
-//! - **C2S (Client-to-Server)**: End-user clients connecting to the Narwhal server
-//!
-//! ## Other Client Types
-//!
-//! The following client types remain in the `narwhal-modulator` crate because they are
-//! tightly coupled with modulator functionality:
-//!
-//! - **S2M (Server-to-Modulator)**: Server-initiated connections to modulators
-//! - **M2S (Modulator-to-Server)**: Modulator-initiated connections for sending private messages
-//!
-//! If you need S2M or M2S client functionality, use:
-//!
-//! ```ignore
-//! use narwhal_modulator::client::{S2mClient, M2sClient};
-//! ```
+//! - **C2S**: End-user clients connecting to the Narwhal server
+//! - **S2M**: Server-initiated connections to modulators
+//! - **M2S**: Modulator-initiated connections for sending private messages
 //!
 //! ## Example
 //!
 //! ```ignore
-//! use narwhal_client::C2sClient;
-//! use narwhal_common::client::Config;
+//! use narwhal_client::tokio::{C2sClient, TlsDialer};
+//! use narwhal_client::{C2sConfig, AuthMethod};
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // Create a config with your desired settings
-//! let config = Config {
-//!     max_idle_connections: 16,
-//!     heartbeat_interval: std::time::Duration::from_secs(60),
-//!     connect_timeout: std::time::Duration::from_secs(5),
-//!     timeout: std::time::Duration::from_secs(5),
-//!     payload_read_timeout: std::time::Duration::from_secs(5),
-//!     backoff_initial_delay: std::time::Duration::from_millis(100),
-//!     backoff_max_delay: std::time::Duration::from_secs(30),
-//!     backoff_max_retries: 5,
+//! let config = C2sConfig {
+//!     address: "example.com:5555".to_string(),
+//!     ..Default::default()
 //! };
-//! let client = C2sClient::new("127.0.0.1:5555", config)?;
+//! let client = C2sClient::new(config, auth_method)?;
 //! # Ok(())
 //! # }
 //! ```
 
-pub mod c2s;
+pub(crate) mod auth;
+pub(crate) mod config;
+pub(crate) mod conn_state;
+pub(crate) mod object_pool;
 
-// Re-export main client types for convenience
-pub use c2s::{C2sClient, C2sSessionExtraInfo};
+pub mod compio;
+pub mod tokio;
+
+pub use auth::{AuthMethod, Authenticator, AuthenticatorFactory};
+
+pub use config::{
+  C2sConfig, C2sSessionExtraInfo, Config, M2sConfig, M2sSessionExtraInfo, S2mConfig, S2mSessionExtraInfo, SessionInfo,
+  TCP_NETWORK, UNIX_NETWORK,
+};

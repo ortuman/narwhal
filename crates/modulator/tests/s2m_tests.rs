@@ -14,7 +14,7 @@ use narwhal_util::string_atom::StringAtom;
 
 const TEST_MODULATOR_SECRET: &str = "a_test_secret";
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_connect_timeout() -> anyhow::Result<()> {
   // Set the connection timeout to 50ms.
   let mut config = default_s2m_config_with_secret(TEST_MODULATOR_SECRET);
@@ -25,14 +25,14 @@ async fn test_s2m_connect_timeout() -> anyhow::Result<()> {
       Ok(ForwardBroadcastPayloadResult::Valid)
     });
 
-  let mut suite = S2mSuite::with_config(config, modulator);
+  let mut suite = S2mSuite::with_config(config, modulator).await;
   suite.setup().await?;
 
   // Connect to the server.
   let mut socket = suite.socket_connect().await?;
 
   // Wait for the connection to timeout.
-  tokio::time::sleep(Duration::from_millis(250)).await;
+  compio::time::sleep(Duration::from_millis(250)).await;
 
   // Verify that the connection timed out and the server sent an error message.
   assert_message!(
@@ -50,7 +50,7 @@ async fn test_s2m_connect_timeout() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_ping_timeout() -> anyhow::Result<()> {
   // Configure keep-alive parameters.
   let mut config = default_s2m_config_with_secret(TEST_MODULATOR_SECRET);
@@ -62,20 +62,20 @@ async fn test_s2m_ping_timeout() -> anyhow::Result<()> {
       Ok(ForwardBroadcastPayloadResult::Valid)
     });
 
-  let mut suite = S2mSuite::with_config(config, modulator);
+  let mut suite = S2mSuite::with_config(config, modulator).await;
   suite.setup().await?;
 
   // Identify a user.
   let mut conn = suite.connect(TEST_MODULATOR_SECRET).await?;
 
   // Wait until ping is received.
-  tokio::time::sleep(Duration::from_millis(150)).await;
+  compio::time::sleep(Duration::from_millis(150)).await;
 
   let ping_msg = conn.read_message().await?;
   assert!(matches!(ping_msg, Message::Ping { .. }));
 
   // Wait for keep-alive timeout.
-  tokio::time::sleep(Duration::from_millis(200)).await;
+  compio::time::sleep(Duration::from_millis(200)).await;
 
   // Verify that the server sent the proper error message.
   assert_message!(
@@ -93,7 +93,7 @@ async fn test_s2m_ping_timeout() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_max_connection_limit_reached() -> anyhow::Result<()> {
   // Set the maximum number of streams to 1.
   let mut config = default_s2m_config_with_secret(TEST_MODULATOR_SECRET);
@@ -104,17 +104,11 @@ async fn test_s2m_max_connection_limit_reached() -> anyhow::Result<()> {
       Ok(ForwardBroadcastPayloadResult::Valid)
     });
 
-  let mut suite = S2mSuite::with_config(config, modulator);
+  let mut suite = S2mSuite::with_config(config, modulator).await;
   suite.setup().await?;
 
-  // Establish a first connection.
-  let (tx, rx) = tokio::sync::oneshot::channel();
-
-  let mut socket = suite.socket_connect().await?;
-  tokio::spawn(async move {
-    let _ = rx.await;
-    socket.shutdown().await.ok();
-  });
+  // Establish a first connection — keep it alive as a local variable.
+  let _first = suite.socket_connect().await?;
 
   // Connect to the server again and expect an error.
   let mut socket = suite.socket_connect().await?;
@@ -132,12 +126,10 @@ async fn test_s2m_max_connection_limit_reached() -> anyhow::Result<()> {
 
   suite.teardown().await?;
 
-  tx.send(()).unwrap();
-
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_max_message_size_exceeded() -> anyhow::Result<()> {
   // Set the maximum message size to 1024 bytes.
   let mut config = default_s2m_config_with_secret(TEST_MODULATOR_SECRET);
@@ -148,7 +140,7 @@ async fn test_s2m_max_message_size_exceeded() -> anyhow::Result<()> {
       Ok(ForwardBroadcastPayloadResult::Valid)
     });
 
-  let mut suite = S2mSuite::with_config(config, modulator);
+  let mut suite = S2mSuite::with_config(config, modulator).await;
   suite.setup().await?;
 
   // Identify a user.
@@ -179,7 +171,7 @@ async fn test_s2m_max_message_size_exceeded() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_auth_success() -> anyhow::Result<()> {
   let modulator = TestModulator::new().with_auth_handler(|token| async move {
     if token.as_ref() == "valid_token" {
@@ -189,7 +181,7 @@ async fn test_s2m_auth_success() -> anyhow::Result<()> {
     }
   });
 
-  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator);
+  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator).await;
   suite.setup().await?;
 
   let mut socket = suite.connect(TEST_MODULATOR_SECRET).await?;
@@ -208,7 +200,7 @@ async fn test_s2m_auth_success() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_auth_failure() -> anyhow::Result<()> {
   let modulator = TestModulator::new().with_auth_handler(|token| async move {
     if token.as_ref() == "valid_token" {
@@ -218,7 +210,7 @@ async fn test_s2m_auth_failure() -> anyhow::Result<()> {
     }
   });
 
-  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator);
+  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator).await;
   suite.setup().await?;
 
   let mut socket = suite.connect(TEST_MODULATOR_SECRET).await?;
@@ -237,7 +229,7 @@ async fn test_s2m_auth_failure() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_auth_continue() -> anyhow::Result<()> {
   let modulator = TestModulator::new().with_auth_handler(|token| async move {
     if token.as_ref() == "challenge_token" {
@@ -247,7 +239,7 @@ async fn test_s2m_auth_continue() -> anyhow::Result<()> {
     }
   });
 
-  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator);
+  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator).await;
   suite.setup().await?;
 
   let mut socket = suite.connect(TEST_MODULATOR_SECRET).await?;
@@ -273,7 +265,7 @@ async fn test_s2m_auth_continue() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_forward_payload_without_alter() -> anyhow::Result<()> {
   let modulator =
     TestModulator::new().with_forward_message_payload_handler(|payload, _from, _channel_handler| async move {
@@ -284,7 +276,7 @@ async fn test_s2m_forward_payload_without_alter() -> anyhow::Result<()> {
       }
     });
 
-  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator);
+  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator).await;
   suite.setup().await?;
 
   let mut socket = suite.connect(TEST_MODULATOR_SECRET).await?;
@@ -315,7 +307,7 @@ async fn test_s2m_forward_payload_without_alter() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_forward_payload_with_alter() -> anyhow::Result<()> {
   const PAYLOAD: &str = "to be";
   const ALTERED_PAYLOAD_SUFFIX: &str = "or not to be";
@@ -341,7 +333,7 @@ async fn test_s2m_forward_payload_with_alter() -> anyhow::Result<()> {
       Ok(ForwardBroadcastPayloadResult::ValidWithAlteration { altered_payload: pool_buffer })
     });
 
-  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator);
+  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator).await;
   suite.setup().await?;
 
   let mut socket = suite.connect(TEST_MODULATOR_SECRET).await?;
@@ -383,11 +375,11 @@ async fn test_s2m_forward_payload_with_alter() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_forward_event() -> anyhow::Result<()> {
   let modulator = TestModulator::new().with_forward_event_handler(|_event| async { Ok(()) });
 
-  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator);
+  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator).await;
   suite.setup().await?;
 
   let mut socket = suite.connect(TEST_MODULATOR_SECRET).await?;
@@ -411,14 +403,14 @@ async fn test_s2m_forward_event() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_unsupported_protocol_version() -> anyhow::Result<()> {
   let modulator =
     TestModulator::new().with_forward_message_payload_handler(|_payload, _from, _channel_handler| async {
       Ok(ForwardBroadcastPayloadResult::Valid)
     });
 
-  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator);
+  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator).await;
   suite.setup().await?;
 
   let mut socket = suite.socket_connect().await?;
@@ -447,14 +439,14 @@ async fn test_s2m_unsupported_protocol_version() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_invalid_message() -> anyhow::Result<()> {
   let modulator =
     TestModulator::new().with_forward_message_payload_handler(|_payload, _from, _channel_handler| async {
       Ok(ForwardBroadcastPayloadResult::Valid)
     });
 
-  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator);
+  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator).await;
   suite.setup().await?;
 
   let mut socket = suite.connect(TEST_MODULATOR_SECRET).await?;
@@ -478,7 +470,7 @@ async fn test_s2m_invalid_message() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_s2m_mod_direct() -> anyhow::Result<()> {
   const PAYLOAD: &str = "private payload";
 
@@ -491,7 +483,7 @@ async fn test_s2m_mod_direct() -> anyhow::Result<()> {
     }
   });
 
-  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator);
+  let mut suite = S2mSuite::with_config(default_s2m_config_with_secret(TEST_MODULATOR_SECRET), modulator).await;
   suite.setup().await?;
 
   let mut socket = suite.connect(TEST_MODULATOR_SECRET).await?;

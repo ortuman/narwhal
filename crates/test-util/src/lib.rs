@@ -11,14 +11,17 @@ pub use m2s_suite::{M2sSuite, default_m2s_config};
 pub use modulator::{TestModulator, default_s2m_config};
 pub use s2m_suite::{S2mSuite, default_s2m_config_with_secret};
 
+use std::cell::UnsafeCell;
 use std::io::Cursor;
+use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use compio::buf::{BufResult, IoBuf, IoBufMut};
+use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use narwhal_protocol::{Message, deserialize, serialize};
-use narwhal_util::{codec::StreamReader, pool::MutablePoolBuffer};
+use narwhal_util::{codec_compio::StreamReader, pool::MutablePoolBuffer};
 
 /// A testing macro for asserting that a message matches an expected type and parameters.
 ///
@@ -54,27 +57,84 @@ macro_rules! assert_message {
   };
 }
 
+/// A lock-free shared stream wrapper for compio's single-threaded runtime.
+///
+/// Multiple clones of a `LocalStream` share the same underlying stream via
+/// `Rc<UnsafeCell<S>>`.
+///
+/// # Safety
+///
+/// Only safe within a **single-threaded**, cooperative async runtime like
+/// compio. Because only one task ever executes at a time, the two halves
+/// never actually access the inner stream concurrently.
+struct LocalStream<S>(Rc<UnsafeCell<S>>);
+
+impl<S> LocalStream<S> {
+  fn new(stream: S) -> Self {
+    Self(Rc::new(UnsafeCell::new(stream)))
+  }
+}
+
+impl<S> Clone for LocalStream<S> {
+  fn clone(&self) -> Self {
+    LocalStream(Rc::clone(&self.0))
+  }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for LocalStream<S> {
+  async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+    // SAFETY: compio is single-threaded and cooperative – only one task
+    // executes at any point, so no concurrent mutable access can occur.
+    let stream = unsafe { &mut *self.0.get() };
+    stream.read(buf).await
+  }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for LocalStream<S> {
+  async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+    let stream = unsafe { &mut *self.0.get() };
+    stream.write(buf).await
+  }
+
+  async fn flush(&mut self) -> std::io::Result<()> {
+    let stream = unsafe { &mut *self.0.get() };
+    stream.flush().await
+  }
+
+  async fn shutdown(&mut self) -> std::io::Result<()> {
+    let stream = unsafe { &mut *self.0.get() };
+    stream.shutdown().await
+  }
+}
+
 /// A test connection wrapper for async streams that provides message-based communication.
+///
+/// Uses compio's `AsyncRead` / `AsyncWrite` traits and a `LocalStream` wrapper
+/// to share the underlying stream between reader and writer halves without
+/// splitting.
 ///
 /// # Type Parameters
 ///
-/// * `T` - Any type that implements both `AsyncRead` and `AsyncWrite`, typically
-///   network streams like `TcpStream` or `UnixStream`
-pub struct TestConn<T: AsyncRead + AsyncWrite> {
-  /// the writer handle for the stream.
-  pub writer: futures::io::WriteHalf<T>,
+/// * `S` - Any type that implements both compio `AsyncRead` and `AsyncWrite` + `Unpin`,
+///   typically network streams like `TcpStream` or `TlsStream<TcpStream>`
+pub struct TestConn<S: AsyncRead + AsyncWrite + Unpin> {
+  /// The writer handle (a clone of the shared stream).
+  writer: LocalStream<S>,
 
-  /// the reader handle for the stream.
-  pub reader: StreamReader<futures::io::ReadHalf<T>>,
+  /// The reader handle, wrapped in a compio-compatible `StreamReader`.
+  reader: StreamReader<LocalStream<S>>,
 
-  /// buffer for writing messages.
+  /// Buffer for serialising outbound messages.
   write_buffer: Vec<u8>,
 }
 
 // ===== impl TestConn =====
 
-impl<T: AsyncRead + AsyncWrite> TestConn<T> {
+impl<S: AsyncRead + AsyncWrite + Unpin> TestConn<S> {
   /// Creates a new `TestConn` instance from an async stream.
+  ///
+  /// The stream is wrapped in a `LocalStream` so that a reader and a writer
+  /// can share it without requiring a `split()` operation.
   ///
   /// # Arguments
   ///
@@ -85,13 +145,14 @@ impl<T: AsyncRead + AsyncWrite> TestConn<T> {
   /// # Returns
   ///
   /// A new `TestConn` instance ready for message communication.
-  pub fn new(stream: T, read_buffer: MutablePoolBuffer, max_message_size: usize) -> Self {
-    let (rh, wh) = AsyncReadExt::split(stream);
+  pub fn new(stream: S, read_buffer: MutablePoolBuffer, max_message_size: usize) -> Self {
+    let local_stream = LocalStream::new(stream);
+    let reader_stream = local_stream.clone();
+
     let write_buffer = vec![0u8; max_message_size];
+    let stream_reader = StreamReader::with_pool_buffer(reader_stream, read_buffer);
 
-    let stream_reader = StreamReader::with_pool_buffer(rh, read_buffer);
-
-    Self { writer: wh, reader: stream_reader, write_buffer }
+    Self { writer: local_stream, reader: stream_reader, write_buffer }
   }
 
   /// Serializes and sends a message over the connection.
@@ -107,8 +168,11 @@ impl<T: AsyncRead + AsyncWrite> TestConn<T> {
   pub async fn write_message(&mut self, message: Message) -> anyhow::Result<()> {
     let n = serialize(&message, &mut self.write_buffer)?;
 
-    AsyncWriteExt::write_all(&mut self.writer, &self.write_buffer[..n]).await?;
-    AsyncWriteExt::flush(&mut self.writer).await?;
+    // Copy into an owned buffer because compio's IoBuf requires ownership.
+    let data = self.write_buffer[..n].to_vec();
+
+    self.writer.write_all(data).await.0?;
+    self.writer.flush().await?;
 
     Ok(())
   }
@@ -130,7 +194,7 @@ impl<T: AsyncRead + AsyncWrite> TestConn<T> {
 
     let reader = &mut self.reader;
 
-    let line = match tokio::time::timeout(read_timeout, reader.next()).await {
+    let line = match compio::time::timeout(read_timeout, reader.next()).await {
       Ok(Ok(true)) => reader.get_line().unwrap(),
       Ok(Ok(false)) => return Err(anyhow!("no message received")),
       Ok(Err(e)) => return Err(anyhow!("error reading from stream: {}", e)),
@@ -156,8 +220,12 @@ impl<T: AsyncRead + AsyncWrite> TestConn<T> {
   /// * `Ok(())` - If the data was successfully written and flushed
   /// * `Err(anyhow::Error)` - If there was an I/O error during writing or flushing
   pub async fn write_raw_bytes(&mut self, data: &[u8]) -> anyhow::Result<()> {
-    self.writer.write_all(data).await?;
+    // Copy into an owned buffer because compio's IoBuf requires ownership.
+    let data = data.to_vec();
+
+    self.writer.write_all(data).await.0?;
     self.writer.flush().await?;
+
     Ok(())
   }
 
@@ -165,7 +233,7 @@ impl<T: AsyncRead + AsyncWrite> TestConn<T> {
   ///
   /// This method bypasses the message deserialization system and reads raw bytes
   /// directly from the underlying stream into the provided mutable byte slice.
-  /// The buffer will be filled exactly to its capacity.
+  /// The buffer will be filled exactly to its length.
   ///
   /// # Arguments
   ///
@@ -176,7 +244,12 @@ impl<T: AsyncRead + AsyncWrite> TestConn<T> {
   /// * `Ok(())` - If the buffer was successfully filled with data from the stream
   /// * `Err(anyhow::Error)` - If there was an I/O error during reading
   pub async fn read_raw_bytes(&mut self, data: &mut [u8]) -> anyhow::Result<()> {
-    self.reader.read_raw(data).await?;
+    let len = data.len();
+    let buf = vec![0u8; len];
+
+    let result = self.reader.read_raw(buf, len).await?;
+    data.copy_from_slice(&result[..len]);
+
     Ok(())
   }
 
@@ -191,7 +264,28 @@ impl<T: AsyncRead + AsyncWrite> TestConn<T> {
   /// * `Ok(())` - If the shutdown was successful
   /// * `Err(anyhow::Error)` - If there was an error during the shutdown process
   pub async fn shutdown(&mut self) -> anyhow::Result<()> {
-    self.writer.close().await?;
+    self.writer.shutdown().await?;
     Ok(())
+  }
+
+  /// Asserts that no message is received within the given timeout.
+  ///
+  /// This is useful for verifying that the server does *not* send a message
+  /// in a given time window (e.g. after a disconnect or when rate-limited).
+  ///
+  /// # Returns
+  ///
+  /// * `Ok(())` - If the timeout elapsed without receiving a message
+  /// * `Err(anyhow::Error)` - If a message was unexpectedly received, EOF was
+  ///   reached, or an I/O error occurred
+  pub async fn expect_read_timeout(&mut self, timeout: Duration) -> anyhow::Result<()> {
+    let reader = &mut self.reader;
+
+    match compio::time::timeout(timeout, reader.next()).await {
+      Ok(Ok(true)) => Err(anyhow!("expected timeout, but received a message")),
+      Ok(Ok(false)) => Err(anyhow!("no message received")),
+      Ok(Err(e)) => Err(anyhow!("error reading from stream: {}", e)),
+      Err(_) => Ok(()),
+    }
   }
 }

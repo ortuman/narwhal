@@ -5,21 +5,25 @@ edition = "2024"
 license = "BSD-3-Clause"
 
 [dependencies]
-anyhow = "1.0.100"
-async-channel = "2.3.1"
+anyhow = "1.0.101"
+async-channel = "2.5.0"
 async-lock = "3.4.2"
-async-trait = "0.1.88"
-deadpool =  {  version = "0.12.2", features = ["rt_tokio_1"] }
-humantime-serde = "1.1"
+async-trait = "0.1.89"
+compio = { version = "0.18.0", features = ["net", "time", "runtime"] }
+core_affinity = "0.8.3"
+futures = "0.3.32"
+humantime-serde = "1.1.1"
+libc = "0.2.182"
 parking_lot = "0.12.5"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_derive = "1.0.219"
-tracing = "0.1.41"
-tokio = { version = "1.48.0", features = ["io-util", "signal"] }
-tokio-util = { version = "0.7.15", features = ["rt"] }
+serde = { version = "1.0.228", features = ["derive"] }
+socket2 = { version = "0.5.10", features = ["all"] }
+tracing = "0.1.44"
+async-broadcast = "0.7.2"
+narwhal-client = { path = "../client" }
 narwhal-common = { path = "../common" }
 narwhal-protocol = { path = "../protocol" }
 narwhal-util = { path = "../util" }
 
 [dev-dependencies]
+compio = { version = "0.18.0", features = ["macros", "time"] }
 narwhal-test-util = { path = "../test-util" }

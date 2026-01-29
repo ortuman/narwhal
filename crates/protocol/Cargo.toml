@@ -5,10 +5,9 @@ edition = "2024"
 license = "BSD-3-Clause"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.101"
 once_cell = "1.21.3"
-regex = "1.12.2"
-futures = "0.3.31"
-tokio = { version = "1.48.0", features = ["io-util"] }
+regex = "1.12.3"
+futures = "0.3.32"
 narwhal-protocol-macros = { path = "../protocol-macros" }
 narwhal-util = { path = "../util" }

@@ -4,7 +4,7 @@ use std::io::Cursor;
 
 use futures::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use narwhal_util::codec::StreamReader;
+use narwhal_util::codec_tokio::StreamReader;
 use narwhal_util::pool::MutablePoolBuffer;
 
 use crate::{Message, deserialize, serialize};

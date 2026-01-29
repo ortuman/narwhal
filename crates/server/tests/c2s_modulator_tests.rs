@@ -4,21 +4,22 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::broadcast;
+use async_lock::Mutex;
 
-use narwhal_modulator::client::S2mClient;
-use narwhal_modulator::config::S2mClientConfig;
+use narwhal_client::S2mConfig;
+use narwhal_client::compio::s2m::S2mClient;
 use narwhal_modulator::create_s2m_listener;
-use narwhal_modulator::modulator::{AuthResult, ForwardBroadcastPayloadResult};
+use narwhal_modulator::modulator::{AuthResult, ForwardBroadcastPayloadResult, SendPrivatePayloadResult};
 use narwhal_modulator::{OutboundPrivatePayload, create_m2s_listener};
 use narwhal_protocol::EventKind::{MemberJoined, MemberLeft};
 use narwhal_protocol::{
-  AuthAckParameters, AuthParameters, BroadcastAckParameters, BroadcastParameters, ErrorParameters, EventParameters,
-  MessageParameters, ModDirectParameters,
+  AuthAckParameters, AuthParameters, BroadcastAckParameters, BroadcastParameters, ConnectParameters, ErrorParameters,
+  Event, EventParameters, JoinChannelParameters, ListChannelsParameters, Message, MessageParameters,
+  ModDirectAckParameters, ModDirectParameters,
 };
-use narwhal_protocol::{ConnectParameters, Message};
-use narwhal_test_util::default_m2s_config;
-use narwhal_test_util::{C2sSuite, TestModulator, assert_message, default_c2s_config, default_s2m_config};
+use narwhal_test_util::{
+  C2sSuite, TestModulator, assert_message, default_c2s_config, default_m2s_config, default_s2m_config,
+};
 use narwhal_util::pool::Pool;
 use narwhal_util::string_atom::StringAtom;
 
@@ -29,21 +30,21 @@ const TEST_USER_3: &str = "test_user_3";
 
 const SHARED_SECRET: &str = "a_secret";
 
-#[tokio::test(flavor = "multi_thread")]
+#[compio::test]
 async fn test_c2s_modulator_single_step_auth() -> anyhow::Result<()> {
   let modulator = TestModulator::new()
     .with_auth_handler(|_| async { Ok(AuthResult::Success { username: StringAtom::from("test_user") }) });
 
-  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator, 1).await?;
+  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator).await?;
   s2m_ln.bootstrap().await?;
 
-  let s2m_client = S2mClient::new(S2mClientConfig {
+  let s2m_client = S2mClient::new(S2mConfig {
     address: s2m_ln.local_address().unwrap().to_string(),
     shared_secret: SHARED_SECRET.to_string(),
     ..Default::default()
   })?;
 
-  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None);
+  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None).await?;
   suite.setup().await?;
 
   // Connect to the server
@@ -72,20 +73,20 @@ async fn test_c2s_modulator_single_step_auth() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[compio::test]
 async fn test_c2s_modulator_auth_failed() -> anyhow::Result<()> {
   let modulator = TestModulator::new().with_auth_handler(|_| async { Ok(AuthResult::Failure) });
 
-  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator, 1).await?;
+  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator).await?;
   s2m_ln.bootstrap().await?;
 
-  let s2m_client = S2mClient::new(S2mClientConfig {
+  let s2m_client = S2mClient::new(S2mConfig {
     address: s2m_ln.local_address().unwrap().to_string(),
     shared_secret: SHARED_SECRET.to_string(),
     ..Default::default()
   })?;
 
-  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None);
+  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None).await?;
   suite.setup().await?;
 
   // Connect to the server
@@ -98,7 +99,7 @@ async fn test_c2s_modulator_auth_failed() -> anyhow::Result<()> {
   let connect_ack = tls_socket.read_message().await?;
   assert!(matches!(connect_ack, Message::ConnectAck { .. }));
 
-  // Send AUTH message with a token - the modulator will authenticate and return "test_user"
+  // Send AUTH message with a token - the modulator will reject it
   tls_socket.write_message(Message::Auth(AuthParameters { token: StringAtom::from("any_token") })).await?;
 
   // Verify authentication failure
@@ -114,7 +115,7 @@ async fn test_c2s_modulator_auth_failed() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[compio::test]
 async fn test_c2s_modulator_multi_step_auth() -> anyhow::Result<()> {
   let modulator = TestModulator::new().with_auth_handler(|token| async move {
     if token.as_ref() == "initial_token" {
@@ -126,16 +127,16 @@ async fn test_c2s_modulator_multi_step_auth() -> anyhow::Result<()> {
     }
   });
 
-  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator, 1).await?;
+  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator).await?;
   s2m_ln.bootstrap().await?;
 
-  let s2m_client = S2mClient::new(S2mClientConfig {
+  let s2m_client = S2mClient::new(S2mConfig {
     address: s2m_ln.local_address().unwrap().to_string(),
     shared_secret: SHARED_SECRET.to_string(),
     ..Default::default()
   })?;
 
-  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None);
+  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None).await?;
   suite.setup().await?;
 
   // Connect to the server
@@ -178,11 +179,8 @@ async fn test_c2s_modulator_multi_step_auth() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[compio::test]
 async fn test_c2s_modulator_send_private_payload() -> anyhow::Result<()> {
-  use narwhal_modulator::modulator::SendPrivatePayloadResult;
-  use narwhal_protocol::{ModDirectAckParameters, ModDirectParameters};
-
   // Create a modulator that validates private payloads - only accepts messages that contain "valid"
   let modulator = TestModulator::new().with_send_private_payload_handler(|payload, _from| async move {
     // Validate the payload - only accept payloads that contain "valid"
@@ -192,16 +190,16 @@ async fn test_c2s_modulator_send_private_payload() -> anyhow::Result<()> {
     if is_valid { Ok(SendPrivatePayloadResult::Valid) } else { Ok(SendPrivatePayloadResult::Invalid) }
   });
 
-  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator, 1).await?;
+  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator).await?;
   s2m_ln.bootstrap().await?;
 
-  let s2m_client = S2mClient::new(S2mClientConfig {
+  let s2m_client = S2mClient::new(S2mConfig {
     address: s2m_ln.local_address().unwrap().to_string(),
     shared_secret: SHARED_SECRET.to_string(),
     ..Default::default()
   })?;
 
-  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None);
+  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None).await?;
   suite.setup().await?;
 
   // Identify the user
@@ -257,84 +255,63 @@ async fn test_c2s_modulator_send_private_payload() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[compio::test]
 async fn test_c2s_modulator_receive_private_payload() -> anyhow::Result<()> {
   const TEST_PRIVATE_PAYLOAD: &str = r#"{"type":"test","message":"Hello from modulator"}"#;
 
-  // Set up M2S server with a fixed port and shared secret
+  // Set up M2S server with a shared secret.
   let mut m2s_config = default_m2s_config();
   m2s_config.shared_secret = SHARED_SECRET.to_string();
 
-  // Create two separate broadcast channels to prevent feedback loop:
-  // 1. s2m_payload_tx/rx: for modulator to send messages to S2M
-  // 2. m2s_payload_tx/rx: for M2S to broadcast to C2S
-  let (s2m_payload_tx, s2m_payload_rx) = broadcast::channel::<OutboundPrivatePayload>(1);
-  let (m2s_payload_tx, m2s_payload_rx) = broadcast::channel::<OutboundPrivatePayload>(1);
+  // Two separate broadcast channels:
+  let (s2m_payload_tx, s2m_payload_rx) = async_broadcast::broadcast::<OutboundPrivatePayload>(16);
+  let (m2s_payload_tx, m2s_payload_rx) = async_broadcast::broadcast::<OutboundPrivatePayload>(16);
 
-  // Create M2S listener with the M2S->C2S channel.
-  let mut m2s_listener = create_m2s_listener(m2s_config, m2s_payload_tx, 1).await?;
+  // Create M2S listener with the M2S→C2S channel.
+  let mut m2s_listener = create_m2s_listener(m2s_config, m2s_payload_tx).await?;
   m2s_listener.bootstrap().await?;
-
-  // Create a channel for triggering the modulator.
-  let (trigger_tx, trigger_rx) = broadcast::channel::<()>(1);
 
   // Create a modulator that provides the receiver for private payloads.
   let modulator = TestModulator::new().with_receive_private_payload_handler(move || {
-    let modulator_rx = s2m_payload_rx.resubscribe();
-    let modulator_tx = s2m_payload_tx.clone();
-
-    let mut cloned_trigger_rx_clone = trigger_rx.resubscribe();
-
-    // Spawn a task that sends a JSON-like private payload.
-    tokio::spawn(async move {
-      // Wait for the trigger signal
-      cloned_trigger_rx_clone.recv().await.unwrap();
-
-      let priv_payload_bytes = TEST_PRIVATE_PAYLOAD.as_bytes();
-
-      let targets = vec![StringAtom::from(TEST_USER_1), StringAtom::from(TEST_USER_2)];
-
-      // Create pool buffer with the message content
-      let pool = Pool::new(1, TEST_PRIVATE_PAYLOAD.len());
-      let mut mut_buffer = pool.acquire_buffer().await;
-
-      mut_buffer.as_mut_slice()[..priv_payload_bytes.len()].copy_from_slice(priv_payload_bytes);
-      let payload_buffer = mut_buffer.freeze(priv_payload_bytes.len());
-
-      // Send to all connected users
-      let outbound = OutboundPrivatePayload { payload: payload_buffer.clone(), targets };
-
-      assert!(modulator_tx.send(outbound).is_ok());
-    });
-
-    async move { Ok(modulator_rx) }
+    let rx = s2m_payload_rx.clone();
+    async move { Ok(rx) }
   });
 
-  // Configure S2M with the M2S server address
+  // Configure S2M with the M2S server address.
   let mut s2m_config = default_s2m_config(SHARED_SECRET);
   s2m_config.m2s_client.address = m2s_listener.local_address().unwrap().to_string();
   s2m_config.m2s_client.shared_secret = SHARED_SECRET.to_string();
 
-  let mut s2m_ln = create_s2m_listener(s2m_config, modulator, 1).await?;
+  let mut s2m_ln = create_s2m_listener(s2m_config, modulator).await?;
   s2m_ln.bootstrap().await?;
 
-  let s2m_client = S2mClient::new(S2mClientConfig {
+  let s2m_client = S2mClient::new(S2mConfig {
     address: s2m_ln.local_address().unwrap().to_string(),
     shared_secret: SHARED_SECRET.to_string(),
     ..Default::default()
   })?;
 
-  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), Some(m2s_payload_rx));
+  let mut suite =
+    C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), Some(m2s_payload_rx)).await?;
   suite.setup().await?;
 
-  // Identify test users
+  // Identify test users.
   suite.identify(TEST_USER_1).await?;
   suite.identify(TEST_USER_2).await?;
 
-  // Trigger private payload sending.
-  trigger_tx.send(())?;
+  // Build and send the private payload.
+  let priv_payload_bytes = TEST_PRIVATE_PAYLOAD.as_bytes();
+  let targets = vec![StringAtom::from(TEST_USER_1), StringAtom::from(TEST_USER_2)];
 
-  // Verify that TEST_USER_1 received the proper private payload
+  let pool = Pool::new(1, TEST_PRIVATE_PAYLOAD.len());
+  let mut mut_buffer = pool.acquire_buffer().await;
+  mut_buffer.as_mut_slice()[..priv_payload_bytes.len()].copy_from_slice(priv_payload_bytes);
+  let payload_buffer = mut_buffer.freeze(priv_payload_bytes.len());
+
+  let outbound = OutboundPrivatePayload { payload: payload_buffer, targets };
+  s2m_payload_tx.try_broadcast(outbound).expect("failed to send payload");
+
+  // Verify that TEST_USER_1 received the proper private payload.
   assert_message!(
     suite.read_message(TEST_USER_1).await?,
     Message::ModDirect,
@@ -345,7 +322,7 @@ async fn test_c2s_modulator_receive_private_payload() -> anyhow::Result<()> {
   suite.read_raw_bytes(TEST_USER_1, &mut user1_payload).await?;
   assert_eq!(user1_payload.as_slice(), TEST_PRIVATE_PAYLOAD.as_bytes());
 
-  // Verify that TEST_USER_2 received the proper private payload
+  // Verify that TEST_USER_2 received the proper private payload.
   assert_message!(
     suite.read_message(TEST_USER_2).await?,
     Message::ModDirect,
@@ -363,7 +340,7 @@ async fn test_c2s_modulator_receive_private_payload() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[compio::test]
 async fn test_c2s_modulator_broadcast_payload_validation() -> anyhow::Result<()> {
   // Create a modulator that validates payloads - only accepts payloads that contain "valid"
   let modulator =
@@ -375,16 +352,16 @@ async fn test_c2s_modulator_broadcast_payload_validation() -> anyhow::Result<()>
       if is_valid { Ok(ForwardBroadcastPayloadResult::Valid) } else { Ok(ForwardBroadcastPayloadResult::Invalid) }
     });
 
-  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator, 1).await?;
+  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator).await?;
   s2m_ln.bootstrap().await?;
 
-  let s2m_client = S2mClient::new(S2mClientConfig {
+  let s2m_client = S2mClient::new(S2mConfig {
     address: s2m_ln.local_address().unwrap().to_string(),
     shared_secret: SHARED_SECRET.to_string(),
     ..Default::default()
   })?;
 
-  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None);
+  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None).await?;
   suite.setup().await?;
 
   suite.identify(TEST_USER_1).await?;
@@ -439,7 +416,7 @@ async fn test_c2s_modulator_broadcast_payload_validation() -> anyhow::Result<()>
   Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[compio::test]
 async fn test_c2s_modulator_broadcast_payload_alteration() -> anyhow::Result<()> {
   // Create a modulator that reverses the payload text
   let modulator =
@@ -449,7 +426,7 @@ async fn test_c2s_modulator_broadcast_payload_alteration() -> anyhow::Result<()>
       let reversed = payload_str.chars().rev().collect::<String>();
 
       // Create a new pool buffer with the reversed text
-      let pool = narwhal_util::pool::Pool::new(1, 1024);
+      let pool = Pool::new(1, 1024);
       let mut mut_pool_buffer = pool.acquire_buffer().await;
 
       let mut_buff_ptr = mut_pool_buffer.as_mut_slice();
@@ -464,16 +441,16 @@ async fn test_c2s_modulator_broadcast_payload_alteration() -> anyhow::Result<()>
       Ok(ForwardBroadcastPayloadResult::ValidWithAlteration { altered_payload: pool_buffer })
     });
 
-  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator, 1).await?;
+  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator).await?;
   s2m_ln.bootstrap().await?;
 
-  let s2m_client = S2mClient::new(S2mClientConfig {
+  let s2m_client = S2mClient::new(S2mConfig {
     address: s2m_ln.local_address().unwrap().to_string(),
     shared_secret: SHARED_SECRET.to_string(),
     ..Default::default()
   })?;
 
-  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None);
+  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None).await?;
   suite.setup().await?;
 
   suite.identify(TEST_USER_1).await?;
@@ -529,12 +506,9 @@ async fn test_c2s_modulator_broadcast_payload_alteration() -> anyhow::Result<()>
   Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[compio::test]
 async fn test_c2s_modulator_forward_event() -> anyhow::Result<()> {
-  use async_lock::Mutex;
-  use narwhal_protocol::Event;
-
-  // Create a modulator that captures events and logs any calls
+  // Create a modulator that captures events
   let captured_events = Arc::new(Mutex::new(Vec::new()));
   let captured_events_clone = captured_events.clone();
 
@@ -546,16 +520,16 @@ async fn test_c2s_modulator_forward_event() -> anyhow::Result<()> {
     }
   });
 
-  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator, 1).await?;
+  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator).await?;
   s2m_ln.bootstrap().await?;
 
-  let s2m_client = S2mClient::new(S2mClientConfig {
+  let s2m_client = S2mClient::new(S2mConfig {
     address: s2m_ln.local_address().unwrap().to_string(),
     shared_secret: SHARED_SECRET.to_string(),
     ..Default::default()
   })?;
 
-  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None);
+  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None).await?;
   suite.setup().await?;
 
   // User 1 joins and creates a channel (no event sent to creator but modulator is notified)
@@ -621,23 +595,23 @@ async fn test_c2s_modulator_forward_event() -> anyhow::Result<()> {
   assert_eq!(events.len(), 4, "expected 4 events to be forwarded to the modulator");
 
   // Verify the first event (User 1 joined as owner/channel creator)
-  assert_eq!(events[0].kind, narwhal_protocol::EventKind::MemberJoined);
+  assert_eq!(events[0].kind, MemberJoined);
   assert_eq!(events[0].channel, Some(StringAtom::from("!test1@localhost")));
   assert_eq!(events[0].nid, Some(StringAtom::from("test_user_1@localhost")));
   assert_eq!(events[0].owner, Some(true));
 
   // Verify the second event (User 2 joined)
-  assert_eq!(events[1].kind, narwhal_protocol::EventKind::MemberJoined);
+  assert_eq!(events[1].kind, MemberJoined);
   assert_eq!(events[1].channel, Some(StringAtom::from("!test1@localhost")));
   assert_eq!(events[1].nid, Some(StringAtom::from("test_user_2@localhost")));
 
   // Verify the third event (User 3 joined)
-  assert_eq!(events[2].kind, narwhal_protocol::EventKind::MemberJoined);
+  assert_eq!(events[2].kind, MemberJoined);
   assert_eq!(events[2].channel, Some(StringAtom::from("!test1@localhost")));
   assert_eq!(events[2].nid, Some(StringAtom::from("test_user_3@localhost")));
 
   // Verify the fourth event (User 2 left)
-  assert_eq!(events[3].kind, narwhal_protocol::EventKind::MemberLeft);
+  assert_eq!(events[3].kind, MemberLeft);
   assert_eq!(events[3].channel, Some(StringAtom::from("!test1@localhost")));
   assert_eq!(events[3].nid, Some(StringAtom::from("test_user_2@localhost")));
   assert_eq!(events[3].owner, Some(false));
@@ -648,22 +622,22 @@ async fn test_c2s_modulator_forward_event() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[compio::test]
 async fn test_c2s_modulator_channel_survives_single_connection_drop() -> anyhow::Result<()> {
   // Create a modulator that authenticates all connections as the same user
   let modulator = TestModulator::new()
     .with_auth_handler(|_| async { Ok(AuthResult::Success { username: StringAtom::from(TEST_USER_1) }) });
 
-  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator, 1).await?;
+  let mut s2m_ln = create_s2m_listener(default_s2m_config(SHARED_SECRET), modulator).await?;
   s2m_ln.bootstrap().await?;
 
-  let s2m_client = S2mClient::new(S2mClientConfig {
+  let s2m_client = S2mClient::new(S2mConfig {
     address: s2m_ln.local_address().unwrap().to_string(),
     shared_secret: SHARED_SECRET.to_string(),
     ..Default::default()
   })?;
 
-  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None);
+  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None).await?;
   suite.setup().await?;
 
   // First connection for TEST_USER_1
@@ -672,16 +646,12 @@ async fn test_c2s_modulator_channel_survives_single_connection_drop() -> anyhow:
   conn1.write_message(Message::Connect(ConnectParameters { protocol_version: 1, heartbeat_interval: 0 })).await?;
   let _ = conn1.read_message().await?; // CONNECT_ACK
 
-  conn1.write_message(Message::Auth(narwhal_protocol::AuthParameters { token: StringAtom::from("token1") })).await?;
+  conn1.write_message(Message::Auth(AuthParameters { token: StringAtom::from("token1") })).await?;
 
   assert_message!(
     conn1.read_message().await?,
     Message::AuthAck,
-    narwhal_protocol::AuthAckParameters {
-      challenge: None,
-      succeeded: Some(true),
-      nid: Some(StringAtom::from("test_user_1@localhost"))
-    }
+    AuthAckParameters { challenge: None, succeeded: Some(true), nid: Some(StringAtom::from("test_user_1@localhost")) }
   );
 
   // Second connection for the same TEST_USER_1
@@ -690,21 +660,17 @@ async fn test_c2s_modulator_channel_survives_single_connection_drop() -> anyhow:
   conn2.write_message(Message::Connect(ConnectParameters { protocol_version: 1, heartbeat_interval: 0 })).await?;
   let _ = conn2.read_message().await?; // CONNECT_ACK
 
-  conn2.write_message(Message::Auth(narwhal_protocol::AuthParameters { token: StringAtom::from("token2") })).await?;
+  conn2.write_message(Message::Auth(AuthParameters { token: StringAtom::from("token2") })).await?;
 
   assert_message!(
     conn2.read_message().await?,
     Message::AuthAck,
-    narwhal_protocol::AuthAckParameters {
-      challenge: None,
-      succeeded: Some(true),
-      nid: Some(StringAtom::from("test_user_1@localhost"))
-    }
+    AuthAckParameters { challenge: None, succeeded: Some(true), nid: Some(StringAtom::from("test_user_1@localhost")) }
   );
 
   // First connection joins a channel
   conn1
-    .write_message(Message::JoinChannel(narwhal_protocol::JoinChannelParameters {
+    .write_message(Message::JoinChannel(JoinChannelParameters {
       id: 1234,
       channel: "!test1@localhost".into(),
       on_behalf: None,
@@ -727,13 +693,13 @@ async fn test_c2s_modulator_channel_survives_single_connection_drop() -> anyhow:
   // Drop the first connection
   drop(conn1);
 
-  // Wait for the channel to be removed from the server's state
-  tokio::time::sleep(Duration::from_secs(1)).await;
+  // Wait for the server to process the connection drop
+  compio::time::sleep(Duration::from_secs(1)).await;
 
   // Second connection should still be able to list channels
   // and see that the user is still a member of the channel
   conn2
-    .write_message(Message::ListChannels(narwhal_protocol::ListChannelsParameters {
+    .write_message(Message::ListChannels(ListChannelsParameters {
       id: 5678,
       page_size: None,
       page: None,

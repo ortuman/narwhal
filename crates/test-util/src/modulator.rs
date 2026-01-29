@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
+use async_broadcast;
 use futures::future::BoxFuture;
-use tokio::sync::broadcast;
 
 use narwhal_modulator::Modulator;
 use narwhal_modulator::modulator::{
@@ -118,7 +118,7 @@ impl TestModulator {
   pub fn with_receive_private_payload_handler<F, Fut>(mut self, handler: F) -> Self
   where
     F: Fn() -> Fut + Send + Sync + 'static,
-    Fut: futures::Future<Output = anyhow::Result<broadcast::Receiver<OutboundPrivatePayload>>> + Send + 'static,
+    Fut: futures::Future<Output = anyhow::Result<async_broadcast::Receiver<OutboundPrivatePayload>>> + Send + 'static,
   {
     self.receive_private_payload_handler = Some(Arc::new(move |_request| {
       let fut = handler();
@@ -134,7 +134,7 @@ impl Default for TestModulator {
   }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl Modulator for TestModulator {
   async fn protocol_name(&self) -> anyhow::Result<StringAtom> {
     Ok("test-modulator-proto/1.0".into())
@@ -211,6 +211,7 @@ pub fn default_s2m_config(shared_secret: &str) -> narwhal_modulator::S2mServerCo
       listener: narwhal_modulator::ListenerConfig {
         network: narwhal_modulator::TCP_NETWORK.to_string(),
         bind_address: "127.0.0.1:0".to_string(), // use a random port
+        workers_count: 1,
         ..Default::default()
       },
       shared_secret: shared_secret.to_string(),

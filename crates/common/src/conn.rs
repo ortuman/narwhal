@@ -1,45 +1,112 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use core::fmt::Debug;
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::future::Future;
-use std::io::{Cursor, IoSlice};
+use std::io::Cursor;
 use std::marker::PhantomData;
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::thread;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use core_affinity::CoreId;
-
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use compio::buf::{BufResult, IoBuf, IoBufMut};
+use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use futures::FutureExt;
 use rand::random;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 use tracing::{error, info, trace, warn};
 
 use async_channel::{Receiver, Sender, TryRecvError, bounded};
 use async_lock::RwLock;
+use slab::Slab;
 
 use narwhal_protocol::ErrorReason::{
   BadRequest, InternalServerError, OutboundQueueIsFull, PolicyViolation, ResponseTooLarge, ServerShuttingDown, Timeout,
 };
 use narwhal_protocol::{ErrorParameters, Message, PingParameters, SerializeError, deserialize, serialize};
 
-use narwhal_util::codec::{StreamReader, StreamReaderError};
-use narwhal_util::io::write_all_vectored;
+use narwhal_util::codec_compio::{StreamReader, StreamReaderError};
+
 use narwhal_util::pool::{BucketedPool, MutablePoolBuffer, Pool, PoolBuffer};
 use narwhal_util::string_atom::StringAtom;
 
+use crate::runtime::Task;
 use crate::service::Service;
 
 const SERVER_OVERLOADED_ERROR: &[u8] = b"ERROR reason=SERVER_OVERLOADED detail=\\\"max connections reached\\\"\n";
 
-const MAX_IOVS: usize = 128;
+/// A lock-free shared stream wrapper for compio's single-threaded runtime.
+///
+/// Multiple clones of a `LocalStream` share the same underlying stream via
+/// `Rc<UnsafeCell<S>>`.
+///
+/// # Safety
+///
+/// Only safe within a **single-threaded**, cooperative async runtime like
+/// compio. Because only one task ever executes at a time, the two halves
+/// never actually access the inner stream concurrently.
+struct LocalStream<S>(Rc<UnsafeCell<S>>);
+
+impl<S> LocalStream<S> {
+  fn new(stream: S) -> Self {
+    Self(Rc::new(UnsafeCell::new(stream)))
+  }
+}
+
+impl<S> Clone for LocalStream<S> {
+  fn clone(&self) -> Self {
+    LocalStream(Rc::clone(&self.0))
+  }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for LocalStream<S> {
+  async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+    // SAFETY: compio is single-threaded and cooperative – only one task
+    // executes at any point, so no concurrent mutable access can occur.
+    let stream = unsafe { &mut *self.0.get() };
+    stream.read(buf).await
+  }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for LocalStream<S> {
+  async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+    let stream = unsafe { &mut *self.0.get() };
+    stream.write(buf).await
+  }
+
+  async fn flush(&mut self) -> std::io::Result<()> {
+    let stream = unsafe { &mut *self.0.get() };
+    stream.flush().await
+  }
+
+  async fn shutdown(&mut self) -> std::io::Result<()> {
+    let stream = unsafe { &mut *self.0.get() };
+    stream.shutdown().await
+  }
+}
+
+const MAX_BUFFERS_PER_BATCH: usize = 192;
+
+const READ_CHANNEL_CAPACITY: usize = 1024;
+
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Result type sent from the read loop to the main connection loop.
+enum ReadResult {
+  /// Successfully read and parsed a message with an optional payload.
+  Message { message: Message, payload: Option<PoolBuffer> },
+  /// Stream closed by peer (EOF).
+  Eof,
+  /// Read loop encountered an error condition.
+  ///
+  /// The contained message is always a [`Message::Error`] that the main loop
+  /// should write to the wire before closing the connection.
+  Error(Message),
+}
 
 /// Represents the current state of a client connection in the protocol flow.
 ///
@@ -82,7 +149,7 @@ pub enum State {
 /// - `State::Connecting` → `State::Connected` → `State::Authenticated`
 ///
 /// Implementations must ensure state transitions only move forward, never backward.
-#[async_trait]
+#[async_trait(?Send)]
 pub trait Dispatcher: 'static {
   /// Processes an incoming message based on the current connection state.
   ///
@@ -163,7 +230,7 @@ pub trait Dispatcher: 'static {
 ///
 /// Implementors typically hold configuration data and references to
 /// shared resources that new dispatchers will need access to.
-#[async_trait]
+#[async_trait(?Send)]
 pub trait DispatcherFactory<D: Dispatcher>: Clone + Send + Sync + 'static {
   /// Creates a new instance of a dispatcher factory.
   ///
@@ -261,8 +328,8 @@ struct ConnManagerInner<ST: Service> {
   /// The payload buffer pool.
   payload_buffer_pool: BucketedPool,
 
-  /// Connection task tracker.
-  task_tracker: TaskTracker,
+  /// A single shared newline buffer
+  newline_buffer: PoolBuffer,
 
   /// The shutdown cancellation token.
   shutdown_token: CancellationToken,
@@ -279,7 +346,7 @@ impl<ST: Service> std::fmt::Debug for ConnManagerInner<ST> {
       .field("active_connections", &self.active_connections)
       .field("message_buffer_pool", &self.message_buffer_pool)
       .field("payload_buffer_pool", &self.payload_buffer_pool)
-      .field("task_tracker", &self.task_tracker)
+      .field("newline_buffer", &self.newline_buffer)
       .field("shutdown_token", &self.shutdown_token)
       .finish()
   }
@@ -299,15 +366,15 @@ impl<ST: Service> Clone for ConnManager<ST> {
 
 impl<ST: Service> ConnManager<ST> {
   /// Creates a new connection manager.
-  pub fn new(config: impl Into<Config>) -> Self {
+  pub async fn new(config: impl Into<Config>) -> Self {
     let conn_cfg = config.into();
 
     let max_connections = conn_cfg.max_connections as usize;
 
     // Account for the fact that each connection has two message buffers (read and write)
-    let max_message_pool_buffers = max_connections * 2 + MAX_IOVS;
+    let max_message_pool_buffers = max_connections * 2 + MAX_BUFFERS_PER_BATCH;
 
-    let max_payload_buffers_per_bucket = max_connections + (max_connections * MAX_IOVS);
+    let max_payload_buffers_per_bucket = max_connections + (max_connections * MAX_BUFFERS_PER_BATCH);
 
     // Create message buffer pool
     let message_buffer_pool = Pool::new(max_message_pool_buffers, conn_cfg.max_message_size as usize);
@@ -323,7 +390,14 @@ impl<ST: Service> ConnManager<ST> {
       0.5,                                          // 50% decay
     );
 
-    let task_tracker = TaskTracker::new();
+    // Create a single shared newline buffer
+    let newline_buffer = {
+      let pool = Pool::new(1, 1);
+      let mut buf = pool.acquire_buffer().await;
+      buf[0] = b'\n';
+      buf.freeze(1)
+    };
+
     let shutdown_token = CancellationToken::new();
 
     let inner = ConnManagerInner {
@@ -332,7 +406,7 @@ impl<ST: Service> ConnManager<ST> {
       active_connections: Arc::new(AtomicU32::new(0)),
       message_buffer_pool,
       payload_buffer_pool,
-      task_tracker,
+      newline_buffer,
       shutdown_token,
       _phantom: PhantomData,
     };
@@ -356,21 +430,33 @@ impl<ST: Service> ConnManager<ST> {
     // Notify the shutdown to all active connections.
     inner.shutdown_token.cancel();
 
-    // Wait for all connections to finish.
-    inner.task_tracker.close();
-    inner.task_tracker.wait().await;
+    // Poll until all active connections have drained.
+    let deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    loop {
+      if inner.active_connections.load(Ordering::SeqCst) == 0 {
+        break;
+      }
+      if std::time::Instant::now() >= deadline {
+        let remaining = inner.active_connections.load(Ordering::SeqCst);
+        warn!(remaining, service_type = ST::NAME, "connection manager timed out waiting for connections to drain");
+        break;
+      }
+
+      compio::time::sleep(SHUTDOWN_DRAIN_POLL_INTERVAL).await;
+    }
 
     info!(service_type = ST::NAME, "connection manager stopped");
 
     Ok(())
   }
 
+  /// Runs a single client connection to completion.
   pub async fn run_connection<S, D: Dispatcher, DF: DispatcherFactory<D>>(
     &self,
     mut stream: S,
     mut dispatcher_factory: DF,
   ) where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
   {
     let mut inner = self.0.write().await;
 
@@ -381,6 +467,7 @@ impl<ST: Service> ConnManager<ST> {
     let config = inner.config.clone();
     let message_buffer_pool = inner.message_buffer_pool.clone();
     let payload_buffer_pool = inner.payload_buffer_pool.clone();
+    let newline_buffer = inner.newline_buffer.clone();
     let active_connections = inner.active_connections.clone();
     let shutdown_token = inner.shutdown_token.clone();
 
@@ -394,7 +481,7 @@ impl<ST: Service> ConnManager<ST> {
 
       let _ = stream.write_all(SERVER_OVERLOADED_ERROR).await;
       let _ = stream.flush().await;
-      let _ = stream.close().await;
+      let _ = stream.shutdown().await;
 
       let max_conns = config.max_connections;
       warn!(max_conns, service_type = ST::NAME, "max connections limit reached");
@@ -417,7 +504,7 @@ impl<ST: Service> ConnManager<ST> {
       config: config.clone(),
       state: State::Connecting,
       dispatcher: Rc::new(UnsafeCell::new(dispatcher)),
-      task_tracker: TaskTracker::new(),
+      request_tasks: Rc::new(RefCell::new(Slab::with_capacity(config.max_inflight_requests as usize))),
       cancellation_token: CancellationToken::new(),
       activity_counter: Rc::new(Cell::new(0)),
       pong_notifier: None,
@@ -446,6 +533,7 @@ impl<ST: Service> ConnManager<ST> {
       shutdown_token,
       message_buffer_pool,
       payload_buffer_pool,
+      newline_buffer,
       payload_read_timeout,
       max_payload_size,
       rate_limit,
@@ -493,10 +581,10 @@ pub struct Conn<D: Dispatcher> {
   pong_notifier: Option<Sender<u32>>,
 
   /// Current scheduled task (ping or timeout).
-  scheduled_task: Option<tokio::task::JoinHandle<()>>,
+  scheduled_task: Option<Task>,
 
   /// Track tasks associated with connection requests.
-  task_tracker: TaskTracker,
+  request_tasks: Rc<RefCell<Slab<Task>>>,
 
   /// Token used to signal request cancellation.
   cancellation_token: CancellationToken,
@@ -603,8 +691,6 @@ impl<D: Dispatcher> Conn<D> {
     inflight_requests.set(current + 1);
 
     // Spawn the request task.
-    let task_tracker = self.task_tracker.clone();
-
     let handler = self.handler;
     let request_timeout = self.config.request_timeout;
 
@@ -612,17 +698,26 @@ impl<D: Dispatcher> Conn<D> {
 
     let cancellation_token = self.cancellation_token.clone();
 
-    task_tracker.spawn_local(async move {
-      tokio::select! {
-        res = future => {
-            if let Err(e) = res && let Err(e) = Self::notify_error::<ST>(e, tx, handler) {
+    let task_slot = self.request_tasks.borrow().vacant_key();
+    let request_tasks = self.request_tasks.clone();
+
+    let task = compio::runtime::spawn(async move {
+      let timeout_future = compio::time::timeout(request_timeout, future);
+
+      futures::select! {
+        res = timeout_future.fuse() => {
+          match res {
+            Ok(res) => {
+              if let Err(e) = res && let Err(e) = Self::notify_error::<ST>(e, tx, handler) {
                 warn!(handler = handler, service_type = ST::NAME, "failed to notify request error: {}", e.to_string());
+              }
+            },
+            Err(_) => {
+              error!(handler = handler, service_type = ST::NAME, "request timeout");
             }
+          }
         },
-        _ = tokio::time::sleep(request_timeout) => {
-          error!(handler = handler, service_type = ST::NAME, "request timeout");
-        },
-        _ = cancellation_token.cancelled() => {
+        _ = cancellation_token.cancelled().fuse() => {
           trace!(handler = handler, service_type = ST::NAME, "request cancelled");
         },
       }
@@ -630,7 +725,16 @@ impl<D: Dispatcher> Conn<D> {
       // Decrement the inflight requests counter.
       let current = inflight_requests.get();
       inflight_requests.set(current.saturating_sub(1));
+
+      // Clean up task
+      if request_tasks.borrow().contains(task_slot) {
+        drop(request_tasks.borrow_mut().remove(task_slot));
+      }
     });
+
+    // Store the task handle for tracking
+    let key = self.request_tasks.borrow_mut().insert(task);
+    debug_assert!(key == task_slot);
 
     Ok(())
   }
@@ -639,11 +743,12 @@ impl<D: Dispatcher> Conn<D> {
   fn schedule_timeout(&mut self, timeout: Duration, detail: Option<StringAtom>) {
     let tx = self.tx.clone();
 
-    let timeout_task = tokio::task::spawn_local(async move {
-      tokio::time::sleep(timeout).await;
+    let timeout_task = compio::runtime::spawn(async move {
+      compio::time::sleep(timeout).await;
 
       tx.close(Message::Error(ErrorParameters { id: None, reason: Timeout.into(), detail }));
     });
+
     self.scheduled_task = Some(timeout_task);
   }
 
@@ -661,11 +766,11 @@ impl<D: Dispatcher> Conn<D> {
     let (pong_tx, pong_rx) = bounded::<u32>(1);
     self.pong_notifier = Some(pong_tx);
 
-    let ping_task = tokio::task::spawn_local(async move {
+    let ping_task = compio::runtime::spawn(async move {
       let mut last_check_counter = activity_counter.get();
 
       loop {
-        tokio::time::sleep(heartbeat_interval).await;
+        compio::time::sleep(heartbeat_interval).await;
 
         let current_counter = activity_counter.get();
 
@@ -679,7 +784,7 @@ impl<D: Dispatcher> Conn<D> {
         trace!(id = ping_id, handler, service_type = ST::NAME, "sent ping");
 
         // Wait for PONG or timeout
-        match tokio::time::timeout(heartbeat_timeout, pong_rx.recv()).await {
+        match compio::time::timeout(heartbeat_timeout, pong_rx.recv()).await {
           Ok(Ok(pong_id)) if pong_id == ping_id => {
             trace!(id = ping_id, "pong received");
 
@@ -720,7 +825,7 @@ impl<D: Dispatcher> Conn<D> {
   /// Cancels currently scheduled task.
   fn cancel_scheduled_task(&mut self) {
     if let Some(task) = self.scheduled_task.take() {
-      task.abort()
+      drop(task)
     }
   }
 
@@ -738,8 +843,11 @@ impl<D: Dispatcher> Conn<D> {
     // Signal cancellation and wait for all request tasks to finish.
     self.cancellation_token.cancel();
 
-    self.task_tracker.close();
-    self.task_tracker.wait().await;
+    // Wait for all request tasks to complete
+    let tasks = std::mem::take(&mut *self.request_tasks.borrow_mut());
+    for (_key, task) in tasks {
+      let _ = task.await;
+    }
 
     // Shutdown the dispatcher.
     unsafe { &mut *self.dispatcher.get() }.shutdown().await?;
@@ -764,8 +872,8 @@ impl<D: Dispatcher> Conn<D> {
   }
 
   #[allow(clippy::too_many_arguments)]
-  async fn run<T, ST>(
-    stream: T,
+  async fn run<S, ST>(
+    stream: S,
     conn: &mut Conn<D>,
     handler: usize,
     send_msg_rx: Receiver<(Message, Option<PoolBuffer>)>,
@@ -773,15 +881,19 @@ impl<D: Dispatcher> Conn<D> {
     shutdown_token: CancellationToken,
     message_buffer_pool: Pool,
     payload_buffer_pool: BucketedPool,
+    newline_buffer: PoolBuffer,
     payload_read_timeout: Duration,
     max_payload_size: usize,
     rate_limit: u32,
   ) -> anyhow::Result<()>
   where
-    T: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
     ST: Service,
   {
-    let (reader, mut writer) = AsyncReadExt::split(stream);
+    let local_stream = LocalStream::new(stream);
+
+    let reader = local_stream.clone();
+    let mut writer = local_stream;
 
     // Bootstrap the connection.
     conn.bootstrap().await?;
@@ -797,6 +909,7 @@ impl<D: Dispatcher> Conn<D> {
         &shutdown_token,
         message_buffer_pool.clone(),
         payload_buffer_pool.clone(),
+        newline_buffer.clone(),
         payload_read_timeout,
         max_payload_size,
         rate_limit,
@@ -810,7 +923,7 @@ impl<D: Dispatcher> Conn<D> {
     // Shutdown the connection.
     let shutdown_result = conn.shutdown().await;
 
-    match writer.close().await {
+    match writer.shutdown().await {
       Ok(_) => {},
       Err(e) => {
         // Ignore expected socket disconnection errors that occur when client disconnects abruptly
@@ -829,9 +942,166 @@ impl<D: Dispatcher> Conn<D> {
     Ok(())
   }
 
+  /// Dedicated read loop spawned as a separate task.
+  ///
+  /// Sequentially reads from the stream, deserializes messages, reads payloads, and enforces rate limiting.
+  /// Results are sent to the main connection loop to be processed.
+  #[allow(clippy::too_many_arguments)]
+  async fn run_read_loop<T>(
+    mut stream_reader: StreamReader<LocalStream<T>>,
+    read_tx: Sender<ReadResult>,
+    payload_buffer_pool: BucketedPool,
+    payload_read_timeout: Duration,
+    max_payload_size: usize,
+    rate_limit: u32,
+    handler: usize,
+    service_name: &'static str,
+  ) where
+    T: AsyncRead + AsyncWrite + Unpin,
+  {
+    let mut rate_limit_counter: u32 = 0;
+    let mut rate_limit_last_check = std::time::Instant::now();
+
+    let mut delimiter_buf = Box::new([0u8; 1]);
+
+    loop {
+      match stream_reader.next().await {
+        Ok(true) => {
+          let line_bytes = stream_reader.get_line().unwrap();
+          let message_length = line_bytes.len() as u32;
+
+          match deserialize(Cursor::new(line_bytes)) {
+            Ok(msg) => {
+              let mut payload_opt: Option<PoolBuffer> = None;
+              let mut payload_length: u32 = 0;
+
+              // Read associated payload if present.
+              if let Some(payload_info) = msg.payload_info() {
+                if payload_info.length > max_payload_size {
+                  let err_message = Message::Error(ErrorParameters {
+                    id: payload_info.id,
+                    reason: PolicyViolation.into(),
+                    detail: Some("payload too large".into()),
+                  });
+                  let _ = read_tx.send(ReadResult::Error(err_message)).await;
+                  break;
+                }
+                payload_length = payload_info.length as u32;
+
+                let pool_buff = payload_buffer_pool.acquire_buffer(payload_info.length).await.unwrap();
+
+                match compio::time::timeout(
+                  payload_read_timeout,
+                  Self::read_payload(
+                    pool_buff,
+                    delimiter_buf,
+                    &mut stream_reader,
+                    payload_info.length,
+                    payload_info.id,
+                  ),
+                )
+                .await
+                {
+                  Ok(Ok(mut result)) => {
+                    payload_opt = Some(result.data.freeze(payload_info.length));
+                    delimiter_buf = result.delimiter;
+                  },
+                  Ok(Err(e)) => {
+                    let err_message: Message = if let Some(e) = e.downcast_ref::<narwhal_protocol::Error>() {
+                      e.into()
+                    } else {
+                      warn!(handler = handler, service_type = service_name, "failed to read payload: {}", e);
+                      Message::Error(ErrorParameters { id: None, reason: InternalServerError.into(), detail: None })
+                    };
+                    let _ = read_tx.send(ReadResult::Error(err_message)).await;
+                    break;
+                  },
+                  Err(_) => {
+                    let err_message = Message::Error(ErrorParameters {
+                      id: None,
+                      reason: Timeout.into(),
+                      detail: Some("payload read timeout".into()),
+                    });
+                    let _ = read_tx.send(ReadResult::Error(err_message)).await;
+                    break;
+                  },
+                }
+              }
+
+              // Check if the rate limit is exceeded.
+              if rate_limit > 0 {
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(rate_limit_last_check);
+                if elapsed.as_secs() > 1 {
+                  rate_limit_counter = 0;
+                  rate_limit_last_check = now;
+                }
+
+                rate_limit_counter += message_length + payload_length;
+
+                if rate_limit_counter > rate_limit {
+                  let err_message = Message::Error(ErrorParameters {
+                    id: msg.correlation_id(),
+                    reason: PolicyViolation.into(),
+                    detail: Some("rate limit exceeded".into()),
+                  });
+                  let _ = read_tx.send(ReadResult::Error(err_message)).await;
+                  break;
+                }
+              }
+
+              // Send parsed message to the main connection loop.
+              if read_tx.send(ReadResult::Message { message: msg, payload: payload_opt }).await.is_err() {
+                break;
+              }
+            },
+            Err(e) => {
+              let err_detail = format!("{}", e);
+              let err_message = Message::Error(ErrorParameters {
+                id: None,
+                reason: BadRequest.into(),
+                detail: Some(StringAtom::from(err_detail)),
+              });
+              let _ = read_tx.send(ReadResult::Error(err_message)).await;
+              break;
+            },
+          }
+        },
+        Ok(false) => {
+          // Stream closed by the client.
+          let _ = read_tx.send(ReadResult::Eof).await;
+          break;
+        },
+        Err(e) => {
+          match e {
+            StreamReaderError::MaxLineLengthExceeded => {
+              let err_message = Message::Error(ErrorParameters {
+                id: None,
+                reason: PolicyViolation.into(),
+                detail: Some("max message size exceeded".into()),
+              });
+              let _ = read_tx.send(ReadResult::Error(err_message)).await;
+            },
+            StreamReaderError::IoError(e) => {
+              if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                error!(
+                  handler = handler,
+                  service_type = service_name,
+                  "failed to read from connection: {}",
+                  e.to_string()
+                );
+              }
+            },
+          }
+          break;
+        },
+      }
+    }
+  }
+
   #[allow(clippy::too_many_arguments)]
   async fn run_connection_loop<T, W, ST>(
-    reader: futures::io::ReadHalf<T>,
+    reader: LocalStream<T>,
     writer: &mut W,
     conn: &mut Conn<D>,
     handler: usize,
@@ -840,162 +1110,74 @@ impl<D: Dispatcher> Conn<D> {
     shutdown_token: &CancellationToken,
     message_buffer_pool: Pool,
     payload_buffer_pool: BucketedPool,
+    newline_buffer: PoolBuffer,
     payload_read_timeout: Duration,
     max_payload_size: usize,
     rate_limit: u32,
   ) -> anyhow::Result<()>
   where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin + 'static,
     W: AsyncWrite + Unpin,
     ST: Service,
   {
-    // Initialize stream reader
+    // Initialize stream reader and hand it off to the read loop.
     let read_pool_buffer = message_buffer_pool.acquire_buffer().await;
-    let mut stream_reader = StreamReader::with_pool_buffer(reader, read_pool_buffer);
+    let stream_reader = StreamReader::with_pool_buffer(reader, read_pool_buffer);
 
-    // Initialize connection loop state
-    let mut rate_limit_counter = 0;
-    let mut rate_limit_last_check = tokio::time::Instant::now();
+    let (read_tx, read_rx) = bounded::<ReadResult>(READ_CHANNEL_CAPACITY);
 
-    let mut message_buffers_batch: Vec<PoolBuffer> = Vec::with_capacity(MAX_IOVS);
-    let mut payload_buffers_batch: Vec<Option<PoolBuffer>> = Vec::with_capacity(MAX_IOVS);
+    // Spawn the read loop as a separate task.
+    let reader_task = compio::runtime::spawn(Self::run_read_loop(
+      stream_reader,
+      read_tx,
+      payload_buffer_pool,
+      payload_read_timeout,
+      max_payload_size,
+      rate_limit,
+      handler,
+      ST::NAME,
+    ));
 
-    let mut iovs = vec![IoSlice::new(&[]); MAX_IOVS * 3].into_boxed_slice();
+    let mut pool_buffer_batch = Vec::<PoolBuffer>::with_capacity(MAX_BUFFERS_PER_BATCH);
 
-    let cancelled = shutdown_token.cancelled();
-    tokio::pin!(cancelled);
+    let mut cancelled = std::pin::pin!(shutdown_token.cancelled().fuse());
 
     'connection_loop: loop {
-      tokio::select! {
-        // Read the next line from the stream.
-        res = {
-          stream_reader.next()
-        } => {
+      futures::select! {
+        // Receive parsed messages from the read loop.
+        res = read_rx.recv().fuse() => {
           match res {
-            Ok(true) => {
-              let line_bytes = stream_reader.get_line().unwrap();
-
-              let message_length = line_bytes.len() as u32;
-
-              // Deserialize the message and handle it.
-              match deserialize(Cursor::new(line_bytes)) {
-                Ok(msg) => {
-                  // Dispatch the message to the connection.
-                  let mut payload_opt: Option<PoolBuffer> = None;
-
-                  // Check if the message has an associated payload, and if so,
-                  // read it from the connection.
-                  let mut payload_length: u32 = 0;
-
-                  if let Some(payload_info) = msg.payload_info() {
-                    if payload_info.length > max_payload_size {
-                      let err_message = Message::Error(ErrorParameters{id: payload_info.id, reason: PolicyViolation.into(), detail: Some("payload too large".into())});
-                      Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await).await?;
-                      break 'connection_loop;
-                    }
-                    payload_length = payload_info.length as u32;
-
-                    let mut pool_buff = payload_buffer_pool.acquire_buffer(payload_info.length).await.unwrap();
-
-                    let payload = &mut pool_buff.as_mut_slice()[..payload_info.length];
-
-                    match tokio::time::timeout(payload_read_timeout, Self::read_payload(payload, &mut stream_reader, payload_info.id)).await {
-                      Ok(res) => {
-                        match res {
-                          Ok(_) => {
-                            payload_opt = Some(pool_buff.freeze(payload_info.length));
-                          },
-                          Err(e) => {
-                            let err_message: Message = {
-                                if let Some(e) = e.downcast_ref::<narwhal_protocol::Error>() {
-                                    e.into()
-                                } else {
-                                    warn!(handler = handler, service_type = ST::NAME, "failed to read payload: {}", e);
-                                    Message::Error(ErrorParameters{id: None, reason: InternalServerError.into(), detail: None})
-                                }
-                            };
-
-                            Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await).await?;
-                            break 'connection_loop;
-                          },
-                        }
-                      },
-                      Err(_) => {
-                        let err_message = Message::Error(ErrorParameters{id: None, reason: Timeout.into(), detail: Some("payload read timeout".into())});
-                        Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await).await?;
-                        break 'connection_loop;
-                      },
-                    }
-                  }
-
-                  // Check if the rate limit is exceeded.
-                  if rate_limit > 0 {
-                    let now = tokio::time::Instant::now();
-                    let elapsed = now.duration_since(rate_limit_last_check);
-                    if elapsed.as_secs() > 1 {
-                        rate_limit_counter = 0;
-                        rate_limit_last_check = now;
-                    }
-
-                    rate_limit_counter += message_length + payload_length;
-
-                    if rate_limit_counter > rate_limit {
-                      let err_message = Message::Error(ErrorParameters{id: msg.correlation_id(), reason: PolicyViolation.into(), detail: Some("rate limit exceeded".into())});
-                      Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await).await?;
-                      break 'connection_loop;
-                    }
-                  }
-
-                  // Dispatch the message to the connection handler.
-                  match conn.dispatch_message::<ST>(msg, payload_opt).await {
-                    Ok(_) => {},
-                    Err(e) => {
-                      warn!(handler = handler, service_type = ST::NAME, "failed to dispatch message: {}", e.to_string());
-                      break 'connection_loop;
-                    },
-                  }
-                },
+            Ok(ReadResult::Message { message, payload }) => {
+              match conn.dispatch_message::<ST>(message, payload).await {
+                Ok(_) => {},
                 Err(e) => {
-                  let err_detail = format!("{}", e);
-                  let err_message = Message::Error(ErrorParameters{id: None, reason: BadRequest.into(), detail: Some(StringAtom::from(err_detail))});
-                  Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await).await?;
+                  warn!(handler = handler, service_type = ST::NAME, "failed to dispatch message: {}", e.to_string());
                   break 'connection_loop;
                 },
               }
-            },
-            Ok(false) => {
-              // Stream closed by the client.
+            }
+            Ok(ReadResult::Eof) => {
               trace!(handler = handler, service_type = ST::NAME, "connection closed by peer");
               break 'connection_loop;
             }
-            Err(e) => {
-              match e {
-                StreamReaderError::MaxLineLengthExceeded => {
-                  let err_message = Message::Error(ErrorParameters{ id: None, reason: PolicyViolation.into(), detail: Some("max message size exceeded".into()) });
-                  Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await).await?;
-                  break 'connection_loop;
-                },
-                StreamReaderError::IoError(e) => {
-                  if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                    error!(handler = handler, service_type = ST::NAME, "failed to read from connection: {}", e.to_string());
-                  }
-                  break 'connection_loop;
-                },
-              }
+            Ok(ReadResult::Error(err_message)) => {
+              let _  = Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await, &newline_buffer, pool_buffer_batch).await?;
+              break 'connection_loop;
+            }
+            Err(_) => {
+              // Read task exited unexpectedly.
+              break 'connection_loop;
             }
           }
         },
 
-        // Write the message to the stream.
-        res = send_msg_rx.recv() => {
+        // Write outbound messages to the stream.
+        res = send_msg_rx.recv().fuse() => {
           const MESSAGE_CHANNEL_CLOSED_LOG: &str = "message channel closed";
 
           match res {
             Ok((message, payload_opt)) => {
-                let message_buff = Self::serialize_message(&message, message_buffer_pool.acquire_buffer().await)?;
-
-                message_buffers_batch.push(message_buff);
-                payload_buffers_batch.push(payload_opt);
+              Self::add_message_to_batch(&message, payload_opt, &mut pool_buffer_batch, &message_buffer_pool, &newline_buffer).await?;
             }
             Err(_) => {
               error!(handler = handler, service_type = ST::NAME, MESSAGE_CHANNEL_CLOSED_LOG);
@@ -1004,16 +1186,13 @@ impl<D: Dispatcher> Conn<D> {
           };
 
           loop {
-            if message_buffers_batch.len() == message_buffers_batch.capacity() {
+            if pool_buffer_batch.len() >= MAX_BUFFERS_PER_BATCH {
                 break;
             }
 
             match send_msg_rx.try_recv() {
               Ok((message, payload_opt)) => {
-                  let message_buff = Self::serialize_message(&message, message_buffer_pool.acquire_buffer().await)?;
-
-                  message_buffers_batch.push(message_buff);
-                  payload_buffers_batch.push(payload_opt);
+                Self::add_message_to_batch(&message, payload_opt, &mut pool_buffer_batch, &message_buffer_pool, &newline_buffer).await?;
               },
               Err(TryRecvError::Empty) => break,
               Err(TryRecvError::Closed) => {
@@ -1023,36 +1202,29 @@ impl<D: Dispatcher> Conn<D> {
             }
           }
 
-          let iovs_count = Self::prepare_iovs(
-              message_buffers_batch.as_ptr(),
-              payload_buffers_batch.as_ptr(),
-              message_buffers_batch.len(),
-              iovs.as_mut_ptr(),
-          );
-
-          Self::write_iovs(&mut iovs[..iovs_count], writer).await?;
-
-          message_buffer_pool.release_buffers(&mut message_buffers_batch);
-          payload_buffers_batch.clear();
+          pool_buffer_batch = Self::write_batch(pool_buffer_batch, writer).await?;
         },
 
         // Close the connection.
-        res = close_rx.recv() => {
+        res = close_rx.recv().fuse() => {
           let err_message = res.unwrap();
-          Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await).await?;
+          let _  = Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await, &newline_buffer, pool_buffer_batch).await?;
           trace!(handler = handler, service_type = ST::NAME, "closed connection");
           break 'connection_loop;
         },
 
         // Close the connection on shutdown.
-        _ = &mut cancelled => {
+        _ = cancelled.as_mut() => {
           let err_message = Message::Error(ErrorParameters{id: None, reason: ServerShuttingDown.into(), detail: None});
-          Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await).await?;
-          trace!(handler = handler, service_type = ST::NAME, "closed connection");
+          let _ = Self::write_message(&err_message, None, writer, message_buffer_pool.acquire_buffer().await, &newline_buffer, pool_buffer_batch).await?;
+          trace!(handler = handler, service_type = ST::NAME, "closed connection on shutdown");
           break 'connection_loop;
         },
       }
     }
+
+    // Stop polling the reader task.
+    drop(reader_task);
 
     Ok(())
   }
@@ -1062,62 +1234,53 @@ impl<D: Dispatcher> Conn<D> {
     payload_opt: Option<PoolBuffer>,
     writer: &mut W,
     message_buffer: MutablePoolBuffer,
-  ) -> anyhow::Result<()>
+    newline_buffer: &PoolBuffer,
+    mut batch: Vec<PoolBuffer>,
+  ) -> anyhow::Result<Vec<PoolBuffer>>
   where
     W: AsyncWrite + Unpin,
   {
     let message_buff = Self::serialize_message(message, message_buffer)?;
+    batch.push(message_buff);
 
-    let message_buffer_batch = [message_buff];
-    let payload_buffer_batch = [payload_opt];
+    if let Some(payload_buf) = payload_opt {
+      batch.push(payload_buf);
+      batch.push(newline_buffer.clone());
+    };
 
-    let mut iovs = [IoSlice::new(&[]); 3];
-    let iovs_count =
-      Self::prepare_iovs(message_buffer_batch.as_ptr(), payload_buffer_batch.as_ptr(), 1, iovs.as_mut_ptr());
-
-    Self::write_iovs(&mut iovs[..iovs_count], writer).await?;
-
-    Ok(())
+    Self::write_batch(batch, writer).await
   }
 
-  fn prepare_iovs<'a>(
-    message_buffer_batch_ptr: *const PoolBuffer,
-    payload_buffer_batch_ptr: *const Option<PoolBuffer>,
-    batch_len: usize,
-    iovs: *mut IoSlice<'a>,
-  ) -> usize {
-    let mut iovs_count = 0;
-
-    unsafe {
-      for i in 0..batch_len {
-        let message_buffer_batch_item = &*message_buffer_batch_ptr.add(i);
-        let payload_buffer_batch_item = &*payload_buffer_batch_ptr.add(i);
-
-        let message_buff = &message_buffer_batch_item;
-        let payload_opt = &payload_buffer_batch_item;
-
-        *iovs.add(iovs_count) = IoSlice::new(message_buff.as_slice());
-        iovs_count += 1;
-
-        if let Some(payload) = payload_opt {
-          *iovs.add(iovs_count) = IoSlice::new(payload.as_slice());
-          iovs_count += 1;
-          *iovs.add(iovs_count) = IoSlice::new(b"\n");
-          iovs_count += 1;
-        }
-      }
-    }
-
-    iovs_count
-  }
-
-  async fn write_iovs<W>(iovs: &mut [IoSlice<'_>], writer: &mut W) -> anyhow::Result<()>
+  async fn write_batch<W>(batch: Vec<PoolBuffer>, writer: &mut W) -> anyhow::Result<Vec<PoolBuffer>>
   where
     W: AsyncWrite + Unpin,
   {
-    write_all_vectored(iovs, writer).await?;
+    let buf_result = writer.write_vectored_all(batch).await;
+
+    buf_result.0?;
+
+    let mut batch = buf_result.1;
+    batch.clear();
+
     writer.flush().await?;
 
+    Ok(batch)
+  }
+
+  async fn add_message_to_batch(
+    message: &Message,
+    payload_opt: Option<PoolBuffer>,
+    batch: &mut Vec<PoolBuffer>,
+    message_buffer_pool: &Pool,
+    newline_buffer: &PoolBuffer,
+  ) -> anyhow::Result<()> {
+    let message_buff = Self::serialize_message(message, message_buffer_pool.acquire_buffer().await)?;
+    batch.push(message_buff);
+
+    if let Some(payload_buf) = payload_opt {
+      batch.push(payload_buf);
+      batch.push(newline_buffer.clone());
+    }
     Ok(())
   }
 
@@ -1149,22 +1312,23 @@ impl<D: Dispatcher> Conn<D> {
     }
   }
 
-  async fn read_payload<T>(
-    buffer: &mut [u8],
-    stream_reader: &mut StreamReader<futures::io::ReadHalf<T>>,
+  async fn read_payload<B, T>(
+    mut buf: B,
+    mut delimiter_buf: Box<[u8; 1]>,
+    stream_reader: &mut StreamReader<LocalStream<T>>,
+    len: usize,
     correlation_id: Option<u32>,
-  ) -> anyhow::Result<()>
+  ) -> anyhow::Result<PayloadReadResult<B>>
   where
+    B: IoBufMut,
     T: AsyncRead + Unpin,
   {
-    stream_reader.read_raw(buffer).await?;
+    buf = stream_reader.read_raw(buf, len).await?;
 
-    // Read last byte, and ensure it's a newline.
-    let mut cr: [u8; 1] = [0; 1];
-    stream_reader.read_raw(&mut cr).await?;
+    // Read last byte, and ensure it's a newline
+    delimiter_buf = stream_reader.read_raw(delimiter_buf, 1).await?;
 
-    // Verify it's actually a newline
-    if cr[0] != b'\n' {
+    if delimiter_buf[0] != b'\n' {
       let mut error = narwhal_protocol::Error::new(BadRequest).with_detail(StringAtom::from("invalid payload format"));
       if let Some(id) = correlation_id {
         error = error.with_id(id);
@@ -1172,8 +1336,17 @@ impl<D: Dispatcher> Conn<D> {
       return Err(error.into());
     }
 
-    Ok(())
+    Ok(PayloadReadResult { data: buf, delimiter: delimiter_buf })
   }
+}
+
+/// The result of reading a payload and its trailing delimiter.
+struct PayloadReadResult<B> {
+  /// The payload data buffer.
+  data: B,
+
+  /// The delimiter buffer.
+  delimiter: Box<[u8; 1]>,
 }
 
 /// The connection transmitter.
@@ -1250,275 +1423,5 @@ impl ConnTx {
   pub fn close(&self, message: Message) {
     assert!(matches!(message, Message::Error { .. }), "a Message::Error message is expected");
     let _ = self.close_tx.try_send(message);
-  }
-}
-
-const CONN_QUEUE_SIZE: usize = 1024;
-
-/// A trait representing a connection stream that can be read from and written to.
-pub trait ConnStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
-
-impl<T> ConnStream for T where T: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
-
-/// A type alias for an async function that provides a connection stream when invoked.
-pub type ConnProvider<S> =
-  Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = anyhow::Result<S>> + Send>> + Send + 'static>;
-
-/// A pool of connection workers that distributes streams across multiple workers.
-///
-/// The pool manages multiple `ConnWorker` instances, each bound to a different CPU core.
-/// When streams are submitted, they are automatically routed to the worker with the
-/// fewest active streams, providing automatic load balancing.
-///
-/// # Type Parameters
-///
-/// * `S` - The connection stream type (must implement `ConnStream`)
-/// * `D` - The dispatcher type for handling messages
-/// * `DF` - The dispatcher factory for creating dispatchers
-/// * `ST` - The service type being served
-pub struct ConnWorkerPool<S, D: Dispatcher, DF: DispatcherFactory<D>, ST: Service>
-where
-  S: ConnStream,
-{
-  /// The collection of workers in the pool.
-  workers: Arc<[ConnWorker<S, D, DF, ST>]>,
-}
-
-impl<S, D: Dispatcher, DF: DispatcherFactory<D>, ST: Service> Clone for ConnWorkerPool<S, D, DF, ST>
-where
-  S: ConnStream,
-{
-  fn clone(&self) -> Self {
-    Self { workers: self.workers.clone() }
-  }
-}
-
-impl<S, D: Dispatcher, DF: DispatcherFactory<D>, ST: Service> ConnWorkerPool<S, D, DF, ST>
-where
-  S: ConnStream,
-{
-  /// Creates a new connection worker pool.
-  ///
-  /// Each worker is assigned to a different CPU core in a round-robin fashion based
-  /// on the available cores on the system. If `worker_count` exceeds the number of
-  /// available cores, workers will be assigned to cores cyclically.
-  ///
-  /// # Arguments
-  ///
-  /// * `worker_count` - The number of workers to create in the pool
-  /// * `conn_manager` - The connection manager to use for processing streams
-  /// * `dispatcher_factory` - The dispatcher factory to use for creating dispatchers
-  ///
-  /// # Returns
-  ///
-  /// Returns a `ConnWorkerPool` instance or an error if worker creation fails.
-  pub fn new(worker_count: usize, conn_manager: ConnManager<ST>, dispatcher_factory: DF) -> anyhow::Result<Self> {
-    // Get available CPU cores
-    let core_ids = core_affinity::get_core_ids().ok_or_else(|| anyhow::anyhow!("failed to get core IDs"))?;
-
-    if core_ids.is_empty() {
-      return Err(anyhow::anyhow!("no CPU cores available"));
-    }
-
-    // Create workers, assigning each to a core in round-robin fashion
-    let mut workers = Vec::with_capacity(worker_count);
-
-    for i in 0..worker_count {
-      let core_id = core_ids[i % core_ids.len()];
-      let worker = ConnWorker::new(conn_manager.clone(), dispatcher_factory.clone(), core_id)?;
-      workers.push(worker);
-    }
-
-    Ok(ConnWorkerPool { workers: workers.into() })
-  }
-
-  /// Submits a new stream provider to be processed by a worker.
-  ///
-  /// This method performs automatic load balancing by finding the worker with the
-  /// lowest number of active streams and submitting the provided stream to that worker.
-  ///
-  /// If multiple workers have the same minimum load, the first one encountered is chosen.
-  ///
-  /// # Arguments
-  ///
-  /// * `stream_provider` - A function that provides the connection stream when invoked
-  pub async fn submit<F, Fut>(&self, stream_provider: F)
-  where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = anyhow::Result<S>> + Send + 'static,
-  {
-    if let Some(worker) = self.workers.iter().min_by_key(|w| w.active_streams()) {
-      worker.submit(stream_provider).await;
-    }
-  }
-
-  /// Returns the total number of active streams across all workers.
-  ///
-  /// # Returns
-  ///
-  /// The sum of active streams from all workers in the pool.
-  pub fn active_streams(&self) -> usize {
-    self.workers.iter().map(|w| w.active_streams()).sum()
-  }
-
-  /// Returns the number of workers in the pool.
-  ///
-  /// # Returns
-  ///
-  /// The number of workers as a `usize`.
-  pub fn worker_count(&self) -> usize {
-    self.workers.len()
-  }
-}
-
-/// A worker that processes connection streams on a dedicated thread.
-///
-/// # Type Parameters
-///
-/// * `S` - The connection stream type (must implement `ConnStream`)
-/// * `D` - The dispatcher type for handling messages
-/// * `DF` - The dispatcher factory for creating dispatchers
-/// * `ST` - The service type being served
-#[derive(Debug)]
-struct ConnWorker<S, D: Dispatcher, DF: DispatcherFactory<D>, ST: Service>
-where
-  S: ConnStream,
-{
-  /// Channel sender for submitting stream providers to the worker thread.
-  tx: Option<Sender<ConnProvider<S>>>,
-
-  /// Handle to the worker thread. Used to join the thread on shutdown.
-  handle: Option<thread::JoinHandle<()>>,
-
-  /// Atomic counter tracking the number of currently active stream tasks.
-  active_streams: Arc<AtomicUsize>,
-
-  /// Phantom data to maintain type parameters in the struct.
-  #[allow(clippy::type_complexity)]
-  _phantom: PhantomData<fn() -> (D, DF, ST)>,
-}
-
-impl<S, D: Dispatcher, DF: DispatcherFactory<D>, ST: Service> ConnWorker<S, D, DF, ST>
-where
-  S: ConnStream,
-{
-  /// Creates a new connection worker bound to a specific CPU core.
-  ///
-  /// This spawns a new OS thread with the specified CPU affinity and creates a
-  /// single-threaded Tokio runtime on that thread. The worker will process streams
-  /// submitted via the `submit()` method.
-  ///
-  /// # Arguments
-  ///
-  /// * `conn_manager` - The connection manager to use for processing streams
-  /// * `dispatcher_factory` - The dispatcher factory to use for creating dispatchers
-  /// * `affinity` - The CPU core ID to bind this worker thread to
-  ///
-  /// # Returns
-  ///
-  /// Returns a `ConnWorker` instance or an error if thread creation fails.
-  ///
-  /// # Example
-  ///
-  /// ```ignore
-  /// let worker = ConnWorker::new(conn_manager, dispatcher_factory, CoreId { id: 0 })?;
-  /// ```
-  fn new(conn_manager: ConnManager<ST>, dispatcher_factory: DF, affinity: CoreId) -> anyhow::Result<Self> {
-    let (tx, rx) = bounded::<ConnProvider<S>>(CONN_QUEUE_SIZE);
-
-    let active_streams = Arc::new(AtomicUsize::new(0));
-    let active_streams_clone = active_streams.clone();
-
-    let handle = thread::spawn(move || {
-      let _ = core_affinity::set_for_current(affinity);
-
-      Self::spawn_runtime(conn_manager, dispatcher_factory, rx, active_streams_clone);
-    });
-
-    Ok(ConnWorker { tx: Some(tx), handle: Some(handle), active_streams, _phantom: PhantomData })
-  }
-
-  /// Returns the current number of active stream tasks being processed.
-  ///
-  /// # Returns
-  ///
-  /// The number of active streams as a `usize`.
-  fn active_streams(&self) -> usize {
-    self.active_streams.load(Ordering::Relaxed)
-  }
-
-  /// Submits a new stream provider to be processed by the worker thread.
-  ///
-  /// If the worker has been stopped, the provider is silently ignored.
-  ///
-  /// # Arguments
-  ///
-  /// * `stream_provider` - A function that provides the connection stream when invoked
-  async fn submit<F, Fut>(&self, stream_provider: F)
-  where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = anyhow::Result<S>> + Send + 'static,
-  {
-    if let Some(tx) = &self.tx {
-      let _ = tx.send(Box::new(|| Box::pin(stream_provider()))).await;
-    }
-  }
-
-  /// Spawns a single-threaded async runtime associated to the worker thread.
-  fn spawn_runtime(
-    conn_manager: ConnManager<ST>,
-    dispatcher_factory: DF,
-    rx: Receiver<ConnProvider<S>>,
-    active_streams: Arc<AtomicUsize>,
-  ) {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-
-    rt.block_on(async move {
-      let local = tokio::task::LocalSet::new();
-
-      local
-        .run_until(async move {
-          while let Ok(stream_provider) = rx.recv().await {
-            let conn_manager = conn_manager.clone();
-            let dispatcher_factory = dispatcher_factory.clone();
-
-            let worker_active_conns = active_streams.clone();
-
-            tokio::task::spawn_local(async move {
-              let stream = match stream_provider().await {
-                Ok(s) => s,
-                Err(e) => {
-                  warn!("connection provider failed: {}", e.to_string());
-                  return;
-                },
-              };
-
-              worker_active_conns.fetch_add(1, Ordering::Relaxed);
-
-              conn_manager.run_connection(stream, dispatcher_factory).await;
-
-              worker_active_conns.fetch_sub(1, Ordering::Relaxed);
-            });
-          }
-        })
-        .await;
-    });
-  }
-}
-
-impl<S, D: Dispatcher, DF: DispatcherFactory<D>, ST: Service> Drop for ConnWorker<S, D, DF, ST>
-where
-  S: ConnStream,
-{
-  fn drop(&mut self) {
-    // Drop the sender to signal the worker thread to stop
-    if let Some(tx) = self.tx.take() {
-      drop(tx);
-
-      // Wait for the worker thread to terminate
-      if let Some(handle) = self.handle.take() {
-        let _ = handle.join();
-      }
-    }
   }
 }

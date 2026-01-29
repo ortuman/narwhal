@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+use compio::net::TcpStream;
 
 use narwhal_modulator::{Modulator, S2mListener};
 use narwhal_protocol::{Message, S2mConnectParameters};
@@ -23,7 +22,9 @@ pub struct S2mSuite<M: Modulator> {
 
 impl<M: Modulator> S2mSuite<M> {
   /// Creates a new S2mSuite with the given configuration and modulator.
-  pub fn with_config(config: narwhal_modulator::S2mServerConfig, modulator: M) -> Self {
+  ///
+  /// This is `async` because `ConnManager::new` (conn) is async.
+  pub async fn with_config(config: narwhal_modulator::S2mServerConfig, modulator: M) -> Self {
     let arc_config = Arc::new(config);
 
     let dispatcher_factory =
@@ -31,9 +32,9 @@ impl<M: Modulator> S2mSuite<M> {
 
     let server_config = arc_config.server.clone();
 
-    let conn_mng = narwhal_modulator::conn::S2mConnManager::new(&server_config);
+    let conn_mng = narwhal_modulator::conn::S2mConnManager::new(&server_config).await;
 
-    let ln = S2mListener::new(server_config.listener.clone(), conn_mng.clone(), dispatcher_factory, 1);
+    let ln = S2mListener::new(server_config.listener.clone(), conn_mng, dispatcher_factory);
 
     Self { config: arc_config, ln }
   }
@@ -56,10 +57,13 @@ impl<M: Modulator> S2mSuite<M> {
   }
 
   /// Creates a new socket connection to the server without authentication.
-  pub async fn socket_connect(&self) -> anyhow::Result<TestConn<Compat<TcpStream>>> {
+  ///
+  /// Uses `compio::net::TcpStream` so the returned `TestConn` works
+  /// natively with compio's completion-based I/O.
+  pub async fn socket_connect(&self) -> anyhow::Result<TestConn<TcpStream>> {
     let addr = self.ln.local_address().expect("local address not set");
 
-    let tcp_stream = TcpStream::connect(&addr).await?.compat();
+    let tcp_stream = TcpStream::connect(addr).await?;
 
     let max_message_size = self.config().server.limits.max_message_size as usize;
 
@@ -75,7 +79,7 @@ impl<M: Modulator> S2mSuite<M> {
   /// # Arguments
   ///
   /// * `secret` - The secret to use for authentication
-  pub async fn connect(&mut self, secret: &str) -> anyhow::Result<TestConn<Compat<TcpStream>>> {
+  pub async fn connect(&mut self, secret: &str) -> anyhow::Result<TestConn<TcpStream>> {
     let mut socket = self.socket_connect().await?;
 
     socket
@@ -102,7 +106,7 @@ impl<M: Modulator> S2mSuite<M> {
     &mut self,
     secret: &str,
     heartbeat_interval: u32,
-  ) -> anyhow::Result<TestConn<Compat<TcpStream>>> {
+  ) -> anyhow::Result<TestConn<TcpStream>> {
     let mut socket = self.socket_connect().await?;
 
     socket
@@ -130,6 +134,7 @@ pub fn default_s2m_config_with_secret(secret: &str) -> narwhal_modulator::S2mSer
     listener: narwhal_modulator::ListenerConfig {
       network: narwhal_modulator::TCP_NETWORK.to_string(),
       bind_address: "127.0.0.1:0".to_string(), // use a random port
+      workers_count: 1,
       ..Default::default()
     },
     limits: narwhal_modulator::Limits {

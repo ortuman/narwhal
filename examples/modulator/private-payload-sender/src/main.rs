@@ -8,10 +8,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use clap::Parser;
+use futures::{select, FutureExt};
 use serde_json::json;
-use tokio::sync::broadcast;
 
-use tokio::signal;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -32,7 +31,7 @@ struct PrivatePayloadSender {
   target: StringAtom,
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl narwhal_modulator::Modulator for PrivatePayloadSender {
   /// Returns the unique name of this modulator.
   async fn protocol_name(&self) -> anyhow::Result<StringAtom> {
@@ -97,18 +96,17 @@ impl narwhal_modulator::Modulator for PrivatePayloadSender {
     let target = self.target.clone();
 
     // Create a broadcast channel for sending payloads
-    let (sender, receiver) = broadcast::channel(100);
+    let (sender, receiver) = async_broadcast::broadcast(100);
 
     // Create a new pool buffer with the reversed text
     let pool = narwhal_util::pool::Pool::new(1, 4096);
 
     // Spawn a task to send payloads every 5 seconds
-    tokio::spawn(async move {
-      let mut interval = tokio::time::interval(Duration::from_secs(5));
+    compio::runtime::spawn(async move {
       let mut counter = 0;
 
       loop {
-        interval.tick().await;
+        compio::time::sleep(Duration::from_secs(5)).await;
         counter += 1;
 
         // Create a test JSON payload
@@ -135,10 +133,11 @@ impl narwhal_modulator::Modulator for PrivatePayloadSender {
           };
 
           // Send through the broadcast channel
-          let _ = sender.send(outbound_payload);
+          let _ = sender.try_broadcast(outbound_payload);
         }
       }
-    });
+    })
+    .detach();
 
     Ok(ReceivePrivatePayloadResponse { receiver })
   }
@@ -158,8 +157,7 @@ struct Cli {
   target: Option<String>,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
   let env_filter = EnvFilter::builder().with_default_directive(LevelFilter::INFO.into()).from_env_lossy();
 
   tracing_subscriber::fmt().with_env_filter(env_filter).init();
@@ -174,10 +172,14 @@ async fn main() {
   let modulator =
     PrivatePayloadSender { target: StringAtom::from(cli.target.unwrap_or_else(|| "test_user".to_string())) };
 
-  match run_s2m_server(config, modulator).await {
-    Ok(_) => {},
-    Err(e) => eprintln!("error: {}", e),
-  }
+  let rt = compio::runtime::Runtime::new().unwrap();
+
+  rt.block_on(async {
+    match run_s2m_server(config, modulator).await {
+      Ok(_) => {},
+      Err(e) => eprintln!("error: {}", e),
+    }
+  });
 }
 
 async fn run_s2m_server<M>(config: S2mServerConfig, modulator: M) -> anyhow::Result<()>
@@ -186,7 +188,7 @@ where
 {
   let protocol_name = modulator.protocol_name().await?;
 
-  let mut ln = create_s2m_listener(config, modulator, 1).await?;
+  let mut ln = create_s2m_listener(config, modulator).await?;
 
   info!(protocol_name = protocol_name.as_ref(), "📡 starting s2m server...");
 
@@ -220,12 +222,10 @@ fn load_config(config_file: Option<String>) -> anyhow::Result<S2mServerConfig> {
 }
 
 async fn wait_for_stop_signal() -> anyhow::Result<()> {
-  let mut sig_term = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+  let sig_term = compio_signal::unix::signal(libc::SIGTERM);
 
-  tokio::select! {
-    _ = signal::ctrl_c() => Ok(()),
-    _ = sig_term.recv() => {
-      Ok(())
-    },
+  select! {
+    _ = compio_signal::ctrl_c().fuse() => Ok(()),
+    _ = sig_term.fuse() => Ok(()),
   }
 }

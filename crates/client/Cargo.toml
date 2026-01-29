@@ -5,21 +5,27 @@ edition = "2024"
 license = "BSD-3-Clause"
 
 [dependencies]
-anyhow = "1.0.100"
-async-channel = "2.3.1"
-async-trait = "0.1.88"
-humantime-serde = "1.1"
-tokio = { version = "1.48.0", features = ["io-util", "net"] }
-tokio-rustls = "0.26.4"
-tokio-stream = "0.1"
-tokio-util = { version = "0.7.15", features = ["compat"] }
-tracing = "0.1.41"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_derive = "1.0.219"
+anyhow = "1.0.101"
+async-channel = "2.5.0"
+async-lock = "3.4.2"
+async-trait = "0.1.89"
+futures = "0.3.32"
+futures-channel = "0.3.32"
+humantime-serde = "1.1.1"
+parking_lot = "0.12.5"
+serde = { version = "1.0.228", features = ["derive"] }
+tracing = "0.1.44"
 narwhal-common = { path = "../common" }
 narwhal-protocol = { path = "../protocol" }
 narwhal-util = { path = "../util" }
-futures = "0.3.31"
+tokio = { version = "1.49.0", default-features = false, features = ["io-util", "macros", "net", "time"] }
+tokio-util = { version = "0.7.18", features = ["compat", "rt"] }
+tokio-rustls = { version = "0.26.4" }
+compio = { version = "0.18.0", features = ["net", "time", "macros"] }
+compio-tls = { version = "0.9.0", features = ["rustls"] }
+rustls = { version = "0.23.36" }
+webpki-roots = { version = "1.0.6" }
 
 [dev-dependencies]
 narwhal-test-util = { path = "../test-util" }
+compio = { version = "0.18.0", features = ["macros", "time"] }
