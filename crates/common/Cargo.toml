@@ -13,7 +13,7 @@ compio = { version = "0.18.0", features = ["time"] }
 futures = "0.3.32"
 tokio-util = { version = "0.7.18", features = ["rt", "codec"] }
 tracing = "0.1.44"
-rand = "0.9.2"
+rand = "0.10.0"
 slab = "0.4.12"
 narwhal-protocol = { path = "../protocol" }
 narwhal-util = { path = "../util" }

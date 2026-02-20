@@ -16,7 +16,7 @@ humantime-serde = "1.1.1"
 libc = "0.2.182"
 parking_lot = "0.12.5"
 serde = { version = "1.0.228", features = ["derive"] }
-socket2 = { version = "0.5.10", features = ["all"] }
+socket2 = { version = "0.6.0", features = ["all"] }
 tracing = "0.1.44"
 async-broadcast = "0.7.2"
 narwhal-client = { path = "../client" }

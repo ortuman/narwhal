@@ -25,7 +25,7 @@ hdrhistogram = "7.5.4"
 indicatif = "0.18.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["fmt"] }
-rand = "0.9.2"
+rand = "0.10.0"
 
 # Internal dependencies
 narwhal-client = { path = "../client" }
