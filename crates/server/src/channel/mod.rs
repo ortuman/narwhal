@@ -12,8 +12,9 @@ use narwhal_protocol::ErrorReason::{
 };
 use narwhal_protocol::{
   AclAction, AclType, BroadcastAckParameters, ChannelAclParameters, ChannelConfigurationParameters,
-  JoinChannelAckParameters, LeaveChannelAckParameters, ListChannelsAckParameters, ListMembersAckParameters, Message,
-  MessageParameters, QoS, SetChannelAclAckParameters, SetChannelConfigurationAckParameters,
+  DeleteChannelAckParameters, JoinChannelAckParameters, LeaveChannelAckParameters, ListChannelsAckParameters,
+  ListMembersAckParameters, Message, MessageParameters, QoS, SetChannelAclAckParameters,
+  SetChannelConfigurationAckParameters,
 };
 use narwhal_protocol::{ChannelId, Nid};
 use narwhal_protocol::{Event, EventKind};
@@ -533,6 +534,88 @@ impl ChannelManager {
         self.leave_channel(channel_id.clone(), nid.clone(), None, None, 0).await?;
       }
     }
+    Ok(())
+  }
+
+  /// Deletes a channel.
+  ///
+  /// Only the channel owner is allowed to delete the channel. All members are
+  /// removed, the channel is destroyed, and a `ChannelDeleted` event is sent
+  /// to every member except the owner's own connection.
+  ///
+  /// # Arguments
+  ///
+  /// * `channel_id` - The channel identifier to delete
+  /// * `nid` - The user identifier requesting the deletion
+  /// * `transmitter` - The connection transmitter for sending the response
+  /// * `correlation_id` - The correlation ID for the request
+  ///
+  /// # Returns
+  ///
+  /// A result indicating success or failure
+  pub async fn delete_channel(
+    &mut self,
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+  ) -> anyhow::Result<()> {
+    let mng_guard = self.0.read().await;
+    let router = mng_guard.router.clone();
+    let channels = mng_guard.channels.clone();
+    let in_channels = mng_guard.in_channels.clone();
+    drop(mng_guard);
+
+    // Ensure the channel is local.
+    if channel_id.domain != router.c2s_router().local_domain() {
+      return Err(narwhal_protocol::Error::new(NotImplemented).with_id(correlation_id).into());
+    }
+
+    // Check if the channel exists.
+    let channel = {
+      match channels.get(&channel_id.handler) {
+        Some(kv) => {
+          let channel = kv.value();
+          (*channel).clone()
+        },
+        None => return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into()),
+      }
+    };
+    let channel_inner = channel.0.write().await;
+
+    // Re-verify channel is still in the map after acquiring lock.
+    if channels.get(&channel_id.handler).is_none() {
+      return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
+    }
+
+    // Only the owner of the channel can delete it.
+    if !channel_inner.is_owner(&nid) {
+      return Err(narwhal_protocol::Error::new(Forbidden).with_id(correlation_id).into());
+    }
+
+    // Notify all members (except the owner) that the channel has been deleted.
+    channel_inner
+      .notify_channel_deleted(Some(transmitter.resource()), router.c2s_router().local_domain().clone())
+      .await?;
+
+    // Collect all member usernames before dropping the lock.
+    let member_usernames: Vec<StringAtom> = channel_inner.members.iter().map(|m| m.username.clone()).collect();
+    drop(channel_inner);
+
+    // Remove this channel from every member's in_channels set.
+    for username in &member_usernames {
+      in_channels.remove_if_mut(username, |_, in_channels_set| {
+        in_channels_set.remove(&channel_id);
+        in_channels_set.is_empty()
+      });
+    }
+
+    // Remove the channel from the channels map.
+    channels.remove(&channel_id.handler);
+
+    // Send the ack to the owner.
+    transmitter.send_message(Message::DeleteChannelAck(DeleteChannelAckParameters { id: correlation_id }));
+
     Ok(())
   }
 
@@ -1072,6 +1155,21 @@ impl ChannelInner {
 
     let event =
       Event::new(EventKind::MemberLeft).with_channel(channel_id.into()).with_nid(nid.into()).with_owner(as_owner);
+
+    self.notifier.notify(event, self.members.iter(), excluding_resource).await?;
+
+    Ok(())
+  }
+
+  /// Notifies all members that the channel has been deleted.
+  async fn notify_channel_deleted(
+    &self,
+    excluding_resource: Option<Resource>,
+    local_domain: StringAtom,
+  ) -> anyhow::Result<()> {
+    let channel_id = ChannelId::new_unchecked(self.handler.clone(), local_domain);
+
+    let event = Event::new(EventKind::ChannelDeleted).with_channel(channel_id.into());
 
     self.notifier.notify(event, self.members.iter(), excluding_resource).await?;
 

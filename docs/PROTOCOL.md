@@ -26,6 +26,8 @@
   - [JOIN_ACK](#join_ack)
   - [LEAVE](#leave)
   - [LEAVE_ACK](#leave_ack)
+  - [DELETE_CHAN](#delete_chan)
+  - [DELETE_CHAN_ACK](#delete_chan_ack)
   - [BROADCAST](#broadcast)
   - [BROADCAST_ACK](#broadcast_ack)
   - [MESSAGE](#message)
@@ -512,6 +514,39 @@ Acknowledges a channel leave request.
 **Example**:
 ```
 LEAVE_ACK id=2
+```
+
+---
+
+### DELETE_CHAN
+
+Requests deletion of a channel. Only the channel owner is allowed to delete the channel. All members are removed, the channel is destroyed, and a `CHANNEL_DELETED` event is sent to every other member.
+
+**Direction**: Client → Server
+
+**Parameters**:
+- `id` (u32, required): Request identifier (must be non-zero)
+- `channel` (string, required): Channel ID to delete (must be non-empty)
+
+**Example**:
+```
+DELETE_CHAN id=3 channel=!42@example.com
+```
+
+---
+
+### DELETE_CHAN_ACK
+
+Acknowledges a channel deletion request.
+
+**Direction**: Server → Client
+
+**Parameters**:
+- `id` (u32, required): Request identifier matching the DELETE_CHAN message (must be non-zero)
+
+**Example**:
+```
+DELETE_CHAN_ACK id=3
 ```
 
 ---
@@ -1279,6 +1314,7 @@ The following event kinds can be sent in [EVENT](#event) and [S2M_FORWARD_EVENT]
 |------------|-------------|
 | `MEMBER_JOINED` | A member has joined a channel |
 | `MEMBER_LEFT` | A member has left a channel |
+| `CHANNEL_DELETED` | A channel has been deleted by its owner |
 
 ### Event Context
 
@@ -1286,6 +1322,7 @@ Events contain contextual information that varies depending on the event kind:
 
 - **MEMBER_JOINED**: Includes `channel`, `nid` (the member who joined), and `owner` (whether they are the channel owner)
 - **MEMBER_LEFT**: Includes `channel`, `nid` (the member who left), and `owner` (whether they were the channel owner)
+- **CHANNEL_DELETED**: Includes `channel` (the channel that was deleted). No `nid` or `owner` fields are set.
 
 ## Protocol Flow Examples
 

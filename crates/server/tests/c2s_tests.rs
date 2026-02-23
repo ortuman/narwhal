@@ -2,13 +2,14 @@
 
 use std::time::Duration;
 
-use narwhal_protocol::EventKind::{MemberJoined, MemberLeft};
+use narwhal_protocol::EventKind::{ChannelDeleted, MemberJoined, MemberLeft};
 use narwhal_protocol::{
-  AclAction, AclType, BroadcastParameters, ChannelAclParameters, ConnectParameters, ErrorParameters, EventParameters,
-  GetChannelAclParameters, JoinChannelAckParameters, JoinChannelParameters, LeaveChannelAckParameters,
-  LeaveChannelParameters, ListChannelsAckParameters, ListChannelsParameters, ListMembersAckParameters,
-  ListMembersParameters, MessageParameters, SetChannelAclAckParameters, SetChannelAclParameters,
-  SetChannelConfigurationAckParameters, SetChannelConfigurationParameters,
+  AclAction, AclType, BroadcastParameters, ChannelAclParameters, ConnectParameters, DeleteChannelAckParameters,
+  DeleteChannelParameters, ErrorParameters, EventParameters, GetChannelAclParameters, JoinChannelAckParameters,
+  JoinChannelParameters, LeaveChannelAckParameters, LeaveChannelParameters, ListChannelsAckParameters,
+  ListChannelsParameters, ListMembersAckParameters, ListMembersParameters, MessageParameters,
+  SetChannelAclAckParameters, SetChannelAclParameters, SetChannelConfigurationAckParameters,
+  SetChannelConfigurationParameters,
 };
 use narwhal_protocol::{IdentifyParameters, Message};
 use narwhal_test_util::{C2sSuite, assert_message, default_c2s_config};
@@ -1903,6 +1904,123 @@ async fn test_c2s_response_too_large() -> anyhow::Result<()> {
       id: Some(100),
       reason: narwhal_protocol::ErrorReason::ResponseTooLarge.into(),
       detail: Some(StringAtom::from("response exceeded maximum message size")),
+    }
+  );
+
+  suite.teardown().await?;
+
+  Ok(())
+}
+
+#[compio::test]
+async fn test_c2s_delete_channel_as_owner() -> anyhow::Result<()> {
+  let mut suite = C2sSuite::new(default_c2s_config()).await?;
+  suite.setup().await?;
+
+  // Identify users.
+  suite.identify(TEST_USER_1).await?;
+  suite.identify(TEST_USER_2).await?;
+
+  // TEST_USER_1 joins the channel (becomes owner).
+  suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
+
+  // TEST_USER_1 joins TEST_USER_2 on behalf.
+  suite.join_channel(TEST_USER_1, "!test1@localhost", Some("test_user_2@localhost")).await?;
+
+  // Ignore the MemberJoined event on TEST_USER_2.
+  suite.ignore_reply(TEST_USER_2).await?;
+
+  // Owner deletes the channel.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::DeleteChannel(DeleteChannelParameters { id: 1, channel: StringAtom::from("!test1@localhost") }),
+    )
+    .await?;
+
+  // Verify that the owner receives the ack.
+  assert_message!(
+    suite.read_message(TEST_USER_1).await?,
+    Message::DeleteChannelAck,
+    DeleteChannelAckParameters { id: 1 }
+  );
+
+  // Verify that TEST_USER_2 receives the CHANNEL_DELETED event.
+  assert_message!(
+    suite.read_message(TEST_USER_2).await?,
+    Message::Event,
+    EventParameters {
+      kind: ChannelDeleted.into(),
+      channel: Some(StringAtom::from("!test1@localhost")),
+      nid: None,
+      owner: None,
+    }
+  );
+
+  // Verify the channel no longer exists by re-joining (should succeed as new owner).
+  suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
+
+  suite.teardown().await?;
+
+  Ok(())
+}
+
+#[compio::test]
+async fn test_c2s_delete_channel_as_non_owner() -> anyhow::Result<()> {
+  let mut suite = C2sSuite::new(default_c2s_config()).await?;
+  suite.setup().await?;
+
+  // Identify users.
+  suite.identify(TEST_USER_1).await?;
+  suite.identify(TEST_USER_2).await?;
+
+  // TEST_USER_1 joins the channel (becomes owner).
+  suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
+
+  // TEST_USER_2 joins the channel (not the owner).
+  suite.join_channel(TEST_USER_2, "!test1@localhost", None).await?;
+
+  // Ignore the MemberJoined event on TEST_USER_1.
+  suite.ignore_reply(TEST_USER_1).await?;
+
+  // Non-owner attempts to delete the channel.
+  suite
+    .write_message(
+      TEST_USER_2,
+      Message::DeleteChannel(DeleteChannelParameters { id: 1, channel: StringAtom::from("!test1@localhost") }),
+    )
+    .await?;
+
+  // Verify that the non-owner receives a Forbidden error.
+  assert_message!(
+    suite.read_message(TEST_USER_2).await?,
+    Message::Error,
+    ErrorParameters { id: Some(1), reason: narwhal_protocol::ErrorReason::Forbidden.into(), detail: None }
+  );
+
+  // Verify that the channel still exists by listing members.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::ListMembers(ListMembersParameters {
+        id: 2,
+        channel: StringAtom::from("!test1@localhost"),
+        page: None,
+        page_size: None,
+      }),
+    )
+    .await?;
+
+  assert_message!(
+    suite.read_message(TEST_USER_1).await?,
+    Message::ListMembersAck,
+    ListMembersAckParameters {
+      id: 2,
+      channel: StringAtom::from("!test1@localhost"),
+      members: vec![StringAtom::from("test_user_1@localhost"), StringAtom::from("test_user_2@localhost")],
+      page: None,
+      page_size: None,
+      total_count: None,
     }
   );
 

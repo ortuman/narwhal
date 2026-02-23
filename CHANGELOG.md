@@ -5,6 +5,7 @@ All notable changes to Narwhal will be documented in this file.
 ## main / unreleased
 
 * [CHANGE]: Migrate primary async runtime from tokio to compio. [#150](https://github.com/narwhal-io/narwhal/pull/150)
+* [ENHANCEMENT]: Add `DELETE_CHAN` command for channel deletion. [#160](https://github.com/narwhal-io/narwhal/pull/160)
 
 ## 0.4.0 (2026-01-27)
 
