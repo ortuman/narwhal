@@ -415,6 +415,9 @@ impl C2sDispatcherInner {
       Message::Broadcast { .. } => {
         self.dispatch_broadcast_message(msg, payload.unwrap()).await?;
       },
+      Message::DeleteChannel { .. } => {
+        self.dispatch_delete_channel_message(msg).await?;
+      },
       Message::GetChannelAcl { .. } => {
         self.dispatch_get_channel_acl_message(msg).await?;
       },
@@ -792,6 +795,48 @@ impl C2sDispatcherInner {
   /// * The channel ID is invalid
   /// * The user is not in the channel
   /// * The user lacks permission to remove others
+
+  /// Handles channel deletion requests.
+  ///
+  /// Only the channel owner is allowed to delete the channel. All members are
+  /// removed and notified with a `ChannelDeleted` event, and the channel is
+  /// destroyed.
+  ///
+  /// # Arguments
+  ///
+  /// * `msg` - The delete channel message containing channel ID and correlation ID
+  ///
+  /// # Returns
+  ///
+  /// Returns `Ok(())` if the deletion succeeds.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if:
+  /// * The channel ID is invalid
+  /// * The user is not the channel owner
+  /// * The channel does not exist
+  async fn dispatch_delete_channel_message(&mut self, msg: Message) -> anyhow::Result<()> {
+    let Message::DeleteChannel(params) = msg else { unreachable!() };
+
+    let correlation_id = params.id;
+    let channel_id = Self::parse_channel_id(&params.channel)?;
+
+    let nid = self.nid.as_ref().unwrap().clone();
+    let transmitter = self.transmitter.clone();
+
+    self.channel_manager.delete_channel(channel_id.clone(), nid.clone(), transmitter, correlation_id).await?;
+
+    trace!(
+      handler = self.transmitter.handler,
+      nid = nid.to_string(),
+      channel = channel_id.to_string(),
+      "deleted channel"
+    );
+
+    Ok(())
+  }
+
   async fn dispatch_leave_message(&mut self, msg: Message) -> anyhow::Result<()> {
     assert!(matches!(msg, Message::LeaveChannel { .. }));
 

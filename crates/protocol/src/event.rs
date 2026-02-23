@@ -24,6 +24,12 @@ pub enum EventKind {
   /// This event is triggered when a user leaves a channel, either voluntarily
   /// or due to being removed by another member with appropriate permissions.
   MemberLeft,
+
+  /// Indicates that a channel has been deleted.
+  ///
+  /// This event is triggered when the channel owner explicitly deletes the
+  /// channel. All members are removed and the channel is destroyed.
+  ChannelDeleted,
 }
 
 impl std::fmt::Display for EventKind {
@@ -45,6 +51,7 @@ impl From<EventKind> for &str {
     match val {
       EventKind::MemberJoined => "MEMBER_JOINED",
       EventKind::MemberLeft => "MEMBER_LEFT",
+      EventKind::ChannelDeleted => "CHANNEL_DELETED",
     }
   }
 }
@@ -64,6 +71,7 @@ impl FromStr for EventKind {
     match s {
       "MEMBER_JOINED" => Ok(EventKind::MemberJoined),
       "MEMBER_LEFT" => Ok(EventKind::MemberLeft),
+      "CHANNEL_DELETED" => Ok(EventKind::ChannelDeleted),
       _ => anyhow::bail!("unknown event kind: {}", s),
     }
   }

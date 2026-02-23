@@ -44,6 +44,8 @@ pub enum Message {
   ChannelConfiguration(ChannelConfigurationParameters),
   Connect(ConnectParameters),
   ConnectAck(ConnectAckParameters),
+  DeleteChannel(DeleteChannelParameters),
+  DeleteChannelAck(DeleteChannelAckParameters),
   Error(ErrorParameters),
   Event(EventParameters),
   GetChannelAcl(GetChannelAclParameters),
@@ -165,6 +167,21 @@ pub struct ConnectAckParameters {
   pub max_message_size: u32,
   pub max_payload_size: u32,
   pub max_inflight_requests: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
+pub struct DeleteChannelParameters {
+  #[param(validate = "non_zero")]
+  pub id: u32,
+
+  #[param(validate = "non_empty")]
+  pub channel: StringAtom,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
+pub struct DeleteChannelAckParameters {
+  #[param(validate = "non_zero")]
+  pub id: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
@@ -574,6 +591,8 @@ impl Message {
       b"CONNECT_ACK" => Ok(Message::ConnectAck(ConnectAckParameters::default())),
       b"CHAN_ACL" => Ok(Message::ChannelAcl(ChannelAclParameters::default())),
       b"CHAN_CONFIG" => Ok(Message::ChannelConfiguration(ChannelConfigurationParameters::default())),
+      b"DELETE_CHAN" => Ok(Message::DeleteChannel(DeleteChannelParameters::default())),
+      b"DELETE_CHAN_ACK" => Ok(Message::DeleteChannelAck(DeleteChannelAckParameters::default())),
       b"ERROR" => Ok(Message::Error(ErrorParameters::default())),
       b"EVENT" => Ok(Message::Event(EventParameters::default())),
       b"GET_CHAN_ACL" => Ok(Message::GetChannelAcl(GetChannelAclParameters::default())),
@@ -631,6 +650,8 @@ impl Message {
       Message::ConnectAck { .. } => "CONNECT_ACK",
       Message::ChannelAcl { .. } => "CHAN_ACL",
       Message::ChannelConfiguration { .. } => "CHAN_CONFIG",
+      Message::DeleteChannel { .. } => "DELETE_CHAN",
+      Message::DeleteChannelAck { .. } => "DELETE_CHAN_ACK",
       Message::Error { .. } => "ERROR",
       Message::Event { .. } => "EVENT",
       Message::GetChannelAcl { .. } => "GET_CHAN_ACL",
@@ -685,6 +706,8 @@ impl Message {
       ConnectAck(params) => params.encode(parameter_writer),
       ChannelAcl(params) => params.encode(parameter_writer),
       ChannelConfiguration(params) => params.encode(parameter_writer),
+      DeleteChannel(params) => params.encode(parameter_writer),
+      DeleteChannelAck(params) => params.encode(parameter_writer),
       Error(params) => params.encode(parameter_writer),
       Event(params) => params.encode(parameter_writer),
       GetChannelAcl(params) => params.encode(parameter_writer),
@@ -738,6 +761,8 @@ impl Message {
       ChannelConfiguration(params) => params.decode(parameter_reader),
       Connect(params) => params.decode(parameter_reader),
       ConnectAck(params) => params.decode(parameter_reader),
+      DeleteChannel(params) => params.decode(parameter_reader),
+      DeleteChannelAck(params) => params.decode(parameter_reader),
       Error(params) => params.decode(parameter_reader),
       Event(params) => params.decode(parameter_reader),
       GetChannelAcl(params) => params.decode(parameter_reader),
@@ -804,6 +829,8 @@ impl Message {
       ChannelConfiguration(params) => params.validate(),
       Connect(params) => params.validate(),
       ConnectAck(params) => params.validate(),
+      DeleteChannel(params) => params.validate(),
+      DeleteChannelAck(params) => params.validate(),
       Error(params) => {
         params.validate()?;
 
@@ -903,6 +930,8 @@ impl Message {
       Message::BroadcastAck(params) => Some(params.id),
       Message::ChannelAcl(params) => Some(params.id),
       Message::ChannelConfiguration(params) => Some(params.id),
+      Message::DeleteChannel(params) => Some(params.id),
+      Message::DeleteChannelAck(params) => Some(params.id),
       Message::GetChannelAcl(params) => Some(params.id),
       Message::GetChannelConfiguration(params) => Some(params.id),
       Message::JoinChannel(params) => Some(params.id),
