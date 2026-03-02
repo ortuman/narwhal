@@ -17,7 +17,6 @@ This document contains performance benchmarks for Narwhal's pub/sub messaging sy
 - **Producers**: 1
 - **Consumers**: 1
 - **Channels**: 1
-- **Worker Threads**: 8
 
 ## Benchmark Tool
 
@@ -52,17 +51,17 @@ cargo build --release -p narwhal-benchmark
 
 All benchmarks were run with 1 producer and 1 consumer for 60 seconds.
 
-| Payload Size | Throughput (msg/s) | Data Throughput | Mean Latency | P50 | P95 | P99 | Total Messages |
-|--------------|-------------------:|----------------:|-------------:|----:|----:|----:|---------------:|
-| 256 B        | 83,962            | 20.5 MB/s       | 0.67ms       | 1ms | 1ms | 2ms | 5,054,643      |
-| 512 B        | 83,892            | 41.0 MB/s       | 0.66ms       | 1ms | 1ms | 2ms | 5,051,865      |
-| 1 KB         | 82,688            | 80.7 MB/s       | 0.70ms       | 1ms | 1ms | 2ms | 4,977,980      |
-| 4 KB         | 81,007            | 316.4 MB/s      | 0.78ms       | 1ms | 1ms | 2ms | 4,877,287      |
-| 8 KB         | 75,594            | 590.6 MB/s      | 0.93ms       | 1ms | 1ms | 2ms | 4,551,031      |
-| 16 KB        | 57,930            | 905.1 MB/s      | 1.17ms       | 1ms | 2ms | 4ms | 3,487,746      |
-| 32 KB        | 42,784            | 1.31 GB/s       | 1.86ms       | 2ms | 3ms | 5ms | 2,574,740      |
-| 64 KB        | 29,973            | 1.83 GB/s       | 2.81ms       | 3ms | 5ms | 6ms | 1,804,239      |
-| 128 KB       | 18,614            | 2.27 GB/s       | 4.83ms       | 5ms | 8ms | 9ms | 1,120,856      |
+| Payload Size | Throughput (msg/s) | Data Throughput | Mean Latency | P50 | P95 | P99 | Avg Total Messages | Runs used |
+|--------------|-------------------:|----------------:|-------------:|----:|----:|----:|-------------------:|----------:|
+| 256 B        |             93,026 |       23.8 MB/s |         1.07ms |   1.11ms |   1.20ms |   1.33ms |      5,600,142 | 4/5 |
+| 512 B        |             92,684 |       47.5 MB/s |         1.08ms |   1.01ms |   1.25ms |   1.34ms |      5,579,668 | 4/5 |
+| 1 KB         |             90,407 |       92.6 MB/s |         1.10ms |   1.10ms |   1.17ms |   1.30ms |      5,441,121 | 4/5 |
+| 4 KB         |             83,150 |      340.6 MB/s |         1.20ms |   1.19ms |   1.27ms |   1.41ms |      5,004,638 | 4/5 |
+| 8 KB         |             72,954 |      597.6 MB/s |         1.36ms |   1.36ms |   1.46ms |   1.69ms |      4,391,013 | 4/5 |
+| 16 KB        |             59,675 |      977.7 MB/s |         1.67ms |   1.66ms |   1.78ms |   1.96ms |      3,591,555 | 4/5 |
+| 32 KB        |             40,202 |       1.32 GB/s |         2.48ms |   2.47ms |   2.67ms |   3.01ms |      2,419,756 | 4/5 |
+| 64 KB        |             24,315 |       1.59 GB/s |         4.10ms |   4.08ms |   4.50ms |   5.15ms |      1,463,814 | 4/5 |
+| 128 KB       |             13,750 |       1.80 GB/s |         7.25ms |   7.18ms |   8.08ms |   9.67ms |        828,198 | 4/5 |
 
 ### Visual Performance Analysis
 
@@ -70,33 +69,32 @@ All benchmarks were run with 1 producer and 1 consumer for 60 seconds.
 
 ![Message Throughput vs Payload Size](benchmark_msg_throughput.png)
 
-This graph shows how message throughput (messages per second) varies with payload size. Peak performance is achieved with small to medium payloads (256B-512B), delivering over 83,000 messages per second.
+This graph shows how message throughput (messages per second) varies with payload size. Error bars and individual run points reflect the 4 kept runs. Peak performance is achieved with small payloads, delivering over 93,026 messages per second on average.
 
 #### Latency
 
 ![Message Latency vs Payload Size](benchmark_latency.png)
 
-This graph compares mean and P99 latency across different payload sizes. Latency scales gradually with payload size, with P99 latency remaining under 10ms even at 128KB payloads.
+This graph compares Mean, P50, P95, and P99 latency across different payload sizes. Latency scales gradually with payload size, with P99 latency remaining in the single-digit millisecond range even at 128KB payloads.
 
 #### Data Throughput (Bandwidth)
 
 ![Data Throughput vs Payload Size](benchmark_data_throughput.png)
 
-This graph illustrates the actual data throughput in MB/s. While message rate decreases with larger payloads, the overall bandwidth increases significantly, reaching over 2.2GB/s with 128KB payloads.
+This graph illustrates the actual data throughput. While message rate decreases with larger payloads, the overall bandwidth increases significantly, peaking at 1.80 GB/s with 128 KB payloads.
 
 ### Key Observations
 
-1. **Peak Throughput**: Achieved with 256-byte payloads at ~83,962 messages/second
-2. **Consistent Low Latency**: Sub-millisecond mean latency maintained across small to medium payload sizes (256B - 8KB)
+1. **Peak Throughput**: Achieved with 256 B payloads at ~93,026 messages/second
+2. **Consistent Low Latency**: Sub-2ms mean latency maintained across small to medium payload sizes (256B - 8KB)
 3. **Payload Size Impact**: As payload size increases, message throughput decreases while data throughput increases, which is expected due to larger data transfers
-4. **Latency Stability**: P99 latency remains very low (1-9ms) across all payload sizes, indicating consistent performance
+4. **Latency Stability**: P99 latency remains very low across all payload sizes, indicating consistent performance
 5. **Zero Errors**: All benchmarks completed without any message loss or errors
+6. **Peak Bandwidth**: 1.80 GB/s achieved at 128 KB payload
 
 ## Notes
 
 - All benchmarks were run on a local machine with the server and client on the same host
 - Network latency in production environments will add to the observed latency values
 - The benchmark tool generates random payloads up to the specified maximum size
-- Server configuration used the `c2s-benchmark.toml` profile with rate limiting disabled
 - Results may vary based on hardware, OS, and system load
-- The benchmark scripts (`run_benchmarks.sh` and `generate_benchmark_plots.py`) are available in the `docs/` directory for easy reproduction
