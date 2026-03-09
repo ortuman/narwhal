@@ -1144,7 +1144,7 @@ impl narwhal_common::conn::Dispatcher for C2sDispatcher {
     let inner = self.0.as_mut().unwrap();
 
     if let Some(nid) = inner.nid.take() {
-      let mut channel_mng = inner.channel_manager.clone();
+      let channel_mng = inner.channel_manager.clone();
 
       // Unregister the username.
       let should_cleanup = inner.c2s_router.unregister_connection(&nid.username, inner.transmitter.handler).await;

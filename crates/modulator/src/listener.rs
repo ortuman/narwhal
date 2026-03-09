@@ -110,7 +110,7 @@ where
 
   /// Bootstraps the listener, starting to accept incoming connections.
   pub async fn bootstrap(&mut self) -> anyhow::Result<()> {
-    assert!(self.shutdown_txs.is_empty(), "listener already bootstrapped");
+    assert!(self.shutdown_txs.is_empty(), "listener already started");
 
     let mut dispatcher_factory = self.dispatcher_factory.clone();
     dispatcher_factory.bootstrap().await?;

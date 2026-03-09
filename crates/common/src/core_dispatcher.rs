@@ -122,7 +122,7 @@ impl CoreDispatcher {
     self.senders = Arc::new(senders);
     *self.handles.lock().unwrap() = handles;
 
-    info!(worker_count, "core dispatcher bootstrapped");
+    info!(worker_count, "core dispatcher started");
 
     Ok(())
   }
@@ -184,7 +184,7 @@ impl CoreDispatcher {
       }
     }
 
-    info!("core dispatcher shut down");
+    info!("core dispatcher stopped");
 
     Ok(())
   }

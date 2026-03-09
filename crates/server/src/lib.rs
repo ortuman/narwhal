@@ -93,12 +93,12 @@ async fn run_server(
 
   let c2s_config = Arc::new(c2s_server_config);
 
-  let max_channels = c2s_config.limits.max_channels;
   let max_clients_per_channel = c2s_config.limits.max_clients_per_channel;
   let max_channels_per_client = c2s_config.limits.max_channels_per_client;
   let max_payload_size = c2s_config.limits.max_payload_size;
 
   let local_domain = StringAtom::from(c2s_config.listener.domain.as_str());
+
   let mut c2s_router = c2s::Router::new(local_domain.clone());
   c2s_router.bootstrap(&core_dispatcher).await?;
 
@@ -108,15 +108,15 @@ async fn run_server(
 
   let channel_reg = guard.sub_registry_with_prefix("narwhal");
 
-  let channel_mng = ChannelManager::new(
+  let mut channel_mng = ChannelManager::new(
     global_router.clone(),
     notifier.clone(),
-    max_channels,
     max_clients_per_channel,
     max_channels_per_client,
     max_payload_size,
     channel_reg,
   );
+  channel_mng.bootstrap(&core_dispatcher).await?;
 
   let c2s_reg = guard.sub_registry_with_prefix("narwhal_c2s");
 
@@ -165,6 +165,7 @@ async fn run_server(
     let _ = handle.await;
   }
 
+  channel_mng.shutdown();
   c2s_router.shutdown();
 
   core_dispatcher.shutdown().await?;

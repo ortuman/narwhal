@@ -467,7 +467,7 @@ impl<ST: Service> ConnRuntime<ST> {
 
   /// Bootstraps the connection runtime.
   pub async fn bootstrap(&self) -> anyhow::Result<()> {
-    info!(max_conns = self.0.config.max_connections, service_type = ST::NAME, "connection runtime bootstrapped");
+    info!(max_conns = self.0.config.max_connections, service_type = ST::NAME, "connection runtime started");
 
     Ok(())
   }
@@ -492,7 +492,7 @@ impl<ST: Service> ConnRuntime<ST> {
       monoio::time::sleep(SHUTDOWN_DRAIN_POLL_INTERVAL).await;
     }
 
-    info!(service_type = ST::NAME, "connection runtime shut down");
+    info!(service_type = ST::NAME, "connection runtime stopped");
 
     Ok(())
   }

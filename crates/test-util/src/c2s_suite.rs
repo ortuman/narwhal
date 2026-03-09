@@ -43,6 +43,9 @@ pub struct C2sSuite {
   /// The local router.
   local_router: c2s::Router,
 
+  /// The channel manager.
+  channel_manager: ChannelManager,
+
   /// The M2S payload receiver.
   m2s_payload_rx: Option<async_broadcast::Receiver<OutboundPrivatePayload>>,
 
@@ -85,22 +88,21 @@ impl C2sSuite {
 
     let notifier = Notifier::new(global_router.clone(), modulator.clone());
 
-    let max_channels = arc_config.limits.max_channels;
     let max_clients_per_channel = arc_config.limits.max_clients_per_channel;
     let max_channels_per_client = arc_config.limits.max_channels_per_client;
     let max_payload_size = arc_config.limits.max_payload_size;
 
     let mut registry = Registry::default();
 
-    let channel_mng = ChannelManager::new(
+    let mut channel_mng = ChannelManager::new(
       global_router,
       notifier,
-      max_channels,
       max_clients_per_channel,
       max_channels_per_client,
       max_payload_size,
       &mut registry,
     );
+    channel_mng.bootstrap(&core_dispatcher).await?;
 
     let conn_cfg = narwhal_common::conn::Config {
       max_connections: arc_config.limits.max_connections,
@@ -142,6 +144,7 @@ impl C2sSuite {
       m2s_payload_rx,
       m2s_router_task_handle: None,
       local_router: c2s_router,
+      channel_manager: channel_mng,
       clients: HashMap::new(),
     })
   }
@@ -167,7 +170,7 @@ impl C2sSuite {
       let _ = handle.await;
     }
 
-    // Close the router's mailboxes so shard actors exit before workers shut down.
+    self.channel_manager.shutdown();
     self.local_router.shutdown();
 
     self.runtime_dispatcher.shutdown().await?;
