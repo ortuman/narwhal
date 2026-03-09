@@ -140,6 +140,8 @@ impl Membership {
   }
 
   pub(crate) async fn reserve_slot(&self, username: &StringAtom, handler: &StringAtom, max_per_client: u32) -> bool {
+    self.assert_bootstrapped();
+
     let shard = shard_for_user(username, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -153,6 +155,8 @@ impl Membership {
   }
 
   pub(crate) async fn release_slot(&self, username: &StringAtom, handler: &StringAtom) {
+    self.assert_bootstrapped();
+
     let shard = shard_for_user(username, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -166,6 +170,8 @@ impl Membership {
   }
 
   pub(crate) async fn release_all_slots(&self, username: &StringAtom) -> Arc<[StringAtom]> {
+    self.assert_bootstrapped();
+
     let shard = shard_for_user(username, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -179,6 +185,8 @@ impl Membership {
   }
 
   pub(crate) async fn get_channels(&self, username: &StringAtom) -> Arc<[StringAtom]> {
+    self.assert_bootstrapped();
+
     let shard = shard_for_user(username, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -189,5 +197,9 @@ impl Membership {
     }
 
     reply_rx.recv().await.unwrap_or_default()
+  }
+
+  fn assert_bootstrapped(&self) {
+    debug_assert!(!self.mailboxes.is_empty(), "Membership::bootstrap() must be called before use");
   }
 }

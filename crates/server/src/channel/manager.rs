@@ -178,7 +178,7 @@ struct Channel {
   config: ChannelConfig,
   acl: ChannelAcl,
   members: HashSet<Nid>,
-  allowed_targets: Vec<Nid>,
+  allowed_targets: Arc<[Nid]>,
   notifier: Notifier,
   seq: u64,
 }
@@ -193,7 +193,7 @@ impl Channel {
       config,
       acl: ChannelAcl::default(),
       members: HashSet::new(),
-      allowed_targets: Vec::new(),
+      allowed_targets: Arc::from([]),
       notifier,
       seq: 1,
     }
@@ -256,7 +256,7 @@ impl Channel {
 
   fn update_allowed_targets(&mut self) {
     let acl = &self.acl;
-    self.allowed_targets = self.members.iter().filter(|m| acl.is_read_allowed(m)).cloned().collect();
+    self.allowed_targets = self.members.iter().filter(|m| acl.is_read_allowed(m)).cloned().collect::<Vec<_>>().into();
   }
 
   async fn notify_member_joined(
@@ -416,7 +416,34 @@ impl ChannelShard {
       None => nid.clone(),
     };
 
-    // Reserve a membership slot.
+    let channel = self.channels.get(&handler).unwrap();
+
+    // Validate before reserving a membership slot.
+    if !channel.acl.is_join_allowed(&new_member_nid) {
+      if as_owner {
+        self.channels.remove(&handler);
+      }
+      self.metrics.channel_joins.get_or_create(&ResultLabel { result: "failure" }).inc();
+      return Err(narwhal_protocol::Error::new(NotAllowed).with_id(correlation_id).into());
+    }
+
+    if channel.is_member(&new_member_nid) {
+      if as_owner {
+        self.channels.remove(&handler);
+      }
+      self.metrics.channel_joins.get_or_create(&ResultLabel { result: "failure" }).inc();
+      return Err(narwhal_protocol::Error::new(UserInChannel).with_id(correlation_id).into());
+    }
+
+    if channel.member_count() >= channel.config.max_clients as usize {
+      if as_owner {
+        self.channels.remove(&handler);
+      }
+      self.metrics.channel_joins.get_or_create(&ResultLabel { result: "failure" }).inc();
+      return Err(narwhal_protocol::Error::new(ChannelIsFull).with_id(correlation_id).into());
+    }
+
+    // All channel-level checks passed, now reserve the membership slot.
     if !self.membership.reserve_slot(&new_member_nid.username, &handler, self.max_channels_per_client).await {
       if as_owner {
         self.channels.remove(&handler);
@@ -428,38 +455,6 @@ impl ChannelShard {
           .with_detail("subscription limit reached")
           .into(),
       );
-    }
-
-    let channel = self.channels.get(&handler).unwrap();
-
-    // Check join ACL.
-    if !channel.acl.is_join_allowed(&new_member_nid) {
-      self.membership.release_slot(&new_member_nid.username, &handler).await;
-      if as_owner {
-        self.channels.remove(&handler);
-      }
-      self.metrics.channel_joins.get_or_create(&ResultLabel { result: "failure" }).inc();
-      return Err(narwhal_protocol::Error::new(NotAllowed).with_id(correlation_id).into());
-    }
-
-    // Check already a member.
-    if channel.is_member(&new_member_nid) {
-      self.membership.release_slot(&new_member_nid.username, &handler).await;
-      if as_owner {
-        self.channels.remove(&handler);
-      }
-      self.metrics.channel_joins.get_or_create(&ResultLabel { result: "failure" }).inc();
-      return Err(narwhal_protocol::Error::new(UserInChannel).with_id(correlation_id).into());
-    }
-
-    // Check channel capacity.
-    if channel.member_count() >= channel.config.max_clients as usize {
-      self.membership.release_slot(&new_member_nid.username, &handler).await;
-      if as_owner {
-        self.channels.remove(&handler);
-      }
-      self.metrics.channel_joins.get_or_create(&ResultLabel { result: "failure" }).inc();
-      return Err(narwhal_protocol::Error::new(ChannelIsFull).with_id(correlation_id).into());
     }
 
     let channel = self.channels.get_mut(&handler).unwrap();
@@ -1009,6 +1004,8 @@ impl ChannelManager {
     transmitter: Arc<dyn Transmitter>,
     correlation_id: u32,
   ) -> anyhow::Result<bool> {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&channel_id.handler, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -1028,6 +1025,8 @@ impl ChannelManager {
     transmitter: Option<Arc<dyn Transmitter>>,
     correlation_id: u32,
   ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&channel_id.handler, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -1040,6 +1039,8 @@ impl ChannelManager {
 
   /// Removes a user from all channels they are a member of.
   pub async fn leave_all_channels(&self, nid: Nid) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     // Release all membership slots and get the list of channel handlers.
     let handlers = self.membership.release_all_slots(&nid.username).await;
     if handlers.is_empty() {
@@ -1076,6 +1077,8 @@ impl ChannelManager {
     transmitter: Arc<dyn Transmitter>,
     correlation_id: u32,
   ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&channel_id.handler, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -1096,6 +1099,8 @@ impl ChannelManager {
     qos: Option<u8>,
     correlation_id: u32,
   ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&channel_id.handler, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -1118,6 +1123,8 @@ impl ChannelManager {
     transmitter: Arc<dyn Transmitter>,
     correlation_id: u32,
   ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&channel_id.handler, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -1149,6 +1156,8 @@ impl ChannelManager {
     transmitter: Arc<dyn Transmitter>,
     correlation_id: u32,
   ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&channel_id.handler, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -1176,6 +1185,8 @@ impl ChannelManager {
     transmitter: Arc<dyn Transmitter>,
     correlation_id: u32,
   ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&channel_id.handler, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -1195,6 +1206,8 @@ impl ChannelManager {
     transmitter: Arc<dyn Transmitter>,
     correlation_id: u32,
   ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&channel_id.handler, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -1215,6 +1228,8 @@ impl ChannelManager {
     transmitter: Arc<dyn Transmitter>,
     correlation_id: u32,
   ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     let all_handlers = self.membership.get_channels(&nid.username).await;
     let local_domain = self.router.c2s_router().local_domain();
 
@@ -1278,6 +1293,8 @@ impl ChannelManager {
     transmitter: Arc<dyn Transmitter>,
     correlation_id: u32,
   ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&channel_id.handler, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
@@ -1286,6 +1303,11 @@ impl ChannelManager {
       .await?;
 
     reply_rx.recv().await?
+  }
+
+  /// Asserts that `bootstrap()` has been called.
+  fn assert_bootstrapped(&self) {
+    debug_assert!(!self.mailboxes.is_empty(), "ChannelManager::bootstrap() must be called before use");
   }
 }
 

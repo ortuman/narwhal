@@ -205,6 +205,8 @@ impl Router {
     target: StringAtom,
     excluding_local_handler: Option<usize>,
   ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&target, self.mailboxes.len());
     let cmd = Command::RouteTo { msg, payload_opt, target, excluding_handler: excluding_local_handler };
     self.mailboxes[shard].send(cmd).await.map_err(|_| anyhow::anyhow!("router shard closed"))?;
@@ -220,6 +222,8 @@ impl Router {
     handler: usize,
     exclusive: bool,
   ) -> bool {
+    self.assert_bootstrapped();
+
     let shard = shard_for(&username, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
     let cmd = Command::Register { username, transmitter, handler, exclusive, reply_tx };
@@ -232,6 +236,8 @@ impl Router {
   /// Unregisters a connection for a specific username and handler.
   /// Returns `true` if the last connection for this username was removed.
   pub async fn unregister_connection(&self, username: &StringAtom, handler: usize) -> bool {
+    self.assert_bootstrapped();
+
     let shard = shard_for(username, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
     let cmd = Command::Unregister { username: username.clone(), handler, reply_tx };
@@ -243,6 +249,8 @@ impl Router {
 
   /// Checks if there are any connections registered for a given username.
   pub async fn has_connection(&self, username: &StringAtom) -> bool {
+    self.assert_bootstrapped();
+
     let shard = shard_for(username, self.mailboxes.len());
     let (reply_tx, reply_rx) = async_channel::bounded(1);
     let cmd = Command::HasConnection { username: username.clone(), reply_tx };
@@ -261,6 +269,11 @@ impl Router {
   /// Returns the local domain of this router.
   pub fn local_domain(&self) -> StringAtom {
     self.local_domain.clone()
+  }
+
+  /// Asserts that `bootstrap()` has been called.
+  fn assert_bootstrapped(&self) {
+    debug_assert!(!self.mailboxes.is_empty(), "Router::bootstrap() must be called before use");
   }
 }
 
