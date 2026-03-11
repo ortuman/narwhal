@@ -35,7 +35,7 @@ pub trait ChannelStore: Send + Sync + 'static {
   /// Called on channel creation (when persist=true) and on any metadata update.
   async fn save_channel(&self, channel: &PersistedChannel) -> anyhow::Result<()>;
 
-  /// Removes all persisted channel metadata.
+  /// Removes all persisted metadata for the given channel handler.
   /// Called when persist is toggled to false or the channel is deleted.
   async fn delete_channel(&self, handler: &StringAtom) -> anyhow::Result<()>;
 
