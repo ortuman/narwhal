@@ -26,7 +26,7 @@ struct PoolInner {
   buffer_size: usize,
 }
 
-// ==== impl Pool =====
+// === impl Pool ===
 
 impl Pool {
   /// Create a new buffer pool with the specified number of buffers and buffer size
@@ -111,7 +111,7 @@ pub struct BucketedPool {
   buckets: Arc<[Pool]>,
 }
 
-// ==== impl BucketedPool =====
+// === impl BucketedPool ===
 
 impl BucketedPool {
   /// Creates a new bucketed pool with a memory budget constraint.
@@ -292,7 +292,7 @@ impl Debug for PoolBufferInner {
   }
 }
 
-// ==== impl PoolBufferInner =====
+// === impl PoolBufferInner ===
 
 impl PoolBufferInner {
   /// Get a read-only reference to the buffer data.
@@ -331,7 +331,7 @@ impl Drop for PoolBufferInner {
 #[derive(Debug)]
 pub struct MutablePoolBuffer(PoolBufferInner);
 
-// ==== impl MutablePoolBuffer =====
+// === impl MutablePoolBuffer ===
 
 impl MutablePoolBuffer {
   /// Get a read-only reference to the buffer data.
@@ -417,7 +417,7 @@ pub struct PoolBuffer {
   len: usize,
 }
 
-// ==== impl PoolBuffer =====
+// === impl PoolBuffer ===
 
 impl PoolBuffer {
   /// Get a read-only reference to the buffer data.
