@@ -10,7 +10,7 @@ pub struct GlobalRouter {
   c2s_router: c2s::Router,
 }
 
-// ===== impl GlobalRouter =====
+// === impl GlobalRouter ===
 
 impl GlobalRouter {
   /// Creates a new `GlobalRouter` instance.

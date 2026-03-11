@@ -15,14 +15,14 @@ use narwhal_protocol::{DEFAULT_MESSAGE_BUFFER_SIZE, M2sConnectParameters, M2sMod
 use narwhal_util::pool::{Pool, PoolBuffer};
 use narwhal_util::string_atom::StringAtom;
 
-// ===== Handshaker =====
+// === Handshaker ===
 #[derive(Clone, Debug, Default)]
 struct M2sHandshaker {
   shared_secret: Option<StringAtom>,
   heartbeat_interval: Duration,
 }
 
-// ===== M2sHandshaker =====
+// === M2sHandshaker ===
 
 #[async_trait::async_trait(?Send)]
 impl Handshaker<Stream> for M2sHandshaker {

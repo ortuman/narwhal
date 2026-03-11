@@ -56,7 +56,7 @@ pub struct C2sSuite {
   clients: HashMap<String, TestConn<TlsStream>>,
 }
 
-// ===== impl C2sSuite =====
+// === impl C2sSuite ===
 
 impl C2sSuite {
   pub async fn default() -> anyhow::Result<Self> {

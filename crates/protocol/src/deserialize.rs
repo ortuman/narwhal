@@ -22,7 +22,7 @@ pub struct Parameter<'a> {
   pub value: &'a [u8],
 }
 
-// ===== impl Parameter =====
+// === impl Parameter ===
 
 impl Parameter<'_> {
   pub fn as_atom(&self) -> anyhow::Result<StringAtom> {
@@ -67,7 +67,7 @@ pub struct ParameterReader<'a> {
   current_value_count: usize,
 }
 
-// ===== impl ParameterReader =====
+// === impl ParameterReader ===
 
 impl<'a> ParameterReader<'a> {
   fn new(c: Cursor<&'a [u8]>) -> Self {

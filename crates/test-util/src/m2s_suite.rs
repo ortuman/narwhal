@@ -30,7 +30,7 @@ pub struct M2sSuite {
   payload_rx: Option<async_broadcast::Receiver<OutboundPrivatePayload>>,
 }
 
-// ===== impl M2sSuite =====
+// === impl M2sSuite ===
 
 impl M2sSuite {
   /// Creates a new M2sSuite with the given configuration.

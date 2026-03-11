@@ -54,7 +54,7 @@ impl std::fmt::Debug for TestModulator {
   }
 }
 
-// ===== impl TestModulator =====
+// === impl TestModulator ===
 
 impl TestModulator {
   pub fn new() -> Self {

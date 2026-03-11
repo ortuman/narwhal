@@ -243,7 +243,7 @@ pub struct ServerConfig {
   pub limits: Limits,
 }
 
-// ===== impl ServerConfig =====
+// === impl ServerConfig ===
 
 impl Default for ServerConfig {
   fn default() -> Self {
@@ -285,7 +285,7 @@ pub struct Limits {
   pub rate_limit: u32,
 }
 
-// ===== impl Limits =====
+// === impl Limits ===
 
 impl Default for Limits {
   fn default() -> Self {

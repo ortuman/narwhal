@@ -139,7 +139,7 @@ pub struct TestConn<S: AsyncReadRent + AsyncWriteRent> {
   write_buffer: Vec<u8>,
 }
 
-// ===== impl TestConn =====
+// === impl TestConn ===
 
 impl<S: AsyncReadRent + AsyncWriteRent> TestConn<S> {
   /// Creates a new `TestConn` instance from an async stream.

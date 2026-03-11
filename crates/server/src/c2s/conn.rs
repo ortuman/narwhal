@@ -36,7 +36,7 @@ use crate::transmitter::{Resource, Transmitter};
 /// The C2S connection runtime.
 pub type C2sConnRuntime = narwhal_common::conn::ConnRuntime<C2sService>;
 
-// ===== C2sDispatcherMetrics =====
+// === C2sDispatcherMetrics ===
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ResultLabel {
@@ -207,7 +207,7 @@ pub struct C2sDispatcherFactoryInner {
 #[derive(Debug, Default)]
 pub struct C2sDispatcher(Option<C2sDispatcherInner>);
 
-// ===== impl C2sDispatcher =====
+// === impl C2sDispatcher ===
 
 impl C2sDispatcher {
   /// Initializes the dispatcher with the given parameters.
@@ -268,7 +268,7 @@ struct C2sDispatcherInner {
   metrics: C2sDispatcherMetrics,
 }
 
-// ===== impl C2sDispatcherInner =====
+// === impl C2sDispatcherInner ===
 
 impl C2sDispatcherInner {
   /// Handles the initial connection handshake with a client.
