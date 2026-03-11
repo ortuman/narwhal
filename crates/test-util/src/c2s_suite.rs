@@ -261,8 +261,8 @@ impl C2sSuite {
     &mut self,
     username: &str,
     channel: &str,
-    max_clients: u32,
-    max_payload_size: u32,
+    max_clients: Option<u32>,
+    max_payload_size: Option<u32>,
   ) -> anyhow::Result<()> {
     self
       .write_message(

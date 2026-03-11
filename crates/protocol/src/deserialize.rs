@@ -417,7 +417,7 @@ mod tests {
     TestCase {
             name: "SET_CHAN_CONFIG",
             input: b"SET_CHAN_CONFIG id=1 channel=!1@localhost max_clients=100 max_payload_size=16",
-            expected: Ok(Message::SetChannelConfiguration(SetChannelConfigurationParameters { id: 1, channel: StringAtom::from("!1@localhost"), max_clients: 100, max_payload_size: 16, ..Default::default() })),
+            expected: Ok(Message::SetChannelConfiguration(SetChannelConfigurationParameters { id: 1, channel: StringAtom::from("!1@localhost"), max_clients: Some(100), max_payload_size: Some(16), ..Default::default() })),
         },
     ];
 

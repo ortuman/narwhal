@@ -401,9 +401,10 @@ impl ChannelShard {
       }
 
       let config = ChannelConfig {
-        max_clients: self.limits.max_clients_per_channel,
-        max_payload_size: self.limits.max_payload_size,
-        max_persist_messages: 0,
+        max_clients: Some(self.limits.max_clients_per_channel),
+        max_payload_size: Some(self.limits.max_payload_size),
+        max_persist_messages: Some(0),
+        persist: Some(false),
       };
       self.channels.insert(handler.clone(), Channel::new(handler.clone(), config, self.notifier.clone()));
       self.total_channels.fetch_add(1, Ordering::SeqCst);
@@ -450,7 +451,7 @@ impl ChannelShard {
       return Err(narwhal_protocol::Error::new(UserInChannel).with_id(correlation_id).into());
     }
 
-    if channel.member_count() >= channel.config.max_clients as usize {
+    if channel.member_count() >= channel.config.max_clients.unwrap_or(0) as usize {
       if as_owner {
         self.channels.remove(&handler);
       }
@@ -619,7 +620,7 @@ impl ChannelShard {
       return Err(narwhal_protocol::Error::new(NotAllowed).with_id(correlation_id).into());
     }
 
-    let max_payload_size = channel.config.max_payload_size;
+    let max_payload_size = channel.config.max_payload_size.unwrap_or(0);
     let allowed_targets = channel.allowed_targets.clone();
     let seq = channel.next_seq();
     let payload_length = payload.as_slice().len() as u32;
@@ -741,7 +742,7 @@ impl ChannelShard {
     };
     new_acl.update(nids, acl_action);
 
-    if new_acl.total_entries() > channel.config.max_clients as usize {
+    if new_acl.total_entries() > channel.config.max_clients.unwrap_or(0) as usize {
       return Err(
         narwhal_protocol::Error::new(PolicyViolation)
           .with_id(correlation_id)
@@ -776,9 +777,10 @@ impl ChannelShard {
     transmitter.send_message(Message::ChannelConfiguration(ChannelConfigurationParameters {
       id: correlation_id,
       channel: channel_id.into(),
-      max_clients: config.max_clients,
-      max_payload_size: config.max_payload_size,
-      max_persist_messages: config.max_persist_messages,
+      max_clients: config.max_clients.unwrap_or(0),
+      max_payload_size: config.max_payload_size.unwrap_or(0),
+      max_persist_messages: config.max_persist_messages.unwrap_or(0),
+      persist: config.persist.unwrap_or(false),
     }));
 
     Ok(())
@@ -796,7 +798,9 @@ impl ChannelShard {
       return Err(narwhal_protocol::Error::new(NotAllowed).with_id(correlation_id).into());
     }
 
-    if config.max_clients > self.limits.max_clients_per_channel {
+    if let Some(v) = config.max_clients
+      && v > self.limits.max_clients_per_channel
+    {
       return Err(
         narwhal_protocol::Error::new(BadRequest)
           .with_id(correlation_id)
@@ -805,7 +809,9 @@ impl ChannelShard {
       );
     }
 
-    if config.max_payload_size > self.limits.max_payload_size {
+    if let Some(v) = config.max_payload_size
+      && v > self.limits.max_payload_size
+    {
       return Err(
         narwhal_protocol::Error::new(BadRequest)
           .with_id(correlation_id)
@@ -814,7 +820,9 @@ impl ChannelShard {
       );
     }
 
-    if config.max_persist_messages > self.limits.max_persist_messages {
+    if let Some(v) = config.max_persist_messages
+      && v > self.limits.max_persist_messages
+    {
       return Err(
         narwhal_protocol::Error::new(BadRequest)
           .with_id(correlation_id)
@@ -1468,9 +1476,10 @@ impl ChannelAcl {
 /// The channel configuration.
 #[derive(Clone, Debug, Default)]
 pub struct ChannelConfig {
-  pub max_clients: u32,
-  pub max_payload_size: u32,
-  pub max_persist_messages: u32,
+  pub max_clients: Option<u32>,
+  pub max_payload_size: Option<u32>,
+  pub max_persist_messages: Option<u32>,
+  pub persist: Option<bool>,
 }
 
 // === impl ChannelConfig ===
@@ -1478,14 +1487,17 @@ pub struct ChannelConfig {
 impl ChannelConfig {
   pub fn merge(&self, other: &Self) -> Self {
     let mut config = self.clone();
-    if other.max_clients > 0 {
-      config.max_clients = other.max_clients;
+    if let Some(v) = other.max_clients {
+      config.max_clients = Some(v);
     }
-    if other.max_payload_size > 0 {
-      config.max_payload_size = other.max_payload_size;
+    if let Some(v) = other.max_payload_size {
+      config.max_payload_size = Some(v);
     }
-    if other.max_persist_messages > 0 {
-      config.max_persist_messages = other.max_persist_messages;
+    if let Some(v) = other.max_persist_messages {
+      config.max_persist_messages = Some(v);
+    }
+    if let Some(v) = other.persist {
+      config.persist = Some(v);
     }
     config
   }

@@ -251,7 +251,7 @@ mod tests {
                     max_payload_size: 16,
                     ..Default::default()
                 }),
-                expected_out: Some("CHAN_CONFIG id=1 channel=!1@localhost max_clients=100 max_payload_size=16 max_persist_messages=0\n".to_string()),
+                expected_out: Some("CHAN_CONFIG id=1 channel=!1@localhost max_clients=100 max_payload_size=16 max_persist_messages=0 persist=false\n".to_string()),
             },
             TestCase {
                 name: "CONNECT",
@@ -450,12 +450,12 @@ mod tests {
                 msg: Message::SetChannelConfiguration ( SetChannelConfigurationParameters {
                     id: 1,
                     channel: "!1@localhost".into(),
-                    max_clients: 100,
-                    max_payload_size: 16,
+                    max_clients: Some(100),
+                    max_payload_size: Some(16),
                     ..Default::default()
                     }
                 ),
-                expected_out: Some("SET_CHAN_CONFIG id=1 channel=!1@localhost max_clients=100 max_payload_size=16 max_persist_messages=0\n".to_string()),
+                expected_out: Some("SET_CHAN_CONFIG id=1 channel=!1@localhost max_clients=100 max_payload_size=16\n".to_string()),
             },
         ];
 

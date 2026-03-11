@@ -5,10 +5,11 @@ use std::time::Duration;
 use narwhal_protocol::EventKind::{ChannelDeleted, MemberJoined, MemberLeft};
 use narwhal_protocol::{
   AclAction, AclType, BroadcastParameters, ChannelAclParameters, ConnectParameters, DeleteChannelAckParameters,
-  DeleteChannelParameters, ErrorParameters, EventParameters, GetChannelAclParameters, JoinChannelAckParameters,
-  JoinChannelParameters, LeaveChannelAckParameters, LeaveChannelParameters, ListChannelsAckParameters,
-  ListChannelsParameters, ListMembersAckParameters, ListMembersParameters, SetChannelAclAckParameters,
-  SetChannelAclParameters, SetChannelConfigurationAckParameters, SetChannelConfigurationParameters,
+  DeleteChannelParameters, ErrorParameters, EventParameters, GetChannelAclParameters,
+  GetChannelConfigurationParameters, JoinChannelAckParameters, JoinChannelParameters, LeaveChannelAckParameters,
+  LeaveChannelParameters, ListChannelsAckParameters, ListChannelsParameters, ListMembersAckParameters,
+  ListMembersParameters, SetChannelAclAckParameters, SetChannelAclParameters, SetChannelConfigurationAckParameters,
+  SetChannelConfigurationParameters,
 };
 use narwhal_protocol::{IdentifyParameters, Message};
 use narwhal_test_util::{C2sSuite, assert_message, default_c2s_config};
@@ -402,7 +403,7 @@ async fn test_c2s_join_full_channel() -> anyhow::Result<()> {
   suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
 
   // Configure channel to allow only one client.
-  suite.configure_channel(TEST_USER_1, "!test1@localhost", 1, 8192).await?;
+  suite.configure_channel(TEST_USER_1, "!test1@localhost", Some(1), Some(8192)).await?;
 
   // Join to the existing channel.
   suite
@@ -1056,8 +1057,8 @@ async fn test_c2s_channel_configuration() -> anyhow::Result<()> {
       Message::SetChannelConfiguration(SetChannelConfigurationParameters {
         id: 1234,
         channel: StringAtom::from("!test1@localhost"),
-        max_clients: 25,
-        max_payload_size: 8192,
+        max_clients: Some(25),
+        max_payload_size: Some(8192),
         ..Default::default()
       }),
     )
@@ -1078,8 +1079,8 @@ async fn test_c2s_channel_configuration() -> anyhow::Result<()> {
       Message::SetChannelConfiguration(SetChannelConfigurationParameters {
         id: 1234,
         channel: StringAtom::from("!test1@localhost"),
-        max_clients: 25,
-        max_payload_size: 8192,
+        max_clients: Some(25),
+        max_payload_size: Some(8192),
         ..Default::default()
       }),
     )
@@ -1115,8 +1116,8 @@ async fn test_c2s_unauthorized_channel_configuration() -> anyhow::Result<()> {
       Message::SetChannelConfiguration(SetChannelConfigurationParameters {
         id: 1234,
         channel: StringAtom::from("!test1@localhost"),
-        max_clients: 25,
-        max_payload_size: 8192,
+        max_clients: Some(25),
+        max_payload_size: Some(8192),
         ..Default::default()
       }),
     )
@@ -1152,8 +1153,8 @@ async fn test_c2s_channel_max_clients_configuration_limit() -> anyhow::Result<()
       Message::SetChannelConfiguration(SetChannelConfigurationParameters {
         id: 1234,
         channel: StringAtom::from("!test1@localhost"),
-        max_clients: 200,
-        max_payload_size: 8192,
+        max_clients: Some(200),
+        max_payload_size: Some(8192),
         ..Default::default()
       }),
     )
@@ -1193,8 +1194,8 @@ async fn test_c2s_channel_max_payload_configuration_limit() -> anyhow::Result<()
       Message::SetChannelConfiguration(SetChannelConfigurationParameters {
         id: 1234,
         channel: StringAtom::from("!test1@localhost"),
-        max_clients: 25,
-        max_payload_size: 1_000 * 1024,
+        max_clients: Some(25),
+        max_payload_size: Some(1_000 * 1024),
         ..Default::default()
       }),
     )
@@ -1234,7 +1235,7 @@ async fn test_c2s_channel_max_persist_messages_configuration_limit() -> anyhow::
       Message::SetChannelConfiguration(SetChannelConfigurationParameters {
         id: 1234,
         channel: StringAtom::from("!test1@localhost"),
-        max_persist_messages: 200,
+        max_persist_messages: Some(200),
         ..Default::default()
       }),
     )
@@ -1250,6 +1251,98 @@ async fn test_c2s_channel_max_persist_messages_configuration_limit() -> anyhow::
       detail: Some(StringAtom::from("max_persist_messages exceeds server established limit")),
     }
   );
+
+  suite.teardown().await?;
+
+  Ok(())
+}
+
+#[monoio::test(enable_timer = true)]
+async fn test_c2s_channel_persist_configuration() -> anyhow::Result<()> {
+  let mut suite = C2sSuite::new(default_c2s_config()).await?;
+  suite.setup().await?;
+
+  // Identify user.
+  suite.identify(TEST_USER_1).await?;
+
+  // Create a channel.
+  suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
+
+  // Set persist to true.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::SetChannelConfiguration(SetChannelConfigurationParameters {
+        id: 1234,
+        channel: StringAtom::from("!test1@localhost"),
+        persist: Some(true),
+        ..Default::default()
+      }),
+    )
+    .await?;
+
+  assert_message!(
+    suite.read_message(TEST_USER_1).await?,
+    Message::SetChannelConfigurationAck,
+    SetChannelConfigurationAckParameters { id: 1234 }
+  );
+
+  // Verify persist is true via GET.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::GetChannelConfiguration(GetChannelConfigurationParameters {
+        id: 1235,
+        channel: StringAtom::from("!test1@localhost"),
+      }),
+    )
+    .await?;
+
+  let reply = suite.read_message(TEST_USER_1).await?;
+  if let Message::ChannelConfiguration(params) = reply {
+    assert_eq!(params.id, 1235);
+    assert!(params.persist);
+  } else {
+    panic!("expected ChannelConfiguration response");
+  }
+
+  // Set persist back to false.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::SetChannelConfiguration(SetChannelConfigurationParameters {
+        id: 1236,
+        channel: StringAtom::from("!test1@localhost"),
+        persist: Some(false),
+        ..Default::default()
+      }),
+    )
+    .await?;
+
+  assert_message!(
+    suite.read_message(TEST_USER_1).await?,
+    Message::SetChannelConfigurationAck,
+    SetChannelConfigurationAckParameters { id: 1236 }
+  );
+
+  // Verify persist is false via GET.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::GetChannelConfiguration(GetChannelConfigurationParameters {
+        id: 1237,
+        channel: StringAtom::from("!test1@localhost"),
+      }),
+    )
+    .await?;
+
+  let reply = suite.read_message(TEST_USER_1).await?;
+  if let Message::ChannelConfiguration(params) = reply {
+    assert_eq!(params.id, 1237);
+    assert!(!params.persist);
+  } else {
+    panic!("expected ChannelConfiguration response");
+  }
 
   suite.teardown().await?;
 
@@ -1588,7 +1681,7 @@ async fn test_c2s_channel_acl_max_entries() -> anyhow::Result<()> {
   suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
 
   // Set channels max clients to 2.
-  suite.configure_channel(TEST_USER_1, "!test1@localhost", 2, 8192).await?;
+  suite.configure_channel(TEST_USER_1, "!test1@localhost", Some(2), Some(8192)).await?;
 
   // Set the channel ACL (exceeding the maximum number of entries).
   suite

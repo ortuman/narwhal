@@ -779,9 +779,12 @@ impl C2sDispatcherInner {
 
       channel_id = Some(Self::parse_channel_id(&params.channel)?);
 
-      channel_config.max_clients = params.max_clients;
-      channel_config.max_payload_size = params.max_payload_size;
-      channel_config.max_persist_messages = params.max_persist_messages;
+      channel_config = ChannelConfig {
+        max_clients: params.max_clients,
+        max_payload_size: params.max_payload_size,
+        max_persist_messages: params.max_persist_messages,
+        persist: params.persist,
+      };
     }
     let nid = self.nid.as_ref().unwrap().clone();
     let transmitter = self.transmitter.clone();
