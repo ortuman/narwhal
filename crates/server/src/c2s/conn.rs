@@ -36,8 +36,6 @@ use crate::transmitter::{Resource, Transmitter};
 /// The C2S connection runtime.
 pub type C2sConnRuntime = narwhal_common::conn::ConnRuntime<C2sService>;
 
-// === C2sDispatcherMetrics ===
-
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ResultLabel {
   result: &'static str,
@@ -136,7 +134,7 @@ impl std::fmt::Debug for C2sDispatcherFactory {
   }
 }
 
-// ==== impl C2sDispatcherFactory ====
+// === impl C2sDispatcherFactory ===
 
 impl C2sDispatcherFactory {
   /// Creates a new C2S `C2sDispatcherFactory`.
