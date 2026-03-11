@@ -592,7 +592,7 @@ pub struct S2mModDirectAckParameters {
   pub valid: bool,
 }
 
-// ===== impl Message =====
+// === impl Message ===
 
 impl Message {
   pub fn from_name(msg_name: &[u8]) -> anyhow::Result<Message> {

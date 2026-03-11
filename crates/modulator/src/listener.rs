@@ -27,7 +27,7 @@ pub type S2mListener<M> = Listener<S2mDispatcher<M>, S2mDispatcherFactory<M>, S2
 /// Type alias for M2S listener.
 pub type M2sListener = Listener<M2sDispatcher, M2sDispatcherFactory, M2sService>;
 
-// ===== Metrics =====
+// === Metrics ===
 
 #[derive(Clone)]
 struct Metrics {

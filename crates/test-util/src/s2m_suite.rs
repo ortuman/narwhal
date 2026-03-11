@@ -23,7 +23,7 @@ pub struct S2mSuite<M: Modulator> {
   core_dispatcher: CoreDispatcher,
 }
 
-// ===== impl S2mSuite =====
+// === impl S2mSuite ===
 
 impl<M: Modulator> S2mSuite<M> {
   /// Creates a new S2mSuite with the given configuration and modulator.

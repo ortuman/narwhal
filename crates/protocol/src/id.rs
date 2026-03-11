@@ -46,7 +46,7 @@ pub enum ChannelIdParsingError {
   InvalidChannelIdFormat,
 }
 
-// ===== impl ChannelIdParsingError =====
+// === impl ChannelIdParsingError ===
 
 impl Display for ChannelIdParsingError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,7 +65,7 @@ pub enum NidParsingError {
   InvalidNidFormat,
 }
 
-// ===== impl NidParsingError =====
+// === impl NidParsingError ===
 
 impl Display for NidParsingError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -90,7 +90,7 @@ pub struct ChannelId {
   full: StringAtom,
 }
 
-// ===== impl ChannelId =====
+// === impl ChannelId ===
 
 impl ChannelId {
   /// Creates a new channel ID.
@@ -200,7 +200,7 @@ pub struct Nid {
   full: StringAtom,
 }
 
-// ===== impl Nid =====
+// === impl Nid ===
 
 impl Nid {
   /// Creates a new NID validating the username and domain.

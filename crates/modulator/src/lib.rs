@@ -75,7 +75,7 @@ pub struct ModulatorService {
   m2s_listener: Option<M2sListener>,
 }
 
-// ===== impl ModulatorService =====
+// === impl ModulatorService ===
 
 impl ModulatorService {
   /// Initializes and starts the modulator service components.

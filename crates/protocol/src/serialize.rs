@@ -122,7 +122,7 @@ pub struct ParameterWriter<'a> {
   c: Cursor<&'a mut [u8]>,
 }
 
-// ===== impl ParameterWriter =====
+// === impl ParameterWriter ===
 
 impl<'a> ParameterWriter<'a> {
   fn new(c: Cursor<&'a mut [u8]>) -> Self {

@@ -638,7 +638,7 @@ pub struct Conn<D: Dispatcher> {
   cancellation_token: CancellationToken,
 }
 
-// ===== impl Conn =====
+// === impl Conn ===
 
 impl<D: Dispatcher> Conn<D> {
   async fn dispatch_message<ST: Service>(&mut self, msg: Message, payload: Option<PoolBuffer>) -> anyhow::Result<()> {
@@ -1471,7 +1471,7 @@ impl std::fmt::Debug for ConnTx {
   }
 }
 
-// ===== impl ConnTx =====
+// === impl ConnTx ===
 
 impl ConnTx {
   /// Creates a new connection transmitter.
