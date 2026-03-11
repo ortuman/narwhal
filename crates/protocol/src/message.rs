@@ -152,6 +152,7 @@ pub struct ChannelConfigurationParameters {
   pub max_clients: u32,
   pub max_payload_size: u32,
   pub max_persist_messages: u32,
+  pub persist: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
@@ -514,6 +515,7 @@ pub struct SetChannelConfigurationParameters {
   pub max_clients: u32,
   pub max_payload_size: u32,
   pub max_persist_messages: u32,
+  pub persist: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]

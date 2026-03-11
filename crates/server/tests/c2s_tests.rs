@@ -9,6 +9,7 @@ use narwhal_protocol::{
   JoinChannelParameters, LeaveChannelAckParameters, LeaveChannelParameters, ListChannelsAckParameters,
   ListChannelsParameters, ListMembersAckParameters, ListMembersParameters, SetChannelAclAckParameters,
   SetChannelAclParameters, SetChannelConfigurationAckParameters, SetChannelConfigurationParameters,
+  GetChannelConfigurationParameters,
 };
 use narwhal_protocol::{IdentifyParameters, Message};
 use narwhal_test_util::{C2sSuite, assert_message, default_c2s_config};
@@ -1250,6 +1251,98 @@ async fn test_c2s_channel_max_persist_messages_configuration_limit() -> anyhow::
       detail: Some(StringAtom::from("max_persist_messages exceeds server established limit")),
     }
   );
+
+  suite.teardown().await?;
+
+  Ok(())
+}
+
+#[monoio::test(enable_timer = true)]
+async fn test_c2s_channel_persist_configuration() -> anyhow::Result<()> {
+  let mut suite = C2sSuite::new(default_c2s_config()).await?;
+  suite.setup().await?;
+
+  // Identify user.
+  suite.identify(TEST_USER_1).await?;
+
+  // Create a channel.
+  suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
+
+  // Set persist to true.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::SetChannelConfiguration(SetChannelConfigurationParameters {
+        id: 1234,
+        channel: StringAtom::from("!test1@localhost"),
+        persist: true,
+        ..Default::default()
+      }),
+    )
+    .await?;
+
+  assert_message!(
+    suite.read_message(TEST_USER_1).await?,
+    Message::SetChannelConfigurationAck,
+    SetChannelConfigurationAckParameters { id: 1234 }
+  );
+
+  // Verify persist is true via GET.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::GetChannelConfiguration(GetChannelConfigurationParameters {
+        id: 1235,
+        channel: StringAtom::from("!test1@localhost"),
+      }),
+    )
+    .await?;
+
+  let reply = suite.read_message(TEST_USER_1).await?;
+  if let Message::ChannelConfiguration(params) = reply {
+    assert_eq!(params.id, 1235);
+    assert!(params.persist);
+  } else {
+    panic!("expected ChannelConfiguration response");
+  }
+
+  // Set persist back to false.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::SetChannelConfiguration(SetChannelConfigurationParameters {
+        id: 1236,
+        channel: StringAtom::from("!test1@localhost"),
+        persist: false,
+        ..Default::default()
+      }),
+    )
+    .await?;
+
+  assert_message!(
+    suite.read_message(TEST_USER_1).await?,
+    Message::SetChannelConfigurationAck,
+    SetChannelConfigurationAckParameters { id: 1236 }
+  );
+
+  // Verify persist is false via GET.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::GetChannelConfiguration(GetChannelConfigurationParameters {
+        id: 1237,
+        channel: StringAtom::from("!test1@localhost"),
+      }),
+    )
+    .await?;
+
+  let reply = suite.read_message(TEST_USER_1).await?;
+  if let Message::ChannelConfiguration(params) = reply {
+    assert_eq!(params.id, 1237);
+    assert!(!params.persist);
+  } else {
+    panic!("expected ChannelConfiguration response");
+  }
 
   suite.teardown().await?;
 

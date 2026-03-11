@@ -336,6 +336,7 @@ impl C2sClient {
     max_clients: u32,
     max_payload_size: u32,
     max_persist_messages: u32,
+    persist: bool,
   ) -> crate::Result<()> {
     use narwhal_protocol::SetChannelConfigurationParameters;
 
@@ -346,6 +347,7 @@ impl C2sClient {
       max_clients,
       max_payload_size,
       max_persist_messages,
+      persist,
     });
 
     let handle = self.client.send_message(message, None).await?;

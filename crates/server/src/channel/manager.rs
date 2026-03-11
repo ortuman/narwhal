@@ -404,6 +404,7 @@ impl ChannelShard {
         max_clients: self.limits.max_clients_per_channel,
         max_payload_size: self.limits.max_payload_size,
         max_persist_messages: 0,
+        persist: false,
       };
       self.channels.insert(handler.clone(), Channel::new(handler.clone(), config, self.notifier.clone()));
       self.total_channels.fetch_add(1, Ordering::SeqCst);
@@ -779,6 +780,7 @@ impl ChannelShard {
       max_clients: config.max_clients,
       max_payload_size: config.max_payload_size,
       max_persist_messages: config.max_persist_messages,
+      persist: config.persist,
     }));
 
     Ok(())
@@ -1471,6 +1473,7 @@ pub struct ChannelConfig {
   pub max_clients: u32,
   pub max_payload_size: u32,
   pub max_persist_messages: u32,
+  pub persist: bool,
 }
 
 // === impl ChannelConfig ===
@@ -1484,9 +1487,8 @@ impl ChannelConfig {
     if other.max_payload_size > 0 {
       config.max_payload_size = other.max_payload_size;
     }
-    if other.max_persist_messages > 0 {
-      config.max_persist_messages = other.max_persist_messages;
-    }
+    config.max_persist_messages = other.max_persist_messages;
+    config.persist = other.persist;
     config
   }
 }
