@@ -829,7 +829,7 @@ async fn test_c2s_modulator_channel_survives_single_connection_drop() -> anyhow:
 
 #[monoio::test(enable_timer = true)]
 async fn test_c2s_channel_persist_not_allowed_for_identified_users() -> anyhow::Result<()> {
-  let mut suite = C2sSuite::default().await?;
+  let mut suite = C2sSuite::new(default_c2s_config()).await?;
   suite.setup().await?;
 
   suite.identify("alice").await?;
