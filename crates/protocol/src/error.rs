@@ -183,7 +183,6 @@ impl Error {
         | ErrorReason::Forbidden
         | ErrorReason::NotAllowed
         | ErrorReason::NotImplemented
-        | ErrorReason::PolicyViolation
         | ErrorReason::UserInChannel
         | ErrorReason::UserNotInChannel
         | ErrorReason::UsernameInUse
