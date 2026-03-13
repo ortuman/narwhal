@@ -39,6 +39,15 @@ pub trait ChannelStore: Send + Sync + 'static {
   async fn load_channel(&self, handler: &StringAtom) -> anyhow::Result<PersistedChannel>;
 }
 
+/// Factory for creating per-channel message logs.
+pub trait MessageLogFactory: Send + Sync + 'static {
+  /// The message log type produced by this factory.
+  type Log: MessageLog;
+
+  /// Creates a message log for the given channel handler.
+  fn create(&self, handler: &StringAtom) -> Self::Log;
+}
+
 /// Append-only log for persisting broadcast messages for a single channel.
 #[async_trait(?Send)]
 pub trait MessageLog {
