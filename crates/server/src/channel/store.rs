@@ -18,7 +18,6 @@ pub struct PersistedChannel {
   pub config: ChannelConfig,
   pub acl: ChannelAcl,
   pub members: HashSet<Nid>,
-  pub seq: u64,
 }
 
 /// Storage backend for persisting channel metadata.
@@ -61,6 +60,10 @@ pub trait MessageLog: Send + 'static {
 
   /// Flushes any buffered writes to durable storage.
   async fn flush(&self) -> anyhow::Result<()>;
+
+  /// Returns the highest sequence number stored in the log, or 0 if the log is empty.
+  /// Used during restore to derive the correct starting seq for new broadcasts.
+  async fn last_seq(&self) -> anyhow::Result<u64>;
 
   /// Streams messages with seq > `from_seq`, ordered by seq ascending, up to `limit` entries,
   /// writing their wire-format representation directly to the given writer.
@@ -112,6 +115,10 @@ impl MessageLog for NoopMessageLog {
 
   async fn flush(&self) -> anyhow::Result<()> {
     Ok(())
+  }
+
+  async fn last_seq(&self) -> anyhow::Result<u64> {
+    Ok(0)
   }
 
   async fn write_history<W: AsyncWriteRent>(&self, _from_seq: u64, _limit: u32, _writer: &mut W) -> anyhow::Result<u32>

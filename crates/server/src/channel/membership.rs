@@ -23,8 +23,6 @@ enum Command {
 
   ReleaseSlot { username: StringAtom, handler: StringAtom, reply_tx: Sender<()> },
 
-  ReleaseAllSlots { username: StringAtom, reply_tx: Sender<Arc<[StringAtom]>> },
-
   GetChannels { username: StringAtom, reply_tx: Sender<Arc<[StringAtom]>> },
 }
 
@@ -58,11 +56,6 @@ impl MembershipShard {
         let _ = reply_tx.send(()).await;
       },
 
-      Command::ReleaseAllSlots { username, reply_tx } => {
-        let handlers = self.release_all_slots(&username);
-        let _ = reply_tx.send(handlers).await;
-      },
-
       Command::GetChannels { username, reply_tx } => {
         let channels = self.get_channels(&username);
         let _ = reply_tx.send(channels).await;
@@ -88,10 +81,6 @@ impl MembershipShard {
         self.user_channels.remove(username);
       }
     }
-  }
-
-  fn release_all_slots(&mut self, username: &StringAtom) -> Arc<[StringAtom]> {
-    self.user_channels.remove(username).map(Arc::from_iter).unwrap_or_default()
   }
 
   fn get_channels(&self, username: &StringAtom) -> Arc<[StringAtom]> {
@@ -167,21 +156,6 @@ impl Membership {
     }
 
     let _ = reply_rx.recv().await;
-  }
-
-  pub(crate) async fn release_all_slots(&self, username: &StringAtom) -> Arc<[StringAtom]> {
-    self.assert_bootstrapped();
-
-    let shard = shard_for_user(username, self.mailboxes.len());
-    let (reply_tx, reply_rx) = async_channel::bounded(1);
-
-    let cmd = Command::ReleaseAllSlots { username: username.clone(), reply_tx };
-
-    if self.mailboxes[shard].send(cmd).await.is_err() {
-      return Arc::from([]);
-    }
-
-    reply_rx.recv().await.unwrap_or_default()
   }
 
   pub(crate) async fn get_channels(&self, username: &StringAtom) -> Arc<[StringAtom]> {
