@@ -30,12 +30,14 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 
+use tracing::error;
+
 use crate::notifier::Notifier;
 use crate::router::GlobalRouter;
 use crate::transmitter::{Resource, Transmitter};
 
 use super::membership::Membership;
-use super::store::{ChannelStore, MessageLog, MessageLogFactory};
+use super::store::{ChannelStore, MessageLog, MessageLogFactory, PersistedChannel};
 
 const DEFAULT_MAILBOX_CAPACITY: usize = 16384;
 
@@ -183,7 +185,6 @@ struct Channel<ML: MessageLog> {
   allowed_targets: Arc<[Nid]>,
   notifier: Notifier,
   seq: u64,
-  #[allow(dead_code)]
   message_log: ML,
 }
 
@@ -305,6 +306,17 @@ impl<ML: MessageLog> Channel<ML> {
     self.seq += 1;
     seq
   }
+
+  fn to_persisted(&self) -> PersistedChannel {
+    PersistedChannel {
+      handler: self.handler.clone(),
+      owner: self.owner.clone(),
+      config: self.config.clone(),
+      acl: self.acl.clone(),
+      members: self.members.clone(),
+      seq: self.seq,
+    }
+  }
 }
 
 struct ChannelShard<CS: ChannelStore, MLF: MessageLogFactory> {
@@ -325,10 +337,35 @@ struct ChannelShard<CS: ChannelStore, MLF: MessageLogFactory> {
 // === impl ChannelShard ===
 
 impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
-  async fn run(mut self) {
+  async fn restore_and_run(mut self, handlers: Vec<StringAtom>) {
+    if let Err(e) = self.restore(handlers).await {
+      error!("failed to restore persisted channels: {}", e);
+    }
     while let Ok(cmd) = self.mailbox.recv().await {
       self.handle(cmd).await;
     }
+  }
+
+  async fn restore(&mut self, handlers: Vec<StringAtom>) -> anyhow::Result<()> {
+    for handler in &handlers {
+      let persisted = self.store.load_channel(handler).await?;
+      let message_log = self.message_log_factory.create(handler);
+      let mut channel = Channel::new(handler.clone(), persisted.config, self.notifier.clone(), message_log);
+      channel.owner = persisted.owner;
+      channel.acl = persisted.acl;
+      channel.members = persisted.members;
+      channel.seq = persisted.seq;
+      channel.update_allowed_targets();
+
+      for member in &channel.members {
+        self.membership.reserve_slot(&member.username, handler, self.limits.max_channels_per_client).await;
+      }
+
+      self.channels.insert(handler.clone(), channel);
+      self.total_channels.fetch_add(1, Ordering::SeqCst);
+      self.metrics.channels_active.inc();
+    }
+    Ok(())
   }
 
   async fn handle(&mut self, cmd: Command) {
@@ -366,7 +403,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
         let _ = reply_tx.send(result).await;
       },
       Command::SetChannelConfiguration { config, channel_id, nid, transmitter, correlation_id, reply_tx } => {
-        let result = self.set_channel_configuration(config, channel_id, nid, transmitter, correlation_id);
+        let result = self.set_channel_configuration(config, channel_id, nid, transmitter, correlation_id).await;
         let _ = reply_tx.send(result).await;
       },
       Command::FilterOwnedChannels { nid, handlers, reply_tx } => {
@@ -487,6 +524,12 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       .notify_member_joined(&new_member_nid, Some(transmitter.resource()), as_owner, self.local_domain.clone())
       .await?;
 
+    // Save updated membership to persistent storage.
+    let channel = self.channels.get(&handler).unwrap();
+    if channel.config.persist == Some(true) {
+      self.store.save_channel(&channel.to_persisted()).await?;
+    }
+
     transmitter.send_message(Message::JoinChannelAck(JoinChannelAckParameters {
       id: correlation_id,
       channel: channel_id.into(),
@@ -592,6 +635,13 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       self.membership.release_slot(username, &channel_id.handler).await;
     }
 
+    // Clean up persistent storage before removing the channel from memory.
+    let channel = self.channels.get_mut(&channel_id.handler).unwrap();
+    if channel.config.persist == Some(true) {
+      channel.message_log.delete().await?;
+      self.store.delete_channel(&channel_id.handler).await?;
+    }
+
     self.channels.remove(&channel_id.handler);
 
     transmitter.send_message(Message::DeleteChannelAck(DeleteChannelAckParameters { id: correlation_id }));
@@ -629,6 +679,8 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     }
 
     let max_payload_size = channel.config.max_payload_size.unwrap_or(0);
+    let is_persistent = channel.config.persist == Some(true);
+    let max_persist_messages = channel.config.max_persist_messages.unwrap_or(0);
     let allowed_targets = channel.allowed_targets.clone();
     let seq = channel.next_seq();
     let payload_length = payload.as_slice().len() as u32;
@@ -655,6 +707,11 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       seq,
       timestamp,
     });
+
+    if is_persistent {
+      let channel = self.channels.get_mut(&channel_id.handler).unwrap();
+      channel.message_log.append(&msg, &payload, max_persist_messages).await?;
+    }
 
     self.router.route_to_many(msg, Some(payload), allowed_targets.iter(), Some(transmitter.resource())).await?;
 
@@ -794,7 +851,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     Ok(())
   }
 
-  fn set_channel_configuration(
+  async fn set_channel_configuration(
     &mut self,
     config: ChannelConfig,
     channel_id: ChannelId,
@@ -846,7 +903,16 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       return Err(narwhal_protocol::Error::new(Forbidden).with_id(correlation_id).into());
     }
 
+    let was_persistent = channel.config.persist == Some(true);
     channel.merge_config(&config);
+    let is_persistent = channel.config.persist == Some(true);
+
+    if is_persistent {
+      self.store.save_channel(&channel.to_persisted()).await?;
+    } else if was_persistent {
+      channel.message_log.delete().await?;
+      self.store.delete_channel(&channel_id.handler).await?;
+    }
 
     transmitter
       .send_message(Message::SetChannelConfigurationAck(SetChannelConfigurationAckParameters { id: correlation_id }));
@@ -943,6 +1009,10 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     channel.remove_member(nid);
 
     if channel.is_empty() {
+      if channel.config.persist == Some(true) {
+        channel.message_log.delete().await?;
+        self.store.delete_channel(handler).await?;
+      }
       self.channels.remove(handler);
       self.total_channels.fetch_sub(1, Ordering::SeqCst);
       self.metrics.channels_active.dec();
@@ -953,6 +1023,12 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       let channel = self.channels.get_mut(handler).unwrap();
       let new_owner = channel.pick_new_owner().unwrap();
       channel.notify_member_joined(&new_owner, None, true, self.local_domain.clone()).await?;
+    }
+
+    // Save updated membership to persistent storage.
+    let channel = self.channels.get(handler).unwrap();
+    if channel.config.persist == Some(true) {
+      self.store.save_channel(&channel.to_persisted()).await?;
     }
 
     Ok(true)
@@ -1040,7 +1116,15 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelManager<CS, MLF> {
     let mut mailboxes = Vec::with_capacity(shard_count);
     let local_domain = self.router.c2s_router().local_domain();
 
-    for shard_id in 0..shard_count {
+    // Load persisted channel handlers and group by shard.
+    let handlers = self.store.load_channel_handlers().await?;
+    let mut shard_handlers: Vec<Vec<StringAtom>> = vec![Vec::new(); shard_count];
+    for handler in handlers.iter() {
+      let shard_id = shard_for(handler, shard_count);
+      shard_handlers[shard_id].push(handler.clone());
+    }
+
+    for (shard_id, handlers_for_shard) in shard_handlers.into_iter().enumerate() {
       let (tx, rx) = async_channel::bounded(self.mailbox_capacity);
       mailboxes.push(tx);
 
@@ -1060,7 +1144,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelManager<CS, MLF> {
 
       core_dispatcher
         .dispatch_at_shard(shard_id, move || async move {
-          shard.run().await;
+          shard.restore_and_run(handlers_for_shard).await;
         })
         .await?;
     }
