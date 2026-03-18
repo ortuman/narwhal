@@ -222,17 +222,6 @@ impl<ML: MessageLog> Channel<ML> {
     self.members.len()
   }
 
-  fn insert_member(&mut self, nid: Nid) {
-    if self.owner.is_none() {
-      self.owner = Some(nid.clone());
-    }
-    let pos = self.members.partition_point(|m| m < &nid);
-    let mut v: Vec<Nid> = self.members.iter().cloned().collect();
-    v.insert(pos, nid);
-    self.members = Rc::from(v);
-    self.update_allowed_targets();
-  }
-
   fn remove_member(&mut self, nid: &Nid) -> bool {
     if self.owner.as_ref() == Some(nid) {
       self.owner = None;
