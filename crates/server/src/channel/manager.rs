@@ -540,17 +540,20 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     }
 
     // Persist the projected membership before any in-memory changes.
-    {
+    // Build new_members once and share the Rc between the persist and in-memory paths.
+    let new_members = {
       let channel = self.channels.get(&handler).unwrap();
+      let pos = channel.members.partition_point(|m| m < &new_member_nid);
+      let mut v: Vec<Nid> = channel.members.iter().cloned().collect();
+      v.insert(pos, new_member_nid.clone());
+      let new_members: Rc<[Nid]> = Rc::from(v);
+
       if channel.config.persist == Some(true) {
         let mut projected = channel.to_persisted();
         if projected.owner.is_none() {
           projected.owner = Some(new_member_nid.clone());
         }
-        let pos = channel.members.partition_point(|m| m < &new_member_nid);
-        let mut v: Vec<Nid> = channel.members.iter().cloned().collect();
-        v.insert(pos, new_member_nid.clone());
-        projected.members = Rc::from(v);
+        projected.members = new_members.clone();
         if let Err(e) = self.store.save_channel(&projected).await {
           self.membership.release_slot(&new_member_nid.username, &handler).await;
           if as_owner {
@@ -561,10 +564,16 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
           return Err(e);
         }
       }
-    }
+
+      new_members
+    };
 
     let channel = self.channels.get_mut(&handler).unwrap();
-    channel.insert_member(new_member_nid.clone());
+    if channel.owner.is_none() {
+      channel.owner = Some(new_member_nid.clone());
+    }
+    channel.members = new_members;
+    channel.update_allowed_targets();
     if let Err(e) = channel
       .notify_member_joined(&new_member_nid, Some(transmitter.resource()), as_owner, self.local_domain.clone())
       .await
@@ -1087,14 +1096,24 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     let new_owner =
       if as_owner && !will_be_empty { Some(channel.members.iter().find(|m| *m != nid).unwrap().clone()) } else { None };
 
+    // Build new_members once (only when the channel will survive) so it can be
+    // shared between the persist and in-memory paths without a second O(n) rebuild.
+    let new_members: Option<Rc<[Nid]>> = if !will_be_empty {
+      channel.members.binary_search(nid).ok().map(|pos| {
+        let mut v: Vec<Nid> = channel.members.iter().cloned().collect();
+        v.remove(pos);
+        Rc::from(v)
+      })
+    } else {
+      None
+    };
+
     // Persist the projected membership before any in-memory changes or notifications.
     // Skip when the channel will be empty.
     if channel.config.persist == Some(true) && !will_be_empty {
       let mut projected = channel.to_persisted();
-      if let Ok(pos) = channel.members.binary_search(nid) {
-        let mut v: Vec<Nid> = channel.members.iter().cloned().collect();
-        v.remove(pos);
-        projected.members = Rc::from(v);
+      if let Some(ref members) = new_members {
+        projected.members = members.clone();
       }
       projected.owner = new_owner.clone().or(projected.owner);
       self.store.save_channel(&projected).await?;
@@ -1105,7 +1124,15 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     }
 
     let channel = self.channels.get_mut(handler).unwrap();
-    channel.remove_member(nid);
+    if let Some(members) = new_members {
+      if channel.owner.as_ref() == Some(nid) {
+        channel.owner = None;
+      }
+      channel.members = members;
+      channel.update_allowed_targets();
+    } else {
+      channel.remove_member(nid);
+    }
 
     if channel.is_empty() {
       let is_persistent = channel.config.persist == Some(true);
