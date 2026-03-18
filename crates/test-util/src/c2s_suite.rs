@@ -324,7 +324,6 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sSuite<CS, MLF> {
           max_payload_size,
           persist,
           max_persist_messages,
-          ..Default::default()
         }),
       )
       .await?;

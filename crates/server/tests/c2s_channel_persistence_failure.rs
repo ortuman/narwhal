@@ -62,8 +62,10 @@ async fn test_c2s_join_channel_fails_when_store_save_fails() -> anyhow::Result<(
   let store = FailingChannelStore::new();
   let mlf = FailingMessageLogFactory::new();
 
-  let mut suite =
-    C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store.clone(), mlf).await?;
+  let mut config = default_c2s_config();
+  config.limits.max_channels_per_client = 1;
+
+  let mut suite = C2sSuite::with_modulator_and_stores(config, Some(s2m_client), None, store.clone(), mlf).await?;
   suite.setup().await?;
 
   suite.auth(TEST_USER_1, TEST_USER_1).await?;
@@ -302,7 +304,6 @@ async fn test_c2s_set_config_fails_when_store_save_fails() -> anyhow::Result<()>
         max_payload_size: Some(4096),
         persist: None,
         max_persist_messages: None,
-        ..Default::default()
       }),
     )
     .await?;
@@ -388,9 +389,9 @@ async fn test_c2s_leave_channel_fails_when_store_save_fails() -> anyhow::Result<
     reply
   );
 
-  // Wait for async connection cleanup to run.
-  // Keep store failing so the cleanup's do_leave also fails, preserving membership.
-  monoio::time::sleep(Duration::from_secs(1)).await;
+  // Yield so the async connection cleanup task can run.
+  // The store is still failing, so do_leave will fail and membership is preserved.
+  monoio::time::sleep(Duration::from_millis(200)).await;
 
   // Verify TEST_USER_2 is still in the channel.
   suite

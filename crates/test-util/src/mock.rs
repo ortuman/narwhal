@@ -12,7 +12,7 @@ use narwhal_util::pool::PoolBuffer;
 use narwhal_util::string_atom::StringAtom;
 
 /// A channel store that can be toggled to fail on `save_channel`.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct FailingChannelStore {
   should_fail: Arc<AtomicBool>,
 }
@@ -85,7 +85,7 @@ impl MessageLog for FailingMessageLog {
 }
 
 /// A message log factory that produces `FailingMessageLog` instances sharing a single failure flag.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct FailingMessageLogFactory {
   should_fail: Arc<AtomicBool>,
 }
