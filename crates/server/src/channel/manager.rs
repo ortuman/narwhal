@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -244,7 +244,7 @@ impl<ML: MessageLog> Channel<ML> {
         self.members = Rc::from(v);
         self.update_allowed_targets();
         true
-      }
+      },
       Err(_) => false,
     }
   }
