@@ -243,10 +243,10 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sSuite<CS, MLF> {
 
   /// Authenticates a user via the modulator AUTH flow.
   ///
-  /// Performs CONNECT → AUTH → AuthAck, then registers the connection under the given username.
+  /// Performs CONNECT → AUTH → AuthAck, then registers the connection under the given client key.
   /// Requires that a modulator with an auth handler is configured.
   #[allow(dead_code)]
-  pub async fn auth(&mut self, username: &str, token: &str) -> anyhow::Result<()> {
+  pub async fn auth(&mut self, client_key: &str, token: &str) -> anyhow::Result<()> {
     let mut tls_socket = self.tls_socket_connect().await?;
 
     tls_socket
@@ -263,12 +263,12 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sSuite<CS, MLF> {
     let auth_ack = tls_socket.read_message().await?;
     match &auth_ack {
       Message::AuthAck(params) => {
-        assert_eq!(params.succeeded, Some(true), "auth failed for token {} (client key {})", token, username);
+        assert_eq!(params.succeeded, Some(true), "auth failed for token {} (client key {})", token, client_key);
       },
       other => panic!("expected AuthAck, got: {:?}", other),
     }
 
-    self.clients.insert(username.to_string(), tls_socket);
+    self.clients.insert(client_key.to_string(), tls_socket);
 
     Ok(())
   }

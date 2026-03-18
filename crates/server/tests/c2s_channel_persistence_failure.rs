@@ -8,8 +8,8 @@ use narwhal_common::core_dispatcher::CoreDispatcher;
 use narwhal_modulator::create_s2m_listener;
 use narwhal_modulator::modulator::AuthResult;
 use narwhal_protocol::{
-  AclAction, AclType, BroadcastParameters, ChannelConfigurationParameters, GetChannelAclParameters,
-  GetChannelConfigurationParameters, ListMembersParameters, Message, SetChannelAclParameters,
+  AclAction, AclType, BroadcastParameters, ChannelConfigurationParameters, ErrorParameters, ErrorReason,
+  GetChannelAclParameters, GetChannelConfigurationParameters, ListMembersParameters, Message, SetChannelAclParameters,
   SetChannelConfigurationParameters,
 };
 use narwhal_test_util::{
@@ -85,7 +85,7 @@ async fn test_c2s_join_channel_fails_when_store_save_fails() -> anyhow::Result<(
 
   let reply = suite.read_message(TEST_USER_2).await?;
   assert!(
-    matches!(&reply, Message::Error(p) if p.reason.as_ref() == "INTERNAL_SERVER_ERROR"),
+    matches!(&reply, Message::Error(ErrorParameters { reason, .. }) if *reason == StringAtom::from(ErrorReason::InternalServerError)),
     "expected InternalServerError, got: {:?}",
     reply
   );
@@ -163,7 +163,7 @@ async fn test_c2s_broadcast_fails_when_message_log_append_fails() -> anyhow::Res
 
   let reply = suite.read_message(TEST_USER_1).await?;
   assert!(
-    matches!(&reply, Message::Error(p) if p.reason.as_ref() == "INTERNAL_SERVER_ERROR"),
+    matches!(&reply, Message::Error(ErrorParameters { reason, .. }) if *reason == StringAtom::from(ErrorReason::InternalServerError)),
     "expected InternalServerError, got: {:?}",
     reply
   );
@@ -223,7 +223,7 @@ async fn test_c2s_set_acl_fails_when_store_save_fails() -> anyhow::Result<()> {
 
   let reply = suite.read_message(TEST_USER_2).await?;
   assert!(
-    matches!(&reply, Message::Error(p) if p.reason.as_ref() == "INTERNAL_SERVER_ERROR"),
+    matches!(&reply, Message::Error(ErrorParameters { reason, .. }) if *reason == StringAtom::from(ErrorReason::InternalServerError)),
     "expected InternalServerError, got: {:?}",
     reply
   );
@@ -306,7 +306,7 @@ async fn test_c2s_set_config_fails_when_store_save_fails() -> anyhow::Result<()>
 
   let reply = suite.read_message(TEST_USER_2).await?;
   assert!(
-    matches!(&reply, Message::Error(p) if p.reason.as_ref() == "INTERNAL_SERVER_ERROR"),
+    matches!(&reply, Message::Error(ErrorParameters { reason, .. }) if *reason == StringAtom::from(ErrorReason::InternalServerError)),
     "expected InternalServerError, got: {:?}",
     reply
   );
@@ -380,14 +380,16 @@ async fn test_c2s_leave_channel_fails_when_store_save_fails() -> anyhow::Result<
 
   let reply = suite.read_message(TEST_USER_2).await?;
   assert!(
-    matches!(&reply, Message::Error(p) if p.reason.as_ref() == "INTERNAL_SERVER_ERROR"),
+    matches!(&reply, Message::Error(ErrorParameters { reason, .. }) if *reason == StringAtom::from(ErrorReason::InternalServerError)),
     "expected InternalServerError, got: {:?}",
     reply
   );
 
-  // Yield so the async connection cleanup task can run.
+  // Verify the server closed TEST_USER_2's connection after the internal error.
+  // This also ensures the async cleanup task has had a chance to run.
   // The store is still failing, so do_leave will fail and membership is preserved.
-  monoio::time::sleep(Duration::from_millis(200)).await;
+  let result = suite.try_read_message(TEST_USER_2, Duration::from_secs(2)).await;
+  assert!(result.is_err(), "expected TEST_USER_2 connection to be closed after INTERNAL_SERVER_ERROR");
 
   // Verify TEST_USER_2 is still in the channel.
   suite
