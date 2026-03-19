@@ -423,6 +423,11 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sSuite<CS, MLF> {
     tls_socket.expect_read_timeout(timeout).await
   }
 
+  /// Drops (disconnects) the client connection for the given username.
+  pub fn drop_client(&mut self, username: &str) -> anyhow::Result<()> {
+    if self.clients.remove(username).is_some() { Ok(()) } else { Err(anyhow!("client not found")) }
+  }
+
   fn get_tls_socket(&mut self, username: &str) -> anyhow::Result<&mut TestConn<TlsStream>> {
     self.clients.get_mut(username).ok_or_else(|| anyhow!("client not found"))
   }
