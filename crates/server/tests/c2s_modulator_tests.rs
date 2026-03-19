@@ -966,12 +966,12 @@ async fn test_c2s_modulator_leave_channels_on_disconnect_enabled() -> anyhow::Re
   // Drop User 1's connection (the only one for that user).
   suite.drop_client(TEST_USER_1)?;
 
-  // Wait for the server to process the disconnection.
-  monoio::time::sleep(Duration::from_secs(1)).await;
-
   // User 2 should receive a MemberLeft event for User 1 (channels cleaned up).
+  let msg =
+    suite.try_read_message(TEST_USER_2, Duration::from_secs(5)).await?.expect("timed out waiting for MemberLeft event");
+
   assert_message!(
-    suite.read_message(TEST_USER_2).await?,
+    msg,
     Message::Event,
     EventParameters {
       kind: MemberLeft.into(),
@@ -1031,11 +1031,8 @@ async fn test_c2s_modulator_leave_channels_on_disconnect_disabled() -> anyhow::R
   // Drop User 1's connection (the only one for that user).
   suite.drop_client(TEST_USER_1)?;
 
-  // Wait for the server to process the disconnection.
-  monoio::time::sleep(Duration::from_secs(1)).await;
-
   // User 2 should NOT receive any MemberLeft event (channels preserved).
-  suite.expect_read_timeout(TEST_USER_2, Duration::from_secs(1)).await?;
+  suite.expect_read_timeout(TEST_USER_2, Duration::from_secs(2)).await?;
 
   suite.teardown().await?;
   s2m_ln.shutdown().await?;
