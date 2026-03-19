@@ -920,3 +920,126 @@ async fn test_c2s_channel_persist_allowed_for_authenticated_users() -> anyhow::R
 
   Ok(())
 }
+
+#[monoio::test(enable_timer = true)]
+async fn test_c2s_modulator_leave_channels_on_disconnect_enabled() -> anyhow::Result<()> {
+  let modulator = TestModulator::new().with_auth_handler(|token| async move {
+    let username = token.to_string();
+    Ok(AuthResult::Success { username: StringAtom::from(username) })
+  });
+
+  let mut core_dispatcher = CoreDispatcher::new(1);
+  core_dispatcher.bootstrap().await?;
+
+  let mut s2m_ln = create_s2m_listener(
+    default_s2m_config(SHARED_SECRET),
+    modulator,
+    core_dispatcher.clone(),
+    &mut Registry::default(),
+  )
+  .await?;
+  s2m_ln.bootstrap().await?;
+
+  let s2m_client = S2mClient::new(S2mConfig {
+    address: s2m_ln.local_address().unwrap().to_string(),
+    shared_secret: SHARED_SECRET.to_string(),
+    ..Default::default()
+  })?;
+
+  let mut config = default_c2s_config();
+  config.leave_channels_on_disconnect = true;
+
+  let mut suite = C2sSuite::with_modulator(config, Some(s2m_client.clone()), None).await?;
+  suite.setup().await?;
+
+  // Authenticate two users.
+  suite.auth(TEST_USER_1, TEST_USER_1).await?;
+  suite.auth(TEST_USER_2, TEST_USER_2).await?;
+
+  // Both join the same channel.
+  suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
+  suite.join_channel(TEST_USER_2, "!test1@localhost", None).await?;
+
+  // User 1 receives a MemberJoined event for User 2.
+  suite.ignore_reply(TEST_USER_1).await?;
+
+  // Drop User 1's connection (the only one for that user).
+  suite.drop_client(TEST_USER_1);
+
+  // Wait for the server to process the disconnection.
+  monoio::time::sleep(Duration::from_secs(1)).await;
+
+  // User 2 should receive a MemberLeft event for User 1 (channels cleaned up).
+  assert_message!(
+    suite.read_message(TEST_USER_2).await?,
+    Message::Event,
+    EventParameters {
+      kind: MemberLeft.into(),
+      channel: Some(StringAtom::from("!test1@localhost")),
+      nid: Some(StringAtom::from("test_user_1@localhost")),
+      owner: Some(true),
+    }
+  );
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  core_dispatcher.shutdown().await?;
+
+  Ok(())
+}
+
+#[monoio::test(enable_timer = true)]
+async fn test_c2s_modulator_leave_channels_on_disconnect_disabled() -> anyhow::Result<()> {
+  let modulator = TestModulator::new().with_auth_handler(|token| async move {
+    let username = token.to_string();
+    Ok(AuthResult::Success { username: StringAtom::from(username) })
+  });
+
+  let mut core_dispatcher = CoreDispatcher::new(1);
+  core_dispatcher.bootstrap().await?;
+
+  let mut s2m_ln = create_s2m_listener(
+    default_s2m_config(SHARED_SECRET),
+    modulator,
+    core_dispatcher.clone(),
+    &mut Registry::default(),
+  )
+  .await?;
+  s2m_ln.bootstrap().await?;
+
+  let s2m_client = S2mClient::new(S2mConfig {
+    address: s2m_ln.local_address().unwrap().to_string(),
+    shared_secret: SHARED_SECRET.to_string(),
+    ..Default::default()
+  })?;
+
+  // Default config has leave_channels_on_disconnect = false.
+  let mut suite = C2sSuite::with_modulator(default_c2s_config(), Some(s2m_client.clone()), None).await?;
+  suite.setup().await?;
+
+  // Authenticate two users.
+  suite.auth(TEST_USER_1, TEST_USER_1).await?;
+  suite.auth(TEST_USER_2, TEST_USER_2).await?;
+
+  // Both join the same channel.
+  suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
+  suite.join_channel(TEST_USER_2, "!test1@localhost", None).await?;
+
+  // User 1 receives a MemberJoined event for User 2.
+  suite.ignore_reply(TEST_USER_1).await?;
+
+  // Drop User 1's connection (the only one for that user).
+  suite.drop_client(TEST_USER_1);
+
+  // Wait for the server to process the disconnection.
+  monoio::time::sleep(Duration::from_secs(1)).await;
+
+  // User 2 should NOT receive any MemberLeft event (channels preserved).
+  suite.expect_read_timeout(TEST_USER_2, Duration::from_secs(1)).await?;
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  core_dispatcher.shutdown().await?;
+
+  Ok(())
+}
