@@ -133,9 +133,9 @@ async fn run_server(
     channel_mng.clone(),
     c2s_router.clone(),
     modulator_service.modulator.clone(),
+    auth_enabled,
     c2s_reg,
-  )
-  .await?;
+  );
 
   let c2s_conn_rt = c2s::conn::C2sConnRuntime::new(c2s_config.as_ref(), c2s_reg).await;
 

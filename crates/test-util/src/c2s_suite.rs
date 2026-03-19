@@ -143,9 +143,9 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sSuite<CS, MLF> {
       channel_mng.clone(),
       c2s_router.clone(),
       modulator,
+      auth_enabled,
       &mut registry,
-    )
-    .await?;
+    );
 
     let ln = c2s::C2sListener::new(
       arc_config.listener.clone(),

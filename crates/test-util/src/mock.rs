@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
@@ -124,12 +123,12 @@ struct StoredChannel {
 /// An in-memory channel store for integration tests.
 #[derive(Clone, Default)]
 pub struct InMemoryChannelStore {
-  channels: Arc<Mutex<HashMap<StringAtom, StoredChannel>>>,
+  channels: Arc<async_lock::Mutex<HashMap<StringAtom, StoredChannel>>>,
 }
 
 impl InMemoryChannelStore {
   pub fn new() -> Self {
-    Self { channels: Arc::new(Mutex::new(HashMap::new())) }
+    Self { channels: Arc::new(async_lock::Mutex::new(HashMap::new())) }
   }
 }
 
@@ -143,22 +142,22 @@ impl ChannelStore for InMemoryChannelStore {
       acl: channel.acl.clone(),
       members: channel.members.iter().cloned().collect(),
     };
-    self.channels.lock().unwrap().insert(channel.handler.clone(), stored);
+    self.channels.lock().await.insert(channel.handler.clone(), stored);
     Ok(())
   }
 
   async fn delete_channel(&self, handler: &StringAtom) -> anyhow::Result<()> {
-    self.channels.lock().unwrap().remove(handler);
+    self.channels.lock().await.remove(handler);
     Ok(())
   }
 
   async fn load_channel_handlers(&self) -> anyhow::Result<Arc<[StringAtom]>> {
-    let guard = self.channels.lock().unwrap();
+    let guard = self.channels.lock().await;
     Ok(guard.keys().cloned().collect::<Vec<_>>().into())
   }
 
   async fn load_channel(&self, handler: &StringAtom) -> anyhow::Result<PersistedChannel> {
-    let guard = self.channels.lock().unwrap();
+    let guard = self.channels.lock().await;
     let stored = guard.get(handler).ok_or_else(|| anyhow::anyhow!("channel not found: {}", handler))?;
     Ok(PersistedChannel {
       handler: stored.handler.clone(),
