@@ -5,8 +5,8 @@ compile_error!("This application strictly does not support Windows.");
 
 use clap::Parser;
 
-use narwhal_server::version::VERSION;
 use narwhal_common::runtime;
+use narwhal_server::version::VERSION;
 
 /// Command line arguments
 #[derive(Parser, Debug)]

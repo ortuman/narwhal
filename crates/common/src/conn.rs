@@ -24,20 +24,20 @@ use rand::random;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
-use async_channel::{Sender, TryRecvError, bounded};
 #[cfg(feature = "runtime-monoio")]
 use async_channel::Receiver;
+use async_channel::{Sender, TryRecvError, bounded};
 
 use slab::Slab;
 
+#[cfg(feature = "runtime-monoio")]
+use narwhal_protocol::ErrorReason::ServerShuttingDown;
 use narwhal_protocol::ErrorReason::{
   BadRequest, InternalServerError, OutboundQueueIsFull, PolicyViolation, ResponseTooLarge, Timeout,
 };
 #[cfg(feature = "runtime-monoio")]
-use narwhal_protocol::ErrorReason::ServerShuttingDown;
-use narwhal_protocol::{ErrorParameters, Message, PingParameters, SerializeError, serialize};
-#[cfg(feature = "runtime-monoio")]
 use narwhal_protocol::deserialize;
+use narwhal_protocol::{ErrorParameters, Message, PingParameters, SerializeError, serialize};
 
 #[cfg(feature = "runtime-monoio")]
 use narwhal_util::codec_monoio::{StreamReader, StreamReaderError};
