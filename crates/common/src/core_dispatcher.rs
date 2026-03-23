@@ -10,12 +10,12 @@ use libc::{
 };
 use tracing::{error, info, trace, warn};
 
-use crate::runtime::{self, Runtime};
+use crate::runtime;
 
 /// Type alias for runtime task handles.
 ///
 /// This represents a spawned task that can be awaited or detached.
-pub type Task = <crate::runtime::CurrentRuntime as Runtime>::JoinHandle<()>;
+pub type Task = crate::runtime::JoinHandle<()>;
 
 type SpawnFn = Box<dyn FnOnce() + Send + 'static>;
 
@@ -87,11 +87,11 @@ impl CoreDispatcher {
 
           runtime::block_on(async move {
             // Spawn a task that drains incoming work from the task channel.
-            drop(runtime::spawn(async move {
+            runtime::spawn_detached(async move {
               while let Ok(f) = task_rx.recv().await {
                 f();
               }
-            }));
+            });
 
             // Signal readiness.
             let _ = ready_tx.send(()).await;
@@ -131,7 +131,7 @@ impl CoreDispatcher {
     Fut: std::future::Future<Output = ()> + 'static,
   {
     let task: SpawnFn = Box::new(move || {
-      drop(runtime::spawn(f()));
+      runtime::spawn_detached(f());
     });
 
     self.senders[shard].send(task).await.map_err(|_| anyhow!("shard {} channel closed", shard))

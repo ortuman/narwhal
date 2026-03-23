@@ -772,8 +772,11 @@ where
         break;
       }
 
+      let mut msg_res = std::pin::pin!(rx.recv().fuse());
+      let mut cancelled = std::pin::pin!(shutdown_token.cancelled().fuse());
+
       futures::select! {
-        msg_res = rx.recv().fuse() => {
+        msg_res = msg_res => {
           match msg_res {
             Ok((msg, payload_opt)) => {
               if let Err(e) = Self::write_message(&msg, payload_opt, &mut writer, message_buff.as_mut_slice()).await {
@@ -788,7 +791,7 @@ where
             },
           }
         },
-        _ = shutdown_token.cancelled().fuse() => {
+        _ = cancelled => {
           break;
         },
       }
@@ -825,6 +828,8 @@ where
       if shutdown_token.is_cancelled() {
         break;
       }
+
+      let mut cancelled = std::pin::pin!(shutdown_token.cancelled().fuse());
 
       futures::select! {
         res = stream_reader.next().fuse() => {
@@ -959,7 +964,7 @@ where
           }
         },
 
-        _ = shutdown_token.cancelled().fuse() => {
+        _ = cancelled => {
           break;
         },
       }

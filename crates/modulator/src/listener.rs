@@ -341,9 +341,9 @@ async fn run_tcp_accept_loop<D, DF, ST>(
             let conn_rt = conn_rt.clone();
             let dispatcher_factory = dispatcher_factory.clone();
 
-            drop(runtime::spawn(async move {
+            runtime::spawn_detached(async move {
               conn_rt.run_connection(tcp_stream, dispatcher_factory).await;
-            }));
+            });
           }
           Err(e) => {
             warn!(worker_id, error = ?e, service_type = ST::NAME, "TCP accept error");
@@ -393,9 +393,9 @@ async fn run_unix_accept_loop<D, DF, ST>(
             let conn_rt = conn_rt.clone();
             let dispatcher_factory = dispatcher_factory.clone();
 
-            drop(runtime::spawn(async move {
+            runtime::spawn_detached(async move {
               conn_rt.run_connection(unix_stream, dispatcher_factory).await;
-            }));
+            });
           }
           Err(e) => {
             warn!(error = ?e, service_type = ST::NAME, "Unix accept error");

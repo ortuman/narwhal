@@ -333,9 +333,9 @@ mod tests {
     let (tx, rx) = async_channel::bounded(64);
 
     let tc = total_connections.clone();
-    drop(runtime::spawn(async move {
+    runtime::spawn_detached(async move {
       RouterShard::new(rx, tc).run().await;
-    }));
+    });
 
     Router {
       local_domain: StringAtom::from("localhost"),

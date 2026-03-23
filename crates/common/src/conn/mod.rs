@@ -6,6 +6,7 @@ mod monoio_io;
 use core::fmt::Debug;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::future::Future;
+use std::io::Cursor;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,14 +20,14 @@ use rand::random;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
-use async_channel::{Sender, bounded};
+use async_channel::{Receiver, Sender, TryRecvError, bounded};
 
 use slab::Slab;
 
 use narwhal_protocol::ErrorReason::{
-  BadRequest, InternalServerError, OutboundQueueIsFull, PolicyViolation, ResponseTooLarge, Timeout,
+  BadRequest, InternalServerError, OutboundQueueIsFull, PolicyViolation, ResponseTooLarge, ServerShuttingDown, Timeout,
 };
-use narwhal_protocol::{ErrorParameters, Message, PingParameters, SerializeError, serialize};
+use narwhal_protocol::{ErrorParameters, Message, PingParameters, SerializeError, deserialize, serialize};
 
 use narwhal_util::pool::{BucketedPool, MutablePoolBuffer, Pool, PoolBuffer};
 use narwhal_util::string_atom::StringAtom;
@@ -83,6 +84,43 @@ enum ReadResult {
   /// The contained message is always a [`Message::Error`] that the main loop
   /// should write to the wire before closing the connection.
   Error(Message),
+}
+
+/// Error from stream line-reading operations.
+pub(crate) enum ReadLineError {
+  /// A line exceeded the maximum allowed length.
+  MaxLineLengthExceeded,
+  /// An I/O error occurred.
+  Io(std::io::Error),
+}
+
+/// Abstracts line-oriented stream reading for the connection read loop.
+pub(crate) trait ConnStreamReader: 'static {
+  /// Reads the next line from the stream.
+  ///
+  /// Returns `true` if a line was read, `false` on EOF.
+  /// After returning `true`, call [`line()`](Self::line) to get the bytes.
+  async fn next(&mut self) -> Result<bool, ReadLineError>;
+
+  /// Returns the bytes of the last line read by [`next()`](Self::next).
+  fn line(&mut self) -> Option<&[u8]>;
+
+  /// Reads exactly `len` bytes of payload data followed by a newline delimiter.
+  async fn read_payload(
+    &mut self,
+    pool: &BucketedPool,
+    len: usize,
+    correlation_id: Option<u32>,
+  ) -> anyhow::Result<PoolBuffer>;
+}
+
+/// Abstracts stream writing for the connection write loop.
+pub(crate) trait ConnWriter {
+  /// Writes all buffers in the batch to the stream, flushes, then clears the batch.
+  async fn write_flush_batch(&mut self, batch: &mut Vec<PoolBuffer>) -> anyhow::Result<()>;
+
+  /// Shuts down the write side of the stream.
+  async fn shutdown(&mut self) -> std::io::Result<()>;
 }
 
 /// Represents the current state of a client connection in the protocol flow.
@@ -179,9 +217,7 @@ pub trait Dispatcher: 'static {
   /// # Errors
   ///
   /// If bootstrapping fails, the connection will be closed immediately.
-  async fn bootstrap(&mut self) -> anyhow::Result<()> {
-    Ok(())
-  }
+  async fn bootstrap(&mut self) -> anyhow::Result<()>;
 
   /// Cleans up the dispatcher's resources.
   ///
@@ -194,9 +230,7 @@ pub trait Dispatcher: 'static {
   ///
   /// * `Ok(())` - Shutdown succeeded
   /// * `Err(e)` - An error occurred during shutdown
-  async fn shutdown(&mut self) -> anyhow::Result<()> {
-    Ok(())
-  }
+  async fn shutdown(&mut self) -> anyhow::Result<()>;
 }
 
 /// A factory for creating new `Dispatcher` instances.
@@ -234,9 +268,7 @@ pub trait DispatcherFactory<D: Dispatcher>: Clone + Send + Sync + 'static {
   ///
   /// * `Ok(())` - Bootstrap succeeded and the factory is ready to create dispatchers
   /// * `Err(e)` - An error occurred during bootstrap, preventing factory initialization
-  async fn bootstrap(&mut self) -> anyhow::Result<()> {
-    Ok(())
-  }
+  async fn bootstrap(&mut self) -> anyhow::Result<()>;
 
   /// Shuts down the dispatcher factory and cleans up resources.
   ///
@@ -247,9 +279,7 @@ pub trait DispatcherFactory<D: Dispatcher>: Clone + Send + Sync + 'static {
   ///
   /// * `Ok(())` - Shutdown succeeded
   /// * `Err(e)` - An error occurred during shutdown
-  async fn shutdown(&mut self) -> anyhow::Result<()> {
-    Ok(())
-  }
+  async fn shutdown(&mut self) -> anyhow::Result<()>;
 }
 
 /// The connection configuration.
@@ -460,40 +490,6 @@ impl<ST: Service> ConnRuntime<ST> {
     info!(service_type = ST::NAME, "connection runtime stopped");
 
     Ok(())
-  }
-
-  // --- Accessors for monoio_io ---
-
-  fn next_handler(&self) -> usize {
-    self.0.next_handler.fetch_add(1, Ordering::SeqCst)
-  }
-
-  fn config(&self) -> Arc<Config> {
-    self.0.config.clone()
-  }
-
-  fn message_buffer_pool(&self) -> Pool {
-    self.0.message_buffer_pool.clone()
-  }
-
-  fn payload_buffer_pool(&self) -> BucketedPool {
-    self.0.payload_buffer_pool.clone()
-  }
-
-  fn newline_buffer(&self) -> PoolBuffer {
-    self.0.newline_buffer.clone()
-  }
-
-  fn active_connections(&self) -> Arc<AtomicU32> {
-    self.0.active_connections.clone()
-  }
-
-  fn shutdown_token(&self) -> CancellationToken {
-    self.0.shutdown_token.clone()
-  }
-
-  fn metrics(&self) -> Metrics {
-    self.0.metrics.clone()
   }
 }
 
@@ -708,7 +704,7 @@ impl<D: Dispatcher> Conn<D> {
     let tx = self.tx.clone();
     let (cancel_tx, cancel_rx) = bounded::<()>(1);
 
-    drop(runtime::spawn(async move {
+    runtime::spawn_detached(async move {
       let mut sleep = std::pin::pin!(runtime::sleep(timeout).fuse());
       let mut cancel = std::pin::pin!(cancel_rx.recv().fuse());
 
@@ -718,7 +714,7 @@ impl<D: Dispatcher> Conn<D> {
         },
         _ = cancel => {},
       }
-    }));
+    });
 
     self.scheduled_task = Some(cancel_tx);
   }
@@ -740,7 +736,7 @@ impl<D: Dispatcher> Conn<D> {
     // Create cancellation channel (monoio JoinHandle drop doesn't cancel)
     let (cancel_tx, cancel_rx) = bounded::<()>(1);
 
-    drop(runtime::spawn(async move {
+    runtime::spawn_detached(async move {
       let cancel_rx = cancel_rx;
       let mut cancel = std::pin::pin!(cancel_rx.recv().fuse());
       let mut last_check_counter = activity_counter.get();
@@ -797,7 +793,7 @@ impl<D: Dispatcher> Conn<D> {
           _ = cancel => break,
         }
       }
-    }));
+    });
 
     self.scheduled_task = Some(cancel_tx);
   }
@@ -893,6 +889,342 @@ impl<D: Dispatcher> Conn<D> {
         None => Err(anyhow!(SerializeError::MessageTooLarge)),
       },
       Err(e) => Err(e.into()),
+    }
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  async fn run<R: ConnStreamReader, W: ConnWriter, ST: Service>(
+    reader: R,
+    writer: &mut W,
+    conn: &mut Conn<D>,
+    handler: usize,
+    send_msg_rx: Receiver<(Message, Option<PoolBuffer>)>,
+    close_rx: Receiver<Message>,
+    shutdown_token: CancellationToken,
+    message_buffer_pool: Pool,
+    payload_buffer_pool: BucketedPool,
+    newline_buffer: PoolBuffer,
+    payload_read_timeout: Duration,
+    max_payload_size: usize,
+    rate_limit: u32,
+  ) -> anyhow::Result<()> {
+    // Bootstrap the connection.
+    conn.bootstrap().await?;
+
+    let loop_result = async {
+      Self::run_connection_loop::<R, W, ST>(
+        reader,
+        writer,
+        conn,
+        handler,
+        send_msg_rx,
+        close_rx,
+        &shutdown_token,
+        message_buffer_pool.clone(),
+        payload_buffer_pool.clone(),
+        newline_buffer.clone(),
+        payload_read_timeout,
+        max_payload_size,
+        rate_limit,
+      )
+      .await?;
+
+      Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    // Shutdown the connection.
+    let shutdown_result = conn.shutdown().await;
+
+    match writer.shutdown().await {
+      Ok(_) => {},
+      Err(e) => {
+        // Ignore expected socket disconnection errors that occur when client disconnects abruptly
+        use std::io::ErrorKind::*;
+        match e.kind() {
+          NotConnected | BrokenPipe | ConnectionAborted | ConnectionReset | UnexpectedEof => {},
+          _ => return Err(e.into()),
+        }
+      },
+    }
+
+    // Return any error from the main loop first, then any error from shutdown.
+    loop_result?;
+    shutdown_result?;
+
+    Ok(())
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  async fn run_connection_loop<R: ConnStreamReader, W: ConnWriter, ST: Service>(
+    reader: R,
+    writer: &mut W,
+    conn: &mut Conn<D>,
+    handler: usize,
+    send_msg_rx: Receiver<(Message, Option<PoolBuffer>)>,
+    close_rx: Receiver<Message>,
+    shutdown_token: &CancellationToken,
+    message_buffer_pool: Pool,
+    payload_buffer_pool: BucketedPool,
+    newline_buffer: PoolBuffer,
+    payload_read_timeout: Duration,
+    max_payload_size: usize,
+    rate_limit: u32,
+  ) -> anyhow::Result<()> {
+    let (read_tx, read_rx) = bounded::<ReadResult>(READ_CHANNEL_CAPACITY);
+
+    // Spawn the read loop as a separate task.
+    // The task handle is dropped at scope exit to stop polling the reader.
+    let reader_task = runtime::spawn(Self::run_read_loop::<R>(
+      reader,
+      read_tx,
+      payload_buffer_pool,
+      payload_read_timeout,
+      max_payload_size,
+      rate_limit,
+      handler,
+      ST::NAME,
+    ));
+
+    let mut pool_buffer_batch = Vec::<PoolBuffer>::with_capacity(MAX_BUFFERS_PER_BATCH);
+
+    let mut cancelled = std::pin::pin!(shutdown_token.cancelled().fuse());
+
+    'connection_loop: loop {
+      let mut read_res = std::pin::pin!(read_rx.recv().fuse());
+      let mut send_msg_res = std::pin::pin!(send_msg_rx.recv().fuse());
+      let mut close_res = std::pin::pin!(close_rx.recv().fuse());
+
+      futures::select! {
+        // Receive parsed messages from the read loop.
+        res = read_res => {
+          match res {
+            Ok(ReadResult::Message { message, payload }) => {
+              match conn.dispatch_message::<ST>(message, payload).await {
+                Ok(_) => {},
+                Err(e) => {
+                  warn!(handler = handler, service_type = ST::NAME, "failed to dispatch message: {}", e.to_string());
+                  break 'connection_loop;
+                },
+              }
+            }
+            Ok(ReadResult::Eof) => {
+              trace!(handler = handler, service_type = ST::NAME, "connection closed by peer");
+              break 'connection_loop;
+            }
+            Ok(ReadResult::Error(err_message)) => {
+              Self::add_message_to_batch(&err_message, None, &mut pool_buffer_batch, &message_buffer_pool, &newline_buffer).await?;
+              writer.write_flush_batch(&mut pool_buffer_batch).await?;
+              break 'connection_loop;
+            }
+            Err(_) => {
+              // Read task exited unexpectedly.
+              break 'connection_loop;
+            }
+          }
+        },
+
+        // Write outbound messages to the stream.
+        res = send_msg_res => {
+          const MESSAGE_CHANNEL_CLOSED_LOG: &str = "message channel closed";
+
+          match res {
+            Ok((message, payload_opt)) => {
+              Self::add_message_to_batch(&message, payload_opt, &mut pool_buffer_batch, &message_buffer_pool, &newline_buffer).await?;
+            }
+            Err(_) => {
+              error!(handler = handler, service_type = ST::NAME, MESSAGE_CHANNEL_CLOSED_LOG);
+              break 'connection_loop;
+            }
+          };
+
+          loop {
+            if pool_buffer_batch.len() >= MAX_BUFFERS_PER_BATCH {
+                break;
+            }
+
+            match send_msg_rx.try_recv() {
+              Ok((message, payload_opt)) => {
+                Self::add_message_to_batch(&message, payload_opt, &mut pool_buffer_batch, &message_buffer_pool, &newline_buffer).await?;
+              },
+              Err(TryRecvError::Empty) => break,
+              Err(TryRecvError::Closed) => {
+                error!(handler = handler, service_type = ST::NAME, MESSAGE_CHANNEL_CLOSED_LOG);
+                break 'connection_loop;
+              }
+            }
+          }
+
+          writer.write_flush_batch(&mut pool_buffer_batch).await?;
+        },
+
+        // Close the connection.
+        res = close_res => {
+          let err_message = res.unwrap();
+          Self::add_message_to_batch(&err_message, None, &mut pool_buffer_batch, &message_buffer_pool, &newline_buffer).await?;
+          writer.write_flush_batch(&mut pool_buffer_batch).await?;
+          trace!(handler = handler, service_type = ST::NAME, "closed connection");
+          break 'connection_loop;
+        },
+
+        // Close the connection on shutdown.
+        _ = cancelled => {
+          let err_message = Message::Error(ErrorParameters{id: None, reason: ServerShuttingDown.into(), detail: None});
+          Self::add_message_to_batch(&err_message, None, &mut pool_buffer_batch, &message_buffer_pool, &newline_buffer).await?;
+          writer.write_flush_batch(&mut pool_buffer_batch).await?;
+          trace!(handler = handler, service_type = ST::NAME, "closed connection on shutdown");
+          break 'connection_loop;
+        },
+      }
+    }
+
+    // Stop polling the reader task.
+    drop(reader_task);
+
+    Ok(())
+  }
+
+  /// Dedicated read loop spawned as a separate task.
+  ///
+  /// Sequentially reads from the stream, deserializes messages, reads payloads, and enforces rate limiting.
+  /// Results are sent to the main connection loop to be processed.
+  #[allow(clippy::too_many_arguments)]
+  async fn run_read_loop<R: ConnStreamReader>(
+    mut reader: R,
+    read_tx: Sender<ReadResult>,
+    payload_buffer_pool: BucketedPool,
+    payload_read_timeout: Duration,
+    max_payload_size: usize,
+    rate_limit: u32,
+    handler: usize,
+    service_name: &'static str,
+  ) {
+    let mut rate_limit_counter: u32 = 0;
+    let mut rate_limit_last_check = std::time::Instant::now();
+
+    loop {
+      match reader.next().await {
+        Ok(true) => {
+          let line_bytes = reader.line().unwrap();
+          let message_length = line_bytes.len() as u32;
+
+          match deserialize(Cursor::new(line_bytes)) {
+            Ok(msg) => {
+              let mut payload_opt: Option<PoolBuffer> = None;
+              let mut payload_length: u32 = 0;
+
+              // Read associated payload if present.
+              if let Some(payload_info) = msg.payload_info() {
+                if payload_info.length > max_payload_size {
+                  let err_message = Message::Error(ErrorParameters {
+                    id: payload_info.id,
+                    reason: PolicyViolation.into(),
+                    detail: Some("payload too large".into()),
+                  });
+                  let _ = read_tx.send(ReadResult::Error(err_message)).await;
+                  break;
+                }
+                payload_length = payload_info.length as u32;
+
+                match runtime::timeout(
+                  payload_read_timeout,
+                  reader.read_payload(&payload_buffer_pool, payload_info.length, payload_info.id),
+                )
+                .await
+                {
+                  Ok(Ok(payload)) => {
+                    payload_opt = Some(payload);
+                  },
+                  Ok(Err(e)) => {
+                    let err_message: Message = if let Some(e) = e.downcast_ref::<narwhal_protocol::Error>() {
+                      e.into()
+                    } else {
+                      warn!(handler = handler, service_type = service_name, "failed to read payload: {}", e);
+                      Message::Error(ErrorParameters { id: None, reason: InternalServerError.into(), detail: None })
+                    };
+                    let _ = read_tx.send(ReadResult::Error(err_message)).await;
+                    break;
+                  },
+                  Err(_) => {
+                    let err_message = Message::Error(ErrorParameters {
+                      id: None,
+                      reason: Timeout.into(),
+                      detail: Some("payload read timeout".into()),
+                    });
+                    let _ = read_tx.send(ReadResult::Error(err_message)).await;
+                    break;
+                  },
+                }
+              }
+
+              // Check if the rate limit is exceeded.
+              if rate_limit > 0 {
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(rate_limit_last_check);
+                if elapsed.as_secs() > 1 {
+                  rate_limit_counter = 0;
+                  rate_limit_last_check = now;
+                }
+
+                rate_limit_counter += message_length + payload_length;
+
+                if rate_limit_counter > rate_limit {
+                  let err_message = Message::Error(ErrorParameters {
+                    id: msg.correlation_id(),
+                    reason: PolicyViolation.into(),
+                    detail: Some("rate limit exceeded".into()),
+                  });
+                  let _ = read_tx.send(ReadResult::Error(err_message)).await;
+                  break;
+                }
+              }
+
+              // Send parsed message to the main connection loop.
+              if read_tx.send(ReadResult::Message { message: msg, payload: payload_opt }).await.is_err() {
+                break;
+              }
+            },
+            Err(e) => {
+              let err_detail = format!("{}", e);
+              let err_message = Message::Error(ErrorParameters {
+                id: None,
+                reason: BadRequest.into(),
+                detail: Some(StringAtom::from(err_detail)),
+              });
+              let _ = read_tx.send(ReadResult::Error(err_message)).await;
+              break;
+            },
+          }
+        },
+        Ok(false) => {
+          // Stream closed by the client.
+          let _ = read_tx.send(ReadResult::Eof).await;
+          break;
+        },
+        Err(e) => {
+          match e {
+            ReadLineError::MaxLineLengthExceeded => {
+              let err_message = Message::Error(ErrorParameters {
+                id: None,
+                reason: PolicyViolation.into(),
+                detail: Some("max message size exceeded".into()),
+              });
+              let _ = read_tx.send(ReadResult::Error(err_message)).await;
+            },
+            ReadLineError::Io(e) => {
+              if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                error!(
+                  handler = handler,
+                  service_type = service_name,
+                  "failed to read from connection: {}",
+                  e.to_string()
+                );
+              }
+            },
+          }
+          break;
+        },
+      }
     }
   }
 }

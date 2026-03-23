@@ -366,8 +366,11 @@ impl<M: Modulator> S2mDispatcherFactory<M> {
     shutdown_rx: async_channel::Receiver<()>,
   ) {
     loop {
+      let mut recv = std::pin::pin!(rx.recv().fuse());
+      let mut shutdown = std::pin::pin!(shutdown_rx.recv().fuse());
+
       futures::select! {
-        result = rx.recv().fuse() => {
+        result = recv => {
           match result {
             std::result::Result::Ok(outbound) => {
                 match m2s_client.route_private_payload(outbound.payload, outbound.targets).await {
@@ -383,7 +386,7 @@ impl<M: Modulator> S2mDispatcherFactory<M> {
             }
           }
         }
-        _ = shutdown_rx.recv().fuse() => {
+        _ = shutdown => {
           break;
         }
       }

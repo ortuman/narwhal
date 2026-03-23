@@ -239,14 +239,12 @@ impl<M: Manager> ObjectPool<M> {
     // Wait for a slot.  Race the semaphore against the close signal so
     // that `close()` can wake blocked callers immediately.
     let permit = {
-      let sem_fut = self.inner.semaphore.acquire_arc();
-      let close_fut = self.inner.close_token.cancelled();
-
-      futures::pin_mut!(sem_fut, close_fut);
+      let mut sem_fut = std::pin::pin!(self.inner.semaphore.acquire_arc().fuse());
+      let mut close_fut = std::pin::pin!(self.inner.close_token.cancelled().fuse());
 
       futures::select! {
-        p = sem_fut.fuse() => p,
-        _ = close_fut.fuse() => return Err(ObjectPoolError::Closed),
+        p = sem_fut => p,
+        _ = close_fut => return Err(ObjectPoolError::Closed),
       }
     };
 

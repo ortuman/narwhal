@@ -322,7 +322,7 @@ async fn run_accept_loop<CS: ChannelStore, MLF: MessageLogFactory>(
             let dispatcher_factory = dispatcher_factory.clone();
             let metrics = metrics.clone();
 
-            drop(runtime::spawn(async move {
+            runtime::spawn_detached(async move {
               match acceptor.accept(tcp_stream).await {
                 std::result::Result::Ok(tls_stream) => {
                   trace!(worker_id, %remote_addr, "TLS handshake complete");
@@ -334,7 +334,7 @@ async fn run_accept_loop<CS: ChannelStore, MLF: MessageLogFactory>(
                   metrics.tls_handshakes.get_or_create(&ResultLabel { result: "failure" }).inc();
                 }
               }
-            }));
+            });
           }
           Err(e) => {
             warn!(worker_id, error = ?e, service_type = C2sService::NAME, "accept error");

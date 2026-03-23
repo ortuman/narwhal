@@ -3,44 +3,15 @@
 use std::future::Future;
 use std::time::Duration;
 
-/// Trait for an asynchronous runtime.
-pub trait Runtime: Clone + Send + Sync + 'static {
+#[cfg(feature = "runtime-monoio")]
+mod monoio_impl {
+  use super::*;
+
   /// A handle to a spawned task.
-  type JoinHandle<T: 'static>: Future<Output = T> + 'static;
+  pub type JoinHandle<T> = monoio::task::JoinHandle<T>;
 
-  /// Spawns a task onto the runtime.
-  fn spawn<F>(&self, future: F) -> Self::JoinHandle<F::Output>
-  where
-    F: Future + 'static,
-    F::Output: 'static;
-
-  /// Sleeps for the specified duration.
-  fn sleep(&self, duration: Duration) -> impl Future<Output = ()>;
-
-  /// Runs a future to completion with a timeout.
-  fn timeout<F>(&self, duration: Duration, future: F) -> impl Future<Output = Result<F::Output, ()>>
-  where
-    F: Future;
-
-  /// Runs a future on a new runtime instance.
-  fn block_on<F>(&self, future: F) -> F::Output
-  where
-    F: Future;
-
-  /// Returns the current runtime.
-  fn current() -> Self;
-}
-
-#[cfg(feature = "runtime-monoio")]
-/// An implementation of the `Runtime` trait for `monoio`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MonoioRuntime;
-
-#[cfg(feature = "runtime-monoio")]
-impl Runtime for MonoioRuntime {
-  type JoinHandle<T: 'static> = monoio::task::JoinHandle<T>;
-
-  fn spawn<F>(&self, future: F) -> Self::JoinHandle<F::Output>
+  /// Spawns a task onto the current runtime.
+  pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
   where
     F: Future + 'static,
     F::Output: 'static,
@@ -48,18 +19,33 @@ impl Runtime for MonoioRuntime {
     monoio::spawn(future)
   }
 
-  fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
+  /// Spawns a fire-and-forget task onto the current runtime.
+  ///
+  /// The task handle is intentionally dropped, detaching the task so it runs
+  /// independently in the background.
+  pub fn spawn_detached<F>(future: F)
+  where
+    F: Future + 'static,
+    F::Output: 'static,
+  {
+    drop(monoio::spawn(future));
+  }
+
+  /// Sleeps for the specified duration.
+  pub fn sleep(duration: Duration) -> impl Future<Output = ()> {
     monoio::time::sleep(duration)
   }
 
-  async fn timeout<F>(&self, duration: Duration, future: F) -> Result<F::Output, ()>
+  /// Runs a future to completion with a timeout.
+  pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, ()>
   where
     F: Future,
   {
     monoio::time::timeout(duration, future).await.map_err(|_| ())
   }
 
-  fn block_on<F>(&self, future: F) -> F::Output
+  /// Runs a future on a new runtime instance.
+  pub fn block_on<F>(future: F) -> F::Output
   where
     F: Future,
   {
@@ -69,57 +55,10 @@ impl Runtime for MonoioRuntime {
       .expect("failed to create monoio runtime");
     rt.block_on(future)
   }
-
-  fn current() -> Self {
-    MonoioRuntime
-  }
 }
 
 #[cfg(not(any(feature = "runtime-monoio")))]
 compile_error!("At least one runtime feature must be enabled for narwhal-common (e.g. 'runtime-monoio').");
 
-/// The currently configured runtime.
 #[cfg(feature = "runtime-monoio")]
-pub type CurrentRuntime = MonoioRuntime;
-
-/// Spawns a task onto the current runtime.
-pub fn spawn<F>(future: F) -> <CurrentRuntime as Runtime>::JoinHandle<F::Output>
-where
-  F: Future + 'static,
-  F::Output: 'static,
-{
-  #[cfg(feature = "runtime-monoio")]
-  {
-    MonoioRuntime.spawn(future)
-  }
-}
-
-/// Sleeps for the specified duration using the current runtime.
-pub fn sleep(duration: Duration) -> impl Future<Output = ()> {
-  #[cfg(feature = "runtime-monoio")]
-  {
-    MonoioRuntime.sleep(duration)
-  }
-}
-
-/// Runs a future to completion with a timeout using the current runtime.
-pub fn timeout<F>(duration: Duration, future: F) -> impl Future<Output = Result<F::Output, ()>>
-where
-  F: Future,
-{
-  #[cfg(feature = "runtime-monoio")]
-  {
-    MonoioRuntime.timeout(duration, future)
-  }
-}
-
-/// Runs a future on a new runtime instance using the current runtime type.
-pub fn block_on<F>(future: F) -> F::Output
-where
-  F: Future,
-{
-  #[cfg(feature = "runtime-monoio")]
-  {
-    MonoioRuntime.block_on(future)
-  }
-}
+pub use monoio_impl::*;

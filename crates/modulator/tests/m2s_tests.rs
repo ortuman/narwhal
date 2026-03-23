@@ -179,8 +179,11 @@ async fn test_m2s_mod_direct_message() -> anyhow::Result<()> {
   );
 
   // Verify the payload was broadcast to the channel
+  let mut recv = std::pin::pin!(payload_rx.recv().fuse());
+  let mut timeout = std::pin::pin!(monoio::time::sleep(Duration::from_millis(100)).fuse());
+
   futures::select! {
-    result = payload_rx.recv().fuse() => {
+    result = recv => {
       let received = result?;
       assert_eq!(received.targets.len(), 2);
       assert_eq!(&*received.targets[0], "user1@localhost");
@@ -190,7 +193,7 @@ async fn test_m2s_mod_direct_message() -> anyhow::Result<()> {
       let payload_data = received.payload.as_slice();
       assert_eq!(payload_data, PAYLOAD);
     }
-    _ = monoio::time::sleep(Duration::from_millis(100)).fuse() => {
+    _ = timeout => {
       panic!("timeout waiting for outbound payload broadcast");
     }
   }
