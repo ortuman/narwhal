@@ -1079,7 +1079,7 @@ impl<D: Dispatcher> Conn<D> {
 
                 match runtime::timeout(
                   payload_read_timeout,
-                  Self::read_payload_with_reader(
+                  Self::read_payload(
                     pool_buff,
                     delimiter_buf,
                     &mut stream_reader,
@@ -1215,7 +1215,8 @@ impl<D: Dispatcher> Conn<D> {
     let (read_tx, read_rx) = bounded::<ReadResult>(READ_CHANNEL_CAPACITY);
 
     // Spawn the read loop as a separate task.
-    let _reader_task = runtime::spawn(Self::run_read_loop(
+    // The task handle is dropped at scope exit to stop polling the reader.
+    let reader_task = runtime::spawn(Self::run_read_loop(
       stream_reader,
       read_tx,
       payload_buffer_pool,
@@ -1315,6 +1316,8 @@ impl<D: Dispatcher> Conn<D> {
         },
       }
     }
+
+    drop(reader_task);
 
     Ok(())
   }
@@ -1451,7 +1454,7 @@ impl<D: Dispatcher> Conn<D> {
   }
 
   #[cfg(feature = "runtime-monoio")]
-  async fn read_payload_with_reader<B, T>(
+  async fn read_payload<B, T>(
     mut buf: B,
     mut delimiter_buf: Box<[u8; 1]>,
     stream_reader: &mut StreamReader<LocalStream<T>>,

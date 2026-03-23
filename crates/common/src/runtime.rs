@@ -63,7 +63,10 @@ impl Runtime for MonoioRuntime {
   where
     F: Future,
   {
-    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new().enable_all().build().unwrap();
+    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+      .enable_all()
+      .build()
+      .expect("failed to create monoio runtime");
     rt.block_on(future)
   }
 
