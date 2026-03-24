@@ -52,7 +52,7 @@ const SERVER_OVERLOADED_ERROR: &[u8] = b"ERROR reason=SERVER_OVERLOADED detail=\
 /// Only safe within a **single-threaded**, cooperative async runtime.
 /// Because only one task ever executes at a time, the two halves
 /// never actually access the inner stream concurrently.
-struct LocalStream<S>(Rc<UnsafeCell<S>>);
+pub struct LocalStream<S>(Rc<UnsafeCell<S>>);
 
 impl<S> LocalStream<S> {
   fn new(stream: S) -> Self {
@@ -87,7 +87,7 @@ enum ReadResult {
 }
 
 /// Error from stream line-reading operations.
-pub(crate) enum ReadLineError {
+pub enum ReadLineError {
   /// A line exceeded the maximum allowed length.
   MaxLineLengthExceeded,
   /// An I/O error occurred.
@@ -95,7 +95,8 @@ pub(crate) enum ReadLineError {
 }
 
 /// Abstracts line-oriented stream reading for the connection read loop.
-pub(crate) trait ConnStreamReader: 'static {
+#[allow(async_fn_in_trait)]
+pub trait ConnStreamReader: 'static {
   /// Reads the next line from the stream.
   ///
   /// Returns `true` if a line was read, `false` on EOF.
@@ -115,12 +116,29 @@ pub(crate) trait ConnStreamReader: 'static {
 }
 
 /// Abstracts stream writing for the connection write loop.
-pub(crate) trait ConnWriter {
+#[allow(async_fn_in_trait)]
+pub trait ConnWriter {
   /// Writes all buffers in the batch to the stream, flushes, then clears the batch.
   async fn write_flush_batch(&mut self, batch: &mut Vec<PoolBuffer>) -> anyhow::Result<()>;
 
   /// Shuts down the write side of the stream.
   async fn shutdown(&mut self) -> std::io::Result<()>;
+}
+
+/// Bridges a raw stream into the runtime-agnostic [`ConnStreamReader`] and [`ConnWriter`] pair.
+#[allow(async_fn_in_trait)]
+pub trait ConnStreamFactory: Sized {
+  type Reader: ConnStreamReader;
+  type Writer: ConnWriter;
+
+  /// Constructs the reader/writer adapters from the raw stream.
+  async fn create(self, pool: &Pool) -> (Self::Reader, Self::Writer);
+
+  /// Writes an error message to the stream and shuts it down.
+  ///
+  /// Used for early rejection (e.g. max-connections reached) before
+  /// the reader/writer adapters are created.
+  async fn reject(self, error: &[u8]);
 }
 
 /// Represents the current state of a client connection in the protocol flow.
@@ -490,6 +508,92 @@ impl<ST: Service> ConnRuntime<ST> {
     info!(service_type = ST::NAME, "connection runtime stopped");
 
     Ok(())
+  }
+
+  /// Runs a single client connection to completion.
+  pub async fn run_connection<SF, D: Dispatcher, DF: DispatcherFactory<D>>(
+    &self,
+    stream_factory: SF,
+    mut dispatcher_factory: DF,
+  ) where
+    SF: ConnStreamFactory,
+  {
+    let inner = &self.0;
+
+    // Assign a unique handler
+    let handler = inner.next_handler.fetch_add(1, Ordering::SeqCst);
+    let config = inner.config.clone();
+    let active_connections = inner.active_connections.clone();
+    let metrics = inner.metrics.clone();
+
+    // Check if we've reached the maximum number of connections
+    let current_connections = active_connections.fetch_add(1, Ordering::SeqCst);
+
+    if current_connections >= config.max_connections {
+      active_connections.fetch_sub(1, Ordering::SeqCst);
+      metrics.connections_rejected.inc();
+
+      stream_factory.reject(SERVER_OVERLOADED_ERROR).await;
+
+      let max_conns = config.max_connections;
+      warn!(max_conns, service_type = ST::NAME, "max connections limit reached");
+
+      return;
+    }
+
+    metrics.connections_active.inc();
+
+    // Create a new connection.
+    let send_msg_channel_size = config.outbound_message_queue_size as usize;
+
+    let (send_msg_tx, send_msg_rx) = bounded(send_msg_channel_size);
+    let (close_tx, close_rx) = bounded(1);
+
+    let tx = ConnTx::new(send_msg_tx, close_tx, metrics.outbound_queue_full.clone());
+
+    let dispatcher = dispatcher_factory.create(handler, tx.clone()).await;
+
+    let mut conn = Conn::new(handler, config.clone(), dispatcher, tx);
+
+    conn.schedule_timeout(config.connect_timeout, Some(StringAtom::from("connection timeout")));
+
+    trace!(handler = handler, service_type = ST::NAME, "connection registered");
+
+    // Create runtime-specific reader and writer from the stream.
+    let (reader, mut writer) = SF::create(stream_factory, &inner.message_buffer_pool).await;
+
+    let payload_read_timeout = config.payload_read_timeout;
+    let max_payload_size = config.max_payload_size as usize;
+    let rate_limit = config.rate_limit;
+
+    match Conn::<D>::run::<_, _, ST>(
+      reader,
+      &mut writer,
+      &mut conn,
+      handler,
+      send_msg_rx,
+      close_rx,
+      inner.shutdown_token.clone(),
+      inner.message_buffer_pool.clone(),
+      inner.payload_buffer_pool.clone(),
+      inner.newline_buffer.clone(),
+      payload_read_timeout,
+      max_payload_size,
+      rate_limit,
+    )
+    .await
+    {
+      Ok(_) => {},
+      Err(e) => {
+        warn!(handler = handler, service_type = ST::NAME, "connection error: {}", e.to_string());
+      },
+    }
+
+    // Decrement the active connections counter
+    active_connections.fetch_sub(1, Ordering::SeqCst);
+    metrics.connections_active.dec();
+
+    trace!(handler = handler, service_type = ST::NAME, "connection deregistered");
   }
 }
 

@@ -1,25 +1,16 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::sync::atomic::Ordering;
-
 use anyhow::anyhow;
-use async_channel::bounded;
 use monoio::BufResult;
 use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
-use tracing::{trace, warn};
 
 use narwhal_protocol::ErrorReason::BadRequest;
 use narwhal_util::codec_monoio::{StreamReader, StreamReaderError};
 use narwhal_util::pool::{BucketedPool, Pool, PoolBuffer};
 use narwhal_util::string_atom::StringAtom;
 
-use crate::service::Service;
-
-use super::{
-  Conn, ConnRuntime, ConnStreamReader, ConnTx, ConnWriter, Dispatcher, DispatcherFactory, LocalStream,
-  MAX_BUFFERS_PER_BATCH, ReadLineError, SERVER_OVERLOADED_ERROR,
-};
+use super::{ConnStreamFactory, ConnStreamReader, ConnWriter, LocalStream, MAX_BUFFERS_PER_BATCH, ReadLineError};
 
 impl<S: AsyncReadRent> AsyncReadRent for LocalStream<S> {
   async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
@@ -57,7 +48,7 @@ impl<S: AsyncWriteRent> AsyncWriteRent for LocalStream<S> {
   }
 }
 
-struct MonoioStreamReader<T: AsyncReadRent + 'static> {
+pub struct MonoioStreamReader<T: AsyncReadRent + 'static> {
   stream_reader: StreamReader<LocalStream<T>>,
   delimiter_buf: Box<[u8; 1]>,
 }
@@ -109,7 +100,7 @@ impl<T: AsyncReadRent + 'static> ConnStreamReader for MonoioStreamReader<T> {
   }
 }
 
-struct MonoioConnWriter<W> {
+pub struct MonoioConnWriter<W> {
   writer: W,
   iovec_batch: Vec<libc::iovec>,
 }
@@ -193,94 +184,20 @@ impl<W: AsyncWriteRent> ConnWriter for MonoioConnWriter<W> {
   }
 }
 
-impl<ST: Service> ConnRuntime<ST> {
-  /// Runs a single client connection to completion.
-  pub async fn run_connection<S, D: Dispatcher, DF: DispatcherFactory<D>>(
-    &self,
-    mut stream: S,
-    mut dispatcher_factory: DF,
-  ) where
-    S: AsyncReadRent + AsyncWriteRent + 'static,
-  {
-    let inner = &self.0;
+impl<S: AsyncReadRent + AsyncWriteRent + 'static> ConnStreamFactory for S {
+  type Reader = MonoioStreamReader<S>;
+  type Writer = MonoioConnWriter<LocalStream<S>>;
 
-    // Assign a unique handler
-    let handler = inner.next_handler.fetch_add(1, Ordering::SeqCst);
-    let config = inner.config.clone();
-    let active_connections = inner.active_connections.clone();
-    let metrics = inner.metrics.clone();
+  async fn create(self, pool: &Pool) -> (Self::Reader, Self::Writer) {
+    let local_stream = LocalStream::new(self);
+    let reader = MonoioStreamReader::new(local_stream.clone(), pool).await;
+    let writer = MonoioConnWriter::new(local_stream);
+    (reader, writer)
+  }
 
-    // Check if we've reached the maximum number of connections
-    let current_connections = active_connections.fetch_add(1, Ordering::SeqCst);
-
-    if current_connections >= config.max_connections {
-      active_connections.fetch_sub(1, Ordering::SeqCst);
-      metrics.connections_rejected.inc();
-
-      let _ = stream.write_all(SERVER_OVERLOADED_ERROR.to_vec()).await;
-      let _ = stream.flush().await;
-      let _ = stream.shutdown().await;
-
-      let max_conns = config.max_connections;
-      warn!(max_conns, service_type = ST::NAME, "max connections limit reached");
-
-      return;
-    }
-
-    metrics.connections_active.inc();
-
-    // Create a new connection.
-    let send_msg_channel_size = config.outbound_message_queue_size as usize;
-
-    let (send_msg_tx, send_msg_rx) = bounded(send_msg_channel_size);
-    let (close_tx, close_rx) = bounded(1);
-
-    let tx = ConnTx::new(send_msg_tx, close_tx, metrics.outbound_queue_full.clone());
-
-    let dispatcher = dispatcher_factory.create(handler, tx.clone()).await;
-
-    let mut conn = Conn::new(handler, config.clone(), dispatcher, tx);
-
-    conn.schedule_timeout(config.connect_timeout, Some(StringAtom::from("connection timeout")));
-
-    trace!(handler = handler, service_type = ST::NAME, "connection registered");
-
-    // Create monoio-specific reader and writer from the stream.
-    let local_stream = LocalStream::new(stream);
-    let reader = MonoioStreamReader::new(local_stream.clone(), &inner.message_buffer_pool).await;
-    let mut writer = MonoioConnWriter::new(local_stream);
-
-    let payload_read_timeout = config.payload_read_timeout;
-    let max_payload_size = config.max_payload_size as usize;
-    let rate_limit = config.rate_limit;
-
-    match Conn::<D>::run::<_, _, ST>(
-      reader,
-      &mut writer,
-      &mut conn,
-      handler,
-      send_msg_rx,
-      close_rx,
-      inner.shutdown_token.clone(),
-      inner.message_buffer_pool.clone(),
-      inner.payload_buffer_pool.clone(),
-      inner.newline_buffer.clone(),
-      payload_read_timeout,
-      max_payload_size,
-      rate_limit,
-    )
-    .await
-    {
-      Ok(_) => {},
-      Err(e) => {
-        warn!(handler = handler, service_type = ST::NAME, "connection error: {}", e.to_string());
-      },
-    }
-
-    // Decrement the active connections counter
-    active_connections.fetch_sub(1, Ordering::SeqCst);
-    metrics.connections_active.dec();
-
-    trace!(handler = handler, service_type = ST::NAME, "connection deregistered");
+  async fn reject(mut self, error: &[u8]) {
+    let _ = self.write_all(error.to_vec()).await;
+    let _ = AsyncWriteRent::flush(&mut self).await;
+    let _ = AsyncWriteRent::shutdown(&mut self).await;
   }
 }
