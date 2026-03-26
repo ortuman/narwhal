@@ -274,7 +274,7 @@ impl<R: AsyncRead> StreamReader<R> {
 mod tests {
   use super::*;
 
-  use compio::buf::{BufResult, IoBufMut, SetLen};
+  use compio::buf::{BufResult, IoBufMut};
   use compio::io::AsyncRead;
 
   use crate::pool::Pool;
