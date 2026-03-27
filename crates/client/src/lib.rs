@@ -10,10 +10,10 @@
 //! matches your application's async runtime:
 //!
 //! - **[`tokio`]** — poll/readiness-based (Tokio)
-//! - **[`monoio`]** — completion-based (monoio)
+//! - **[`compio`]** — completion-based (compio)
 //!
 //! Import the client types you need directly from the corresponding module,
-//! e.g. `narwhal_client::tokio::C2sClient` or `narwhal_client::monoio::C2sClient`.
+//! e.g. `narwhal_client::tokio::c2s::C2sClient` or `narwhal_client::compio::c2s::C2sClient`.
 //!
 //! ## Client Types
 //!
@@ -24,7 +24,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use narwhal_client::tokio::{C2sClient, TlsDialer};
+//! use narwhal_client::tokio::c2s::C2sClient;
 //! use narwhal_client::{C2sConfig, AuthMethod};
 //!
 //! # async fn example() -> anyhow::Result<()> {
@@ -43,7 +43,7 @@ pub(crate) mod conn_state;
 pub mod error;
 pub(crate) mod object_pool;
 
-pub mod monoio;
+pub mod compio;
 pub mod tokio;
 
 pub use auth::{AuthMethod, Authenticator, AuthenticatorFactory};

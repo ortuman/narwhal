@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use monoio::buf::{IoBuf, IoBufMut};
-use monoio::io::AsyncReadRent;
+use compio::buf::{IntoInner, IoBuf, IoBufMut, SetLen};
+use compio::io::AsyncRead;
 
 use crate::pool::MutablePoolBuffer;
 
 /// Helper to get a slice view of an IoBuf's initialized data.
-///
-/// # Safety
-/// The caller must ensure the buffer's read_ptr is valid for bytes_init bytes.
-unsafe fn iobuf_as_slice<B: IoBuf>(buf: &B) -> &[u8] {
-  unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) }
+fn iobuf_as_slice<B: IoBuf>(buf: &B) -> &[u8] {
+  buf.as_init()
 }
 
 /// Error type for stream reading operations.
@@ -52,7 +49,7 @@ pub struct StreamReader<R> {
   line_pos: Option<usize>,
 }
 
-impl<R: AsyncReadRent> StreamReader<R> {
+impl<R: AsyncRead> StreamReader<R> {
   /// Creates a new LineReader with the specified async reader and pre-allocated buffer.
   ///
   /// # Arguments
@@ -70,7 +67,7 @@ impl<R: AsyncReadRent> StreamReader<R> {
     if let Some(pos) = self.line_pos
       && let Some(pool_buffer) = self.pool_buffer.as_ref()
     {
-      let line = unsafe { &iobuf_as_slice(pool_buffer)[..pos] };
+      let line = &iobuf_as_slice(pool_buffer)[..pos];
       return Some(line);
     }
     None
@@ -85,36 +82,16 @@ impl<R: AsyncReadRent> StreamReader<R> {
   ///   - `StreamReaderError::MaxLineLengthExceeded` if line exceeds buffer size
   ///   - `StreamReaderError::IoError` if an I/O error occurred
   ///
-  /// # Behavior
-  /// * Efficiently handles partial reads by preserving unprocessed bytes between calls
-  /// * Lines are split by '\n' characters (LF line endings)
-  ///
   /// # Cancellation Safety
   ///
-  /// ⚠️ **This method is NOT cancellation-safe.**
-  ///
-  /// If this future is cancelled (e.g., dropped while awaiting in a `select!` statement),
-  /// the `StreamReader` will be left in an invalid state:
-  ///
-  /// 1. **Buffer Loss**: The internal `pool_buffer` is moved out during the read operation.
-  ///    If cancelled, it becomes `None` permanently, violating struct invariants.
-  ///
-  /// 2. **Data Loss**: Any data successfully read by the kernel but not yet returned will be lost.
-  ///    This can result in protocol corruption and stream desynchronization.
-  ///
-  /// 3. **State Corruption**: Internal position tracking (`current_pos`, `line_pos`) will not
-  ///    reflect the actual state of the underlying stream.
-  ///
-  /// **Recommendation**: Do not use this method in `select!` blocks where other branches can
-  /// cancel it during normal operation. If cancellation is unavoidable (e.g., shutdown),
-  /// the connection should be closed entirely rather than attempting to continue reading.
+  /// **This method is NOT cancellation-safe.**
   pub async fn next(&mut self) -> anyhow::Result<bool, StreamReaderError> {
     debug_assert!(self.pool_buffer.is_some(), "reading from unset pool buffer");
 
     // Get the buffer capacity once at the start
     let max_line_length = {
       let pool_buffer = self.pool_buffer.as_mut().unwrap();
-      pool_buffer.bytes_total()
+      pool_buffer.buf_capacity()
     };
 
     // First, compact the buffer to remove any previously processed line.
@@ -124,7 +101,7 @@ impl<R: AsyncReadRent> StreamReader<R> {
       // Check if we have a complete line in the buffer
       {
         let pool_buffer = self.pool_buffer.as_ref().unwrap();
-        let buffer = unsafe { &iobuf_as_slice(pool_buffer)[..self.current_pos] };
+        let buffer = &iobuf_as_slice(pool_buffer)[..self.current_pos];
 
         if let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
           self.line_pos = Some(pos);
@@ -142,15 +119,16 @@ impl<R: AsyncReadRent> StreamReader<R> {
       // Set buffer length to current_pos so the Slice below knows where
       // initialized data ends.
       unsafe {
-        owned_pool_buffer.set_init(self.current_pos);
+        owned_pool_buffer.set_len(self.current_pos);
       }
 
-      // Create a SliceMut starting at current_pos so the read writes AFTER
+      // Create a Slice starting at current_pos so the read writes AFTER
       // existing data.
-      let read_slice = owned_pool_buffer.slice_mut(self.current_pos..);
+      let read_slice = owned_pool_buffer.slice(self.current_pos..);
 
       // Read data into the slice
-      let (result, returned_slice) = self.reader.read(read_slice).await;
+      let compio::buf::BufResult(result, returned_slice): compio::buf::BufResult<usize, _> =
+        self.reader.read(read_slice).await;
 
       // Restore the pool buffer from the slice
       self.pool_buffer = Some(returned_slice.into_inner());
@@ -177,33 +155,15 @@ impl<R: AsyncReadRent> StreamReader<R> {
   /// It first attempts to use any remaining buffered data from previous line reads,
   /// then reads directly from the underlying reader if more data is needed.
   ///
-  /// # Arguments
-  /// * `buf` - Owned mutable buffer to fill with data.
-  /// * `len` - The exact number of bytes to read. Must be <= `buf.buf_capacity()`.
-  ///
-  /// # Returns
-  /// * `Ok(buf)` - Successfully read exactly `len` bytes, returning the buffer back
-  /// * `Err(_)` - Contains an error if:
-  ///   - `len` exceeds the buffer capacity
-  ///   - The underlying reader encounters an I/O error
-  ///   - EOF is reached before reading the requested number of bytes
-  ///
   /// # Cancellation Safety
   ///
-  /// ⚠️ **This method is NOT cancellation-safe.**
-  ///
-  /// Similar to `next()`, this method moves the buffer ownership to the monoio I/O operation.
-  /// If cancelled during the read, the `StreamReader` will be left in an invalid state with
-  /// potential data loss and state corruption.
-  ///
-  /// See the `next()` method documentation for detailed information about cancellation safety
-  /// issues and recommended usage patterns.
+  /// **This method is NOT cancellation-safe.**
   pub async fn read_raw<B: IoBuf + IoBufMut>(&mut self, mut buf: B, len: usize) -> anyhow::Result<B> {
-    assert!(len <= buf.bytes_total(), "len exceeds buffer capacity");
+    assert!(len <= buf.buf_capacity(), "len exceeds buffer capacity");
 
     // Reset buffer length to 0 and fill up to requested len
     unsafe {
-      buf.set_init(0);
+      buf.set_len(0);
     }
     let mut bytes_filled = 0;
 
@@ -215,15 +175,14 @@ impl<R: AsyncReadRent> StreamReader<R> {
       let start_pos = if let Some(line_pos) = self.line_pos { line_pos + 1 } else { 0 };
 
       // Copy data directly into the buffer's uninitialized memory
-      // We need to scope the borrow to avoid conflicts later
       {
         let pool_buffer = self.pool_buffer.as_ref().unwrap();
-        let source_data = unsafe { &iobuf_as_slice(pool_buffer)[start_pos..start_pos + to_extract] };
+        let source_data = &iobuf_as_slice(pool_buffer)[start_pos..start_pos + to_extract];
 
         unsafe {
-          let dst = buf.write_ptr();
+          let dst = buf.as_uninit().as_mut_ptr() as *mut u8;
           std::ptr::copy_nonoverlapping(source_data.as_ptr(), dst, to_extract);
-          buf.set_init(to_extract);
+          buf.set_len(to_extract);
         }
       }
 
@@ -248,8 +207,9 @@ impl<R: AsyncReadRent> StreamReader<R> {
 
     // If we still need more data, read directly from the underlying reader
     while bytes_filled < len {
-      let slice = buf.slice_mut(bytes_filled..len);
-      let (result, returned_slice) = self.reader.read(slice).await;
+      let slice = buf.slice(bytes_filled..len);
+      let compio::buf::BufResult(result, returned_slice): compio::buf::BufResult<usize, _> =
+        self.reader.read(slice).await;
       buf = returned_slice.into_inner();
 
       match result {
@@ -286,9 +246,6 @@ impl<R: AsyncReadRent> StreamReader<R> {
 
   /// Compacts the buffer by moving any remaining data after the last processed line
   /// to the beginning of the buffer and updates the current position accordingly.
-  ///
-  /// This is called internally to prepare the buffer for reading more data while
-  /// preserving any unprocessed bytes from previous reads.
   fn compact_buffer(&mut self) {
     if let Some(pos) = self.line_pos.take() {
       let pool_buffer = match self.pool_buffer.as_mut() {
@@ -300,12 +257,12 @@ impl<R: AsyncReadRent> StreamReader<R> {
         let remaining_len = self.current_pos - (pos + 1);
         pool_buffer.as_mut_slice().copy_within(pos + 1..self.current_pos, 0);
         unsafe {
-          pool_buffer.set_init(remaining_len);
+          pool_buffer.set_len(remaining_len);
         }
         self.current_pos = remaining_len;
       } else {
         unsafe {
-          pool_buffer.set_init(0);
+          pool_buffer.set_len(0);
         }
         self.current_pos = 0;
       }
@@ -317,12 +274,12 @@ impl<R: AsyncReadRent> StreamReader<R> {
 mod tests {
   use super::*;
 
-  use monoio::BufResult;
-  use monoio::buf::{IoBufMut, IoVecBufMut};
+  use compio::buf::{BufResult, IoBufMut};
+  use compio::io::AsyncRead;
 
   use crate::pool::Pool;
 
-  /// Mock reader that returns data in chunks
+  /// Mock reader that returns data in chunks.
   struct MockChunkedReader {
     chunks: Vec<Vec<u8>>,
     current_chunk: usize,
@@ -335,22 +292,22 @@ mod tests {
     }
   }
 
-  impl AsyncReadRent for MockChunkedReader {
+  impl AsyncRead for MockChunkedReader {
     async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
       if self.current_chunk >= self.chunks.len() {
-        return (Ok(0), buf); // EOF
+        return BufResult(Ok(0), buf); // EOF
       }
 
       let current_data = &self.chunks[self.current_chunk];
       let remaining = current_data.len() - self.position;
-      let available_space = buf.bytes_total();
+      let available_space = buf.buf_capacity();
       let to_copy = std::cmp::min(available_space, remaining);
 
       if to_copy > 0 {
         unsafe {
-          let dst = buf.write_ptr();
+          let dst = buf.as_uninit().as_mut_ptr() as *mut u8;
           std::ptr::copy_nonoverlapping(current_data[self.position..].as_ptr(), dst, to_copy);
-          buf.set_init(to_copy);
+          buf.set_len(to_copy);
         }
       }
 
@@ -361,16 +318,11 @@ mod tests {
         self.position = 0;
       }
 
-      (Ok(to_copy), buf)
-    }
-
-    async fn readv<B: IoVecBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
-      // Not used in tests
-      (Ok(0), buf)
+      BufResult(Ok(to_copy), buf)
     }
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_empty_lines() {
     let mock_reader = MockChunkedReader::new(vec![b"\n\n".to_vec(), b"non-empty line\n".to_vec(), b"\n".to_vec()]);
     let pool = Pool::new(1, 1024);
@@ -397,7 +349,7 @@ mod tests {
     assert!(!reader.next().await.unwrap());
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_max_line_length() {
     // Create a small buffer of 10 bytes
     let pool = Pool::new(1, 10);
@@ -415,7 +367,7 @@ mod tests {
     assert!(err.to_string().contains("max line length exceeded"));
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_multibyte_utf8() {
     // Japanese, emoji, and other multi-byte characters
     let mock_reader = MockChunkedReader::new(vec![
@@ -439,7 +391,7 @@ mod tests {
     assert_eq!(reader.get_line().unwrap(), "Привет мир".as_bytes());
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_partial_reads() {
     let mock_reader = MockChunkedReader::new(vec![
       b"Partial ".to_vec(),
@@ -461,7 +413,7 @@ mod tests {
     assert_eq!(reader.get_line().unwrap(), "Second line".as_bytes());
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_exact_buffer_size() {
     // Create a buffer and a line of exactly the same size
     let buffer_size = 10;
@@ -478,7 +430,7 @@ mod tests {
     assert_eq!(reader.get_line().unwrap(), "123456789".as_bytes());
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_read_raw_with_buffered_data() {
     // Test reading raw bytes when there's buffered data after a line read
     let mock_reader = MockChunkedReader::new(vec![b"first line\nRAW_DATA_HERE".to_vec()]);
@@ -497,7 +449,7 @@ mod tests {
     assert_eq!(&result[..], b"RAW_DATA_HERE");
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_read_raw_direct_read() {
     // Test reading raw bytes when buffer is empty (direct read from reader)
     let mock_reader = MockChunkedReader::new(vec![b"DIRECT_RAW_DATA".to_vec()]);
@@ -512,7 +464,7 @@ mod tests {
     assert_eq!(&result[..], b"DIRECT_RAW_DATA");
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_read_raw_spanning_chunks() {
     // Test reading raw bytes that span across buffered data and multiple reads
     let mock_reader = MockChunkedReader::new(vec![b"line\nBUFFERED".to_vec(), b"_THEN_".to_vec(), b"READ".to_vec()]);
@@ -531,7 +483,7 @@ mod tests {
     assert_eq!(&result[..], b"BUFFERED_THEN_READ");
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_read_raw_eof() {
     // Test reading raw bytes when there's not enough data (EOF)
     let mock_reader = MockChunkedReader::new(vec![b"short".to_vec()]);
@@ -547,7 +499,7 @@ mod tests {
     assert!(result.unwrap_err().to_string().contains("EOF"));
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_read_raw_partial_buffered() {
     // Test reading raw bytes where some data is buffered and some needs to be read
     let mock_reader = MockChunkedReader::new(vec![b"first\nsecond\nthird".to_vec(), b"_part".to_vec()]);
@@ -566,7 +518,7 @@ mod tests {
     assert_eq!(&result[..], b"second\nthird_pa");
   }
 
-  #[monoio::test]
+  #[compio::test]
   async fn test_read_raw_respects_len_not_capacity() {
     // Provide a single chunk with more data than we'll request
     let mock_reader = MockChunkedReader::new(vec![b"ABCDextra".to_vec()]);
