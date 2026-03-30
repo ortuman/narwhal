@@ -309,12 +309,12 @@ impl<ML: MessageLog> Channel<ML> {
     let handler = self.handler.clone();
     let interval = std::time::Duration::from_millis(interval_ms as u64);
 
-    monoio::spawn(async move {
+    narwhal_common::runtime::spawn_detached(async move {
       use futures::FutureExt;
 
       loop {
         futures::select! {
-          _ = monoio::time::sleep(interval).fuse() => {},
+          _ = narwhal_common::runtime::sleep(interval).fuse() => {},
           _ = cancel_rx.recv().fuse() => break,
         }
         if let Err(e) = message_log.flush().await {
@@ -741,9 +741,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     let is_persistent = self.channels.get(&channel_id.handler).is_some_and(|c| c.config.persist == Some(true));
     if let Some(channel) = self.channels.get_mut(&channel_id.handler) {
       channel.cancel_flush_task();
-      if is_persistent
-        && let Err(e) = channel.message_log.flush().await
-      {
+      if is_persistent && let Err(e) = channel.message_log.flush().await {
         warn!(channel = %channel_id.handler, error = %e, "final flush on delete failed");
       }
     }
@@ -1044,8 +1042,8 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     }
 
     let was_persistent = channel.config.persist == Some(true);
-    let flush_interval_changed = config.message_flush_interval.is_some()
-      && config.message_flush_interval != channel.config.message_flush_interval;
+    let flush_interval_changed =
+      config.message_flush_interval.is_some() && config.message_flush_interval != channel.config.message_flush_interval;
     let new_config = channel.config.merge(&config);
     let is_persistent = new_config.persist == Some(true);
 
@@ -1058,9 +1056,22 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     channel.config = new_config;
 
     // Cancel the flush task if persist was toggled off or flush interval changed.
-    // A new task will be lazily spawned on the next broadcast if needed.
     if (!is_persistent && was_persistent) || flush_interval_changed {
       channel.cancel_flush_task();
+
+      // When the flush interval changed but persistence is still enabled, flush any buffered
+      // messages and restart the periodic task immediately so they are not left pending
+      // indefinitely waiting for the next broadcast.
+      if flush_interval_changed && is_persistent {
+        if let Err(e) = channel.message_log.flush().await {
+          warn!(channel = %channel_id.handler, error = %e, "flush on interval change failed");
+        }
+        if let Some(interval) = channel.config.message_flush_interval
+          && interval > 0
+        {
+          channel.ensure_flush_task(interval);
+        }
+      }
     }
 
     if !is_persistent && was_persistent {
