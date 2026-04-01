@@ -12,6 +12,7 @@ use super::store::{ChannelStore, PersistedChannel};
 
 const METADATA_FILE: &str = "metadata.bin";
 const METADATA_TMP_FILE: &str = "metadata.bin.tmp";
+const MAX_METADATA_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// Computes the SHA-256 hex-encoded hash of a channel handler, used as the directory name.
 pub(crate) fn channel_hash(handler: &StringAtom) -> StringAtom {
@@ -140,6 +141,10 @@ impl ChannelStore for FileChannelStore {
 
   async fn load_channel(&self, hash: &StringAtom) -> anyhow::Result<PersistedChannel> {
     let path = self.channel_dir(hash.as_ref()).join(METADATA_FILE);
+    let meta = compio::fs::metadata(&path).await?;
+    if meta.len() > MAX_METADATA_SIZE as u64 {
+      return Err(anyhow::anyhow!("metadata file exceeds {} bytes", MAX_METADATA_SIZE));
+    }
     let data = compio::fs::read(&path).await?;
     let (channel, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
     Ok(channel)
