@@ -958,8 +958,12 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
         let result = channel.message_log.flush().await;
         self.metrics.message_log_flush_duration_seconds.observe(start.elapsed().as_secs_f64());
         match &result {
-          Ok(()) => { self.metrics.message_log_flushes.get_or_create(&SUCCESS).inc(); },
-          Err(_) => { self.metrics.message_log_flushes.get_or_create(&FAILURE).inc(); },
+          Ok(()) => {
+            self.metrics.message_log_flushes.get_or_create(&SUCCESS).inc();
+          },
+          Err(_) => {
+            self.metrics.message_log_flushes.get_or_create(&FAILURE).inc();
+          },
         }
         result?;
       } else {
@@ -1417,7 +1421,9 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     }
     if let Some(hash) = self.channels.get(handler).and_then(|c| c.store_hash.clone()) {
       match self.store.delete_channel(&hash).await {
-        Ok(()) => { self.metrics.store_deletes.get_or_create(&SUCCESS).inc(); },
+        Ok(()) => {
+          self.metrics.store_deletes.get_or_create(&SUCCESS).inc();
+        },
         Err(e) => {
           self.metrics.store_deletes.get_or_create(&FAILURE).inc();
           warn!(channel = %handler, error = %e, "failed to delete persisted channel");
