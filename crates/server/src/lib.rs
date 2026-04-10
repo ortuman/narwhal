@@ -101,6 +101,7 @@ async fn run_server(
     max_payload_size: c2s_config.limits.max_payload_size,
     max_persist_messages: c2s_config.limits.max_persist_messages,
     max_message_flush_interval: c2s_config.limits.max_message_flush_interval,
+    max_history_limit: c2s_config.limits.max_history_limit,
   };
 
   let local_domain = StringAtom::from(c2s_config.listener.domain.as_str());

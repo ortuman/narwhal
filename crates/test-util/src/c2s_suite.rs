@@ -121,6 +121,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sSuite<CS, MLF> {
       max_payload_size: arc_config.limits.max_payload_size,
       max_persist_messages: arc_config.limits.max_persist_messages,
       max_message_flush_interval: arc_config.limits.max_message_flush_interval,
+      max_history_limit: arc_config.limits.max_history_limit,
     };
 
     let mut registry = Registry::default();

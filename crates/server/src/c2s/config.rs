@@ -202,6 +202,10 @@ pub struct Limits {
   /// A channel value of 0 (the default) means flush immediately after every append.
   #[serde(default = "default_max_message_flush_interval")]
   pub max_message_flush_interval: u32,
+
+  /// The maximum number of messages returned per history request.
+  #[serde(default = "default_max_history_limit")]
+  pub max_history_limit: u32,
 }
 
 fn default_max_connections() -> u32 {
@@ -252,6 +256,10 @@ fn default_max_message_flush_interval() -> u32 {
   60_000 // 60 seconds
 }
 
+fn default_max_history_limit() -> u32 {
+  100
+}
+
 impl Default for Limits {
   fn default() -> Self {
     Self {
@@ -267,6 +275,7 @@ impl Default for Limits {
       payload_pool_memory_budget: default_payload_pool_memory_budget(),
       max_persist_messages: default_max_persist_messages(),
       max_message_flush_interval: default_max_message_flush_interval(),
+      max_history_limit: default_max_history_limit(),
     }
   }
 }
