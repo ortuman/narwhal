@@ -76,7 +76,7 @@ impl ChannelStore for FileChannelStore {
 
     compio::fs::create_dir_all(&dir).await?;
 
-    let data = bincode::serde::encode_to_vec(channel, bincode::config::standard())?;
+    let data = postcard::to_allocvec(channel)?;
     self.atomic_write(&dir, &data).await?;
     Ok(hash)
   }
@@ -146,7 +146,7 @@ impl ChannelStore for FileChannelStore {
       return Err(anyhow::anyhow!("metadata file exceeds {} bytes", MAX_METADATA_SIZE));
     }
     let data = compio::fs::read(&path).await?;
-    let (channel, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
+    let channel = postcard::from_bytes(&data)?;
     Ok(channel)
   }
 }
@@ -263,7 +263,7 @@ mod tests {
     let hash = channel_hash(&StringAtom::from("bad"));
     let dir = tmp.path().join(hash.as_ref());
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join(METADATA_FILE), b"not valid bincode").unwrap();
+    std::fs::write(dir.join(METADATA_FILE), b"not valid postcard").unwrap();
 
     let result = store.load_channel(&hash).await;
     assert!(result.is_err());
