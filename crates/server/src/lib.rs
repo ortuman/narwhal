@@ -15,9 +15,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::channel::file_store::FileChannelStore;
-use crate::channel::file_message_log::FileMessageLogFactory;
 use crate::channel::ChannelManager;
+use crate::channel::file_message_log::FileMessageLogFactory;
+use crate::channel::file_store::FileChannelStore;
 use crate::notifier::Notifier;
 use crate::router::GlobalRouter;
 use crate::telemetry::MetricsRegistry;
