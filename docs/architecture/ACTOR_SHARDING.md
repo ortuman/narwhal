@@ -79,8 +79,7 @@ same four pieces:
                       └─────────────┘
 ```
 
-Each subsystem chooses a **sharding key** (username, channel handler,
-username), hashes it, and routes the command to the owning shard. The shard
+Each subsystem chooses a **sharding key**, hashes it, and routes the command to the owning shard. The shard
 holds an ordinary `HashMap<Key, State>` and mutates it with plain `&mut self`
 — no locks, no atomics on the state itself, because every command for a given
 key is serialized through a single thread.
