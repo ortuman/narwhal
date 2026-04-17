@@ -1,7 +1,6 @@
 # Channel Store — Architecture Specification
 
 > **Status:** Implemented.
-> **Last updated:** 2026-04-17
 > **Related PRs:** see `crates/server/src/channel/file_store.rs` history.
 
 ## Table of Contents

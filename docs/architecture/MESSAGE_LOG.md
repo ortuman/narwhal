@@ -1,7 +1,6 @@
 # Message Log — Architecture Specification
 
 > **Status:** Implemented.
-> **Last updated:** 2026-04-16
 > **Related PRs:** [#221](https://github.com/narwhal-io/narwhal/pull/221) (HISTORY/CHAN_SEQ protocol), [#227](https://github.com/narwhal-io/narwhal/pull/227) (FileMessageLog implementation)
 
 ## Table of Contents

@@ -1,7 +1,6 @@
 # Actor-Based Sharding — Architecture Specification
 
 > **Status:** Implemented.
-> **Last updated:** 2026-04-17
 
 ## Table of Contents
 
