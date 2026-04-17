@@ -688,6 +688,9 @@ impl Inner {
   }
 }
 
+// The shard actor model guarantees single-threaded, non-reentrant access —
+// holding a RefCell borrow across .await is safe in this context.
+#[allow(clippy::await_holding_refcell_ref)]
 #[async_trait(?Send)]
 impl MessageLog for FileMessageLog {
   async fn append(&self, message: &Message, payload: &PoolBuffer, max_messages: u32) -> anyhow::Result<()> {
