@@ -132,8 +132,11 @@ fn channel_hash(handler: &StringAtom) -> StringAtom {
 
 Using a hash (instead of the raw handler) gives a fixed-length, filesystem-safe
 directory name regardless of what characters the handler contains. The hash is
-a pure function of the handler, so `FileChannelStore` and `FileMessageLog`
-independently derive the same directory without any shared state.
+a pure function of the handler, and in the current implementation
+`FileChannelStore` and the file-backed message-log path share a single
+`channel_hash` helper (defined in `channel/file_store.rs` and imported by
+`channel/file_message_log.rs`) to derive the same directory name without
+requiring shared mutable state or a separate mapping.
 
 The server records the hash on the in-memory `Channel` (as `store_hash`) after
 the first successful save, so later deletes can skip re-hashing.
@@ -160,18 +163,26 @@ pub struct PersistedChannel {
 |----------|-------|
 | Encoding | postcard (varint-length-prefixed, little-endian) |
 | Header | None — the format has no magic bytes or version byte |
-| Integrity | No CRC — file is written atomically (see below) |
+| Integrity | No CRC — atomic write protocol avoids torn writes, but does not provide corruption detection (see below) |
 | Max size | 64 MiB — enforced on load to refuse obviously corrupt files |
 
 **Why no CRC:** the atomic write protocol (write-tmp → fsync → rename → fsync
 parent dir) guarantees that readers always see either the previous successful
-write or the new one, never a partial file. A checksum would only add value if
-writes were in-place.
+write or the new one, never a partial file after a crash. That provides
+crash-safety, not integrity verification: a checksum could still help detect
+silent corruption such as bit-rot or stray writes. The current format omits a
+CRC as a simplicity/performance tradeoff, not because atomic writes make
+checksums unnecessary.
 
-**Why no version byte:** the only deployed format is the current one. If a
-schema change becomes necessary, a version byte can be added by bumping the
-postcard struct (non-breaking field additions are already tolerated by
-postcard when they're at the end and `Option`-typed).
+**Why no version byte:** the only deployed format is the current one. The
+current on-disk format should be treated as compatible only with the exact
+current `PersistedChannel` schema: postcard encodes structs positionally, and
+this type does not define `#[serde(default)]`, a versioned wrapper, or custom
+migration logic. Adding, removing, or reordering fields must be considered a
+breaking change for deserialization. If schema evolution becomes necessary,
+introduce explicit format versioning first (for example, a version byte or
+versioned envelope plus per-version decode/migration code) before changing
+the serialized struct layout.
 
 ## Trait API
 
@@ -454,7 +465,7 @@ hundred bytes to low kilobytes, dominated by the member list.
 | Crate | Version | Purpose |
 |-------|---------|---------|
 | `compio` | 0.18 | Async file I/O via io_uring (`write`, `rename`, `sync_all`) |
-| `postcard` | (workspace) | Compact self-describing serialization of `PersistedChannel` |
+| `postcard` | (workspace) | Compact schema-dependent serialization of `PersistedChannel` |
 | `sha2` | (workspace) | SHA-256 hashing of handler → directory name |
 | `serde` | (workspace) | `Serialize` / `Deserialize` derives on `PersistedChannel` and nested types |
 
