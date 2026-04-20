@@ -92,19 +92,26 @@ impl MessageLogMetrics {
       crc_failures.clone(),
     );
 
-    Self { recovery_duration_seconds, append_duration_seconds, segments_rolled, segments_evicted, evicted_bytes, crc_failures }
+    Self {
+      recovery_duration_seconds,
+      append_duration_seconds,
+      segments_rolled,
+      segments_evicted,
+      evicted_bytes,
+      crc_failures,
+    }
   }
 
   /// Returns an instance with unregistered handles — useful for tests that do
   /// not care about observing metric values.
   pub fn noop() -> Self {
     Self {
-      recovery_duration_seconds: Histogram::new(
-        prometheus_client::metrics::histogram::exponential_buckets(0.001, 2.0, 16),
-      ),
-      append_duration_seconds: Histogram::new(
-        prometheus_client::metrics::histogram::exponential_buckets(0.0001, 2.0, 16),
-      ),
+      recovery_duration_seconds: Histogram::new(prometheus_client::metrics::histogram::exponential_buckets(
+        0.001, 2.0, 16,
+      )),
+      append_duration_seconds: Histogram::new(prometheus_client::metrics::histogram::exponential_buckets(
+        0.0001, 2.0, 16,
+      )),
       segments_rolled: Counter::default(),
       segments_evicted: Counter::default(),
       evicted_bytes: Counter::default(),
@@ -1099,7 +1106,13 @@ mod tests {
   async fn create_log_with_segment_max(dir: &std::path::Path, segment_max_bytes: u64) -> FileMessageLog {
     let hash = channel_hash(&StringAtom::from("test_channel"));
     let channel_dir = dir.join(hash.as_ref());
-    FileMessageLog::open_with_segment_max(channel_dir, TEST_MAX_PAYLOAD_SIZE, segment_max_bytes, MessageLogMetrics::noop()).await
+    FileMessageLog::open_with_segment_max(
+      channel_dir,
+      TEST_MAX_PAYLOAD_SIZE,
+      segment_max_bytes,
+      MessageLogMetrics::noop(),
+    )
+    .await
   }
 
   /// Helper: append a single message with the given seq, from, and payload.
@@ -1634,7 +1647,8 @@ mod tests {
   #[compio::test]
   async fn test_factory_creates_independent_logs() {
     let tmp = tempfile::tempdir().unwrap();
-    let factory = FileMessageLogFactory::new(tmp.path().to_path_buf(), TEST_MAX_PAYLOAD_SIZE, MessageLogMetrics::noop());
+    let factory =
+      FileMessageLogFactory::new(tmp.path().to_path_buf(), TEST_MAX_PAYLOAD_SIZE, MessageLogMetrics::noop());
 
     let log_a = factory.create(&StringAtom::from("channel_a")).await;
     let log_b = factory.create(&StringAtom::from("channel_b")).await;
