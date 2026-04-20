@@ -179,7 +179,7 @@ RUST_LOG=debug cargo run --bin narwhal
 
 ## Project Status
 
-**Current Version: 0.5.0 (Alpha)**
+**Current Version: 0.6.0 (Alpha)**
 
 Narwhal is in active development and currently in **alpha** stage. While the core functionality is working and tested, please note:
 
