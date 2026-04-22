@@ -257,8 +257,6 @@ pub struct HistoryParameters {
 
   #[param(validate = "non_zero")]
   pub limit: u32,
-
-  pub direction: Option<StringAtom>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
@@ -950,18 +948,7 @@ impl Message {
         Ok(())
       },
       GetChannelConfiguration(params) => params.validate(),
-      History(params) => {
-        params.validate()?;
-
-        if let Some(ref direction) = params.direction {
-          match direction.as_ref() {
-            "forward" | "backward" => {},
-            _ => anyhow::bail!("invalid direction: {}", direction),
-          }
-        }
-
-        Ok(())
-      },
+      History(params) => params.validate(),
       HistoryAck(params) => params.validate(),
       ChannelSeq(params) => params.validate(),
       ChannelSeqAck(params) => params.validate(),

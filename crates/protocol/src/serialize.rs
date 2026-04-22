@@ -351,8 +351,8 @@ mod tests {
             },
             TestCase {
                 name: "HISTORY",
-                msg: Message::History(HistoryParameters { id: 1, history_id: "h1".into(), channel: "!1@localhost".into(), from_seq: 5, limit: 10, direction: Some("backward".into()) }),
-                expected_out: Some("HISTORY id=1 channel=!1@localhost direction=backward from_seq=5 history_id=h1 limit=10\n".to_string()),
+                msg: Message::History(HistoryParameters { id: 1, history_id: "h1".into(), channel: "!1@localhost".into(), from_seq: 5, limit: 10 }),
+                expected_out: Some("HISTORY id=1 channel=!1@localhost from_seq=5 history_id=h1 limit=10\n".to_string()),
             },
             TestCase {
                 name: "HISTORY_ACK",

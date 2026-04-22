@@ -45,6 +45,10 @@
   - [CHAN_CONFIG](#chan_config)
   - [SET_CHAN_CONFIG](#set_chan_config)
   - [SET_CHAN_CONFIG_ACK](#set_chan_config_ack)
+  - [CHAN_SEQ](#chan_seq)
+  - [CHAN_SEQ_ACK](#chan_seq_ack)
+  - [HISTORY](#history)
+  - [HISTORY_ACK](#history_ack)
   - [EVENT](#event)
   - [PING](#ping)
   - [PONG](#pong)
@@ -463,9 +467,6 @@ Requests to join a channel.
 JOIN id=1 channel=!general@example.com
 ```
 
-**Notes**:
-- May return `RESOURCE_CONFLICT` error if the channel is removed during the join operation due to concurrent modifications. Clients should retry the operation.
-
 ---
 
 ### JOIN_ACK
@@ -607,10 +608,17 @@ Receives a broadcast message from a channel. This message includes a payload.
 - `length` (u32, required): Payload size in bytes (must be non-zero)
 - `seq` (u64, required): Monotonic sequence number of this message within the channel (must be non-zero). Sequence numbers are assigned by the server in the order messages are received and are identical across all recipients of the same broadcast.
 - `timestamp` (u64, required): Server-assigned UTC timestamp in milliseconds since the Unix epoch at which the message was received (must be non-zero). The same value is delivered to all recipients of the same broadcast.
+- `history_id` (string, optional): Present only on `MESSAGE` frames delivered as part of a [HISTORY](#history) replay; echoes the `history_id` from the originating request so the client can demultiplex replay from live traffic. Absent on live broadcasts.
 
-**Example**:
+**Example (live broadcast)**:
 ```
 MESSAGE channel=!42@example.com from=bob@example.com length=512 seq=42 timestamp=1740643200000
+[512 bytes of binary payload follow]
+```
+
+**Example (history replay)**:
+```
+MESSAGE channel=!42@example.com from=bob@example.com history_id=h1 length=512 seq=42 timestamp=1740643200000
 [512 bytes of binary payload follow]
 ```
 
@@ -923,6 +931,96 @@ SET_CHAN_CONFIG_ACK id=10
 ```
 
 **Note**: To retrieve the updated configuration after modification, use [GET_CHAN_CONFIG](#get_chan_config).
+
+---
+
+### CHAN_SEQ
+
+Queries the available sequence range of a channel's message log. Used by clients to discover how much history is retained before issuing a [HISTORY](#history) request.
+
+**Direction**: Client → Server
+
+**Parameters**:
+- `id` (u32, required): Request identifier (must be non-zero)
+- `channel` (string, required): Channel ID to query (must be non-empty)
+
+**Example**:
+```
+CHAN_SEQ id=11 channel=!42@example.com
+```
+
+**Notes**:
+- The server requires the caller to be a member of the channel, to have `read` permission in the channel ACL, and for persistence to be enabled on the channel. Otherwise an [ERROR](#error) with `USER_NOT_IN_CHANNEL`, `NOT_ALLOWED`, or `PERSISTENCE_NOT_ENABLED` is returned.
+
+---
+
+### CHAN_SEQ_ACK
+
+Returns the sequence range currently retained in the channel's message log.
+
+**Direction**: Server → Client (in response to CHAN_SEQ)
+
+**Parameters**:
+- `id` (u32, required): Request identifier matching the CHAN_SEQ message (must be non-zero)
+- `channel` (string, required): Channel ID (must be non-empty)
+- `first_seq` (u64, required): First sequence number still retained in the log (0 if the log is empty)
+- `last_seq` (u64, required): Last sequence number written to the log (0 if the log is empty)
+
+**Example**:
+```
+CHAN_SEQ_ACK id=11 channel=!42@example.com first_seq=1 last_seq=500
+```
+
+**Notes**:
+- When `first_seq == 0` and `last_seq == 0`, the log is empty. Otherwise both are non-zero and `first_seq <= last_seq`.
+- The retained range can shrink as older segments are evicted once `max_persist_messages` is exceeded.
+
+---
+
+### HISTORY
+
+Requests archived messages from a channel. Matching entries are streamed back as individual [MESSAGE](#message) frames (each tagged with `history_id`) followed by a single [HISTORY_ACK](#history_ack).
+
+**Direction**: Client → Server
+
+**Parameters**:
+- `id` (u32, required): Request identifier (must be non-zero)
+- `history_id` (string, required): Client-chosen identifier echoed back on every replayed `MESSAGE` and the terminating `HISTORY_ACK`, allowing the client to demultiplex replay from live traffic and to correlate multiple concurrent replays (must be non-empty)
+- `channel` (string, required): Channel ID to read from (must be non-empty)
+- `from_seq` (u64, required): Sequence number to start reading from, inclusive (must be non-zero). The log always reads forward; clients that want the newest N messages should query [CHAN_SEQ](#chan_seq) first and compute `from_seq = max(1, last_seq - N + 1)`.
+- `limit` (u32, required): Maximum number of entries to return (must be non-zero). The server may clamp this to an internal maximum.
+
+**Example**:
+```
+HISTORY id=12 channel=!42@example.com from_seq=50 history_id=h1 limit=10
+```
+
+**Notes**:
+- The server requires the caller to be a member of the channel, to have `read` permission in the channel ACL, and for persistence to be enabled on the channel. Otherwise an [ERROR](#error) with `USER_NOT_IN_CHANNEL`, `NOT_ALLOWED`, or `PERSISTENCE_NOT_ENABLED` is returned.
+- Requests for a non-local `channel` domain return `NOT_IMPLEMENTED`.
+
+---
+
+### HISTORY_ACK
+
+Signals the end of a history replay and reports how many entries were delivered.
+
+**Direction**: Server → Client (in response to HISTORY, after all replayed MESSAGE frames)
+
+**Parameters**:
+- `id` (u32, required): Request identifier matching the HISTORY message (must be non-zero)
+- `history_id` (string, required): Echo of the `history_id` from the request (must be non-empty)
+- `channel` (string, required): Channel ID (must be non-empty)
+- `count` (u32, required): Number of `MESSAGE` frames delivered for this replay
+
+**Example**:
+```
+HISTORY_ACK id=12 channel=!42@example.com count=10 history_id=h1
+```
+
+**Notes**:
+- Clients should treat the `HISTORY_ACK` as the boundary between replayed messages and live traffic for that `history_id`.
+- `count` may be less than the requested `limit` if the log contained fewer matching entries (including zero).
 
 ---
 
@@ -1274,11 +1372,12 @@ The following error reasons can be returned in [ERROR](#error) messages:
 | `CHANNEL_IS_FULL` | The channel has reached its maximum capacity |
 | `FORBIDDEN` | The request is not allowed due to lack of permissions |
 | `INTERNAL_SERVER_ERROR` | An unexpected error occurred on the server |
-| `MESSAGE_CHANNEL_FULL` | The message channel buffer is full |
 | `NOT_ALLOWED` | The operation is not allowed for the current user or context |
 | `NOT_IMPLEMENTED` | The requested feature or operation is not yet implemented |
+| `OUTBOUND_QUEUE_FULL` | The connection's outbound queue is full and cannot accept new messages |
+| `PERSISTENCE_NOT_ENABLED` | The target channel does not have message persistence enabled |
 | `POLICY_VIOLATION` | The request violates server policies or rules |
-| `RESOURCE_CONFLICT` | The operation failed due to a concurrent modification conflict |
+| `RESOURCE_LIMIT_REACHED` | A server-wide resource limit has been reached (e.g., maximum number of channels) |
 | `RESPONSE_TOO_LARGE` | The response exceeds the maximum message size limit |
 | `SERVER_OVERLOADED` | The server is overloaded and cannot handle the request |
 | `SERVER_SHUTTING_DOWN` | The server is shutting down and not accepting new requests |
@@ -1299,20 +1398,21 @@ The following error reasons can be returned in [ERROR](#error) messages:
 - `FORBIDDEN`
 - `NOT_ALLOWED`
 - `NOT_IMPLEMENTED`
-- `RESOURCE_CONFLICT`
+- `PERSISTENCE_NOT_ENABLED`
+- `RESOURCE_LIMIT_REACHED`
 - `RESPONSE_TOO_LARGE`
+- `SERVER_OVERLOADED`
 - `USER_IN_CHANNEL`
 - `USER_NOT_IN_CHANNEL`
 - `USERNAME_IN_USE`
 - `USER_NOT_REGISTERED`
-- `SERVER_OVERLOADED`
 
 **Non-recoverable errors** (connection should be closed):
 - `BAD_REQUEST`
 - `INTERNAL_SERVER_ERROR`
+- `OUTBOUND_QUEUE_FULL`
 - `POLICY_VIOLATION`
 - `SERVER_SHUTTING_DOWN`
-- `MESSAGE_CHANNEL_FULL`
 - `TIMEOUT`
 - `UNAUTHORIZED`
 - `UNEXPECTED_MESSAGE`
@@ -1536,7 +1636,14 @@ Messages that expect responses use an `id` parameter for correlation:
 
 ## Version History
 
-- **Version 1.3** (Current):
+- **Version 1.4** (Current):
+  - Added `CHAN_SEQ` / `CHAN_SEQ_ACK` messages for querying the retained sequence range of a persistent channel's message log
+  - Added `HISTORY` / `HISTORY_ACK` messages for retrieving archived messages; replayed frames are delivered as regular `MESSAGE` frames carrying a new optional `history_id`
+  - Added optional `history_id` to `MESSAGE` to tag frames delivered during a `HISTORY` replay
+  - Added error reasons `PERSISTENCE_NOT_ENABLED` (recoverable) and `RESOURCE_LIMIT_REACHED` (recoverable)
+  - Corrected the documentation to refer to error reason `OUTBOUND_QUEUE_FULL`, matching the underlying per-connection outbound queue it refers to (the server has always emitted this name; the legacy alias `SEND_CHANNEL_FULL` remains recognised on the wire)
+  - Removed error reason `RESOURCE_CONFLICT` from the documentation (never emitted by the server)
+- **Version 1.3**:
   - Added `seq` (u64) to `BROADCAST_ACK`: the server echoes back the sequence number assigned to the message so the sender knows its position in the channel log
   - Added `seq` (u64) and `timestamp` (u64) to `MESSAGE`: every delivered message now carries a per-channel monotonic sequence number and a server-assigned UTC millisecond timestamp; both values are identical across all recipients of the same broadcast
 - **Version 1.2**:

@@ -1128,14 +1128,13 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
     let history_id = params.history_id;
     let from_seq = params.from_seq;
     let limit = params.limit;
-    let direction = params.direction;
 
     let nid = self.nid.as_ref().unwrap().clone();
     let transmitter = self.transmitter.clone();
 
     self
       .channel_manager
-      .history(channel_id.clone(), nid.clone(), history_id, from_seq, limit, direction, transmitter, correlation_id)
+      .history(channel_id.clone(), nid.clone(), history_id, from_seq, limit, transmitter, correlation_id)
       .await?;
 
     trace!(

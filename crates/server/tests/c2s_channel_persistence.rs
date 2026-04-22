@@ -219,7 +219,6 @@ async fn test_c2s_history_retrieves_persisted_messages() -> anyhow::Result<()> {
         channel: StringAtom::from(CHANNEL),
         from_seq: 1,
         limit: 100,
-        direction: None,
       }),
     )
     .await?;
@@ -351,7 +350,6 @@ async fn test_c2s_history_partial_range() -> anyhow::Result<()> {
         channel: StringAtom::from(CHANNEL),
         from_seq: 6,
         limit: 3,
-        direction: None,
       }),
     )
     .await?;
@@ -439,7 +437,6 @@ async fn test_c2s_history_survives_restart() -> anyhow::Result<()> {
           channel: StringAtom::from(CHANNEL),
           from_seq: 1,
           limit: 100,
-          direction: None,
         }),
       )
       .await?;
@@ -500,7 +497,6 @@ async fn test_c2s_history_empty_channel() -> anyhow::Result<()> {
         channel: StringAtom::from(CHANNEL),
         from_seq: 1,
         limit: 100,
-        direction: None,
       }),
     )
     .await?;
@@ -645,7 +641,6 @@ async fn test_c2s_history_after_eviction() -> anyhow::Result<()> {
         channel: StringAtom::from(CHANNEL),
         from_seq: 1,
         limit: 100,
-        direction: None,
       }),
     )
     .await?;
@@ -731,7 +726,6 @@ async fn test_c2s_history_cross_user() -> anyhow::Result<()> {
         channel: StringAtom::from(CHANNEL),
         from_seq: 1,
         limit: 100,
-        direction: None,
       }),
     )
     .await?;
@@ -848,7 +842,6 @@ async fn test_c2s_history_survives_restart_after_eviction() -> anyhow::Result<()
           channel: StringAtom::from(CHANNEL),
           from_seq: first_seq,
           limit: 100,
-          direction: None,
         }),
       )
       .await?;
@@ -917,7 +910,6 @@ async fn test_c2s_history_from_seq_beyond_last() -> anyhow::Result<()> {
         channel: StringAtom::from(CHANNEL),
         from_seq: 999,
         limit: 100,
-        direction: None,
       }),
     )
     .await?;
@@ -978,7 +970,6 @@ async fn test_c2s_history_independent_channels() -> anyhow::Result<()> {
         channel: StringAtom::from(CHANNEL),
         from_seq: 1,
         limit: 100,
-        direction: None,
       }),
     )
     .await?;
@@ -1014,7 +1005,6 @@ async fn test_c2s_history_independent_channels() -> anyhow::Result<()> {
         channel: StringAtom::from(CHANNEL_B),
         from_seq: 1,
         limit: 100,
-        direction: None,
       }),
     )
     .await?;
@@ -1074,7 +1064,6 @@ async fn test_c2s_history_and_chan_seq_on_non_persistent_channel() -> anyhow::Re
         channel: StringAtom::from(CHANNEL),
         from_seq: 1,
         limit: 10,
-        direction: None,
       }),
     )
     .await?;
@@ -1171,7 +1160,6 @@ async fn test_c2s_toggle_persistence_off_then_on() -> anyhow::Result<()> {
         channel: StringAtom::from(CHANNEL),
         from_seq: 1,
         limit: 100,
-        direction: None,
       }),
     )
     .await?;
