@@ -620,16 +620,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
         let result = self.list_members(channel_id, nid, page, count, transmitter, correlation_id);
         let _ = reply_tx.send(result).await;
       },
-      Command::History {
-        channel_id,
-        nid,
-        history_id,
-        from_seq,
-        limit,
-        transmitter,
-        correlation_id,
-        reply_tx,
-      } => {
+      Command::History { channel_id, nid, history_id, from_seq, limit, transmitter, correlation_id, reply_tx } => {
         let result = self.history(channel_id, nid, history_id, from_seq, limit, transmitter, correlation_id).await;
         let _ = reply_tx.send(result).await;
       },
@@ -2102,16 +2093,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelManager<CS, MLF> {
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
     self.mailboxes[shard]
-      .send(Command::History {
-        channel_id,
-        nid,
-        history_id,
-        from_seq,
-        limit,
-        transmitter,
-        correlation_id,
-        reply_tx,
-      })
+      .send(Command::History { channel_id, nid, history_id, from_seq, limit, transmitter, correlation_id, reply_tx })
       .await?;
 
     reply_rx.recv().await?

@@ -437,7 +437,7 @@ async fn test_c2s_history_survives_restart() -> anyhow::Result<()> {
           channel: StringAtom::from(CHANNEL),
           from_seq: 1,
           limit: 100,
-          }),
+        }),
       )
       .await?;
 
@@ -842,7 +842,7 @@ async fn test_c2s_history_survives_restart_after_eviction() -> anyhow::Result<()
           channel: StringAtom::from(CHANNEL),
           from_seq: first_seq,
           limit: 100,
-          }),
+        }),
       )
       .await?;
 
