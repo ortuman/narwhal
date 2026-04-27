@@ -196,17 +196,20 @@ For the default 128 MiB segments with 4096-byte index interval:
 
 New index entries are written directly into the mmap at the current write
 position (`active_idx_write_pos`). This avoids `write()` syscalls for index
-updates — the kernel handles page dirtying and writeback. An explicit
-`mmap.flush()` is called during `flush()` and before segment roll.
+updates — the kernel handles page dirtying and writeback. The active `.idx`
+file handle is kept open and durability is enforced with async
+`sync_all().await` on that file (instead of synchronous `mmap.flush()`), so
+flush/roll do not block the shard runtime thread.
 
 **Sealed segments — read-only `Mmap`:**
 
 When a segment is rolled (finalized), the index lifecycle is:
 
-1. Flush the `MmapMut` and drop it.
-2. Truncate the `.idx` file from its pre-allocated size to the actual written
+1. `sync_all()` the active `.idx` file.
+2. Drop the active `MmapMut`.
+3. Truncate the `.idx` file from its pre-allocated size to the actual written
    size (`active_idx_write_pos` bytes).
-3. Re-open and memory-map read-only (`Mmap`) for the now-sealed segment.
+4. Re-open and memory-map read-only (`Mmap`) for the now-sealed segment.
 
 Sealed index mmaps remain mapped for the lifetime of the segment. They are
 unmapped (dropped) before the segment files are deleted during eviction.
@@ -366,9 +369,13 @@ same file through the kernel page cache.
 
 ### Flush
 
-`flush()` calls `log_file.sync_all().await` (async `fsync` via io_uring) on the
-active segment's `.log` file, and `mmap.flush()` (sync) on the active segment's
-`.idx` mmap.
+`flush()` calls async `sync_all().await` on both active files:
+
+- the active segment's `.log` file
+- the active segment's `.idx` file (whose dirty pages come from `MmapMut` writes)
+
+Both syncs run through compio/io_uring and avoid synchronous `mmap.flush()`
+inside async shard code.
 
 **Durability guarantee:** same as Kafka — data survives process crashes (data is
 in the kernel page cache) but not power loss without fsync. The existing flush
@@ -386,12 +393,13 @@ After write completes:
 │   ├─ No  → done
 │   └─ Yes → roll:
 │       1. Close active .log file handle
-│       2. Flush active .idx MmapMut and drop the mapping
-│       3. Truncate .idx from pre-allocated size to actual written size
-│       4. Re-open .idx as read-only Mmap (now a sealed segment)
-│       5. Create new .log file (named after next seq to be written)
-│       6. Pre-allocate new .idx to max capacity and MmapMut it
-│       7. New segment becomes the active segment
+│       2. sync_all() active .idx file
+│       3. Drop active .idx MmapMut
+│       4. Truncate .idx from pre-allocated size to actual written size
+│       5. Re-open .idx as read-only Mmap (now a sealed segment)
+│       6. Create new .log file (named after next seq to be written)
+│       7. Pre-allocate new .idx to max capacity and MmapMut it
+│       8. New segment becomes the active segment
 ```
 
 ## Read Path

@@ -290,6 +290,11 @@ struct Inner {
   /// Open file handle for the active (latest) segment's .log.
   active_log: Option<compio::fs::File>,
 
+  /// Open file handle for the active segment's pre-allocated `.idx` file.
+  /// Kept open so flushes can use async `sync_all()` instead of blocking
+  /// `mmap.flush()` on the shard runtime thread.
+  active_idx_file: Option<compio::fs::File>,
+
   /// Read-write mmap of the active segment's pre-allocated `.idx` file.
   /// Entries are written directly into this mapping, Kafka-style.
   active_idx_mmap: Option<MmapMut>,
@@ -334,6 +339,7 @@ impl FileMessageLog {
       segment_max_bytes,
       segments: Vec::new(),
       active_log: None,
+      active_idx_file: None,
       active_idx_mmap: None,
       active_idx_write_pos: 0,
       bytes_since_index: 0,
@@ -449,6 +455,7 @@ impl Inner {
         // SAFETY: Single-threaded shard actor; no concurrent access. The active index
         // file is only written to through this mmap.
         if let Ok(mmap) = unsafe { MmapMut::map_mut(&idx_file) } {
+          self.active_idx_file = Some(idx_file);
           self.active_idx_mmap = Some(mmap);
           self.active_idx_write_pos = actual_size;
         }
@@ -707,6 +714,7 @@ impl Inner {
     // SAFETY: Single-threaded shard actor; no concurrent access. The active index
     // file is only written to through this mmap.
     self.active_idx_mmap = Some(unsafe { MmapMut::map_mut(&idx_file)? });
+    self.active_idx_file = Some(idx_file);
     self.active_idx_write_pos = 0;
 
     self.segments.push(SegmentInfo { first_seq, last_seq: 0, file_size: 0, idx_mmap: None });
@@ -719,20 +727,22 @@ impl Inner {
     // Close the log file handle.
     self.active_log = None;
 
-    // Flush the active index mmap, drop it, then truncate the file to its
-    // actual size and remap as a read-only Mmap for the sealed segment.
+    // Sync the active index file, drop the writable mapping, truncate the file
+    // to its actual size, then remap as a read-only Mmap for the sealed segment.
     let write_pos = self.active_idx_write_pos;
-    if let Some(mmap) = self.active_idx_mmap.take() {
-      let _ = mmap.flush();
-      drop(mmap);
+    if let Some(ref idx_file) = self.active_idx_file {
+      idx_file.sync_all().await?;
     }
+    self.active_idx_mmap = None;
+
+    if let Some(ref idx_file) = self.active_idx_file {
+      idx_file.set_len(write_pos as u64).await?;
+      idx_file.sync_all().await?;
+    }
+    self.active_idx_file = None;
 
     if let Some(seg) = self.segments.last() {
       let idx_path = self.channel_dir.join(format!("{:020}.{INDEX_EXT}", seg.first_seq));
-      // Truncate the pre-allocated file to the actual written size.
-      if let Ok(f) = compio::fs::OpenOptions::new().write(true).open(&idx_path).await {
-        let _ = f.set_len(write_pos as u64).await;
-      }
       let mmap = Self::mmap_index(&idx_path).await;
       self.segments.last_mut().unwrap().idx_mmap = mmap;
     }
@@ -875,6 +885,7 @@ impl MessageLog for FileMessageLog {
 
     // Close active handles and drop the active index mmap.
     inner.active_log = None;
+    inner.active_idx_file = None;
     inner.active_idx_mmap = None;
     inner.active_idx_write_pos = 0;
 
@@ -907,8 +918,12 @@ impl MessageLog for FileMessageLog {
     if let Some(ref log_file) = inner.active_log {
       log_file.sync_all().await?;
     }
-    if let Some(ref mmap) = inner.active_idx_mmap {
-      mmap.flush()?;
+    if inner.active_idx_mmap.is_some() {
+      let idx_file = inner
+        .active_idx_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("active index mmap is present without an active index file handle"))?;
+      idx_file.sync_all().await?;
     }
 
     Ok(())
