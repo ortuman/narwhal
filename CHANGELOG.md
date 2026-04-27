@@ -4,6 +4,8 @@ All notable changes to Narwhal will be documented in this file.
 
 ## Unreleased
 
+* [BUGFIX]: Avoid blocking shard runtimes on message-log index flush by replacing synchronous `mmap.flush()` with async `.idx` file `sync_all()`. [#249](https://github.com/lonewolf-io/narwhal/pull/249)
+
 ## 0.6.0 (2026-04-20)
 
 * [CHANGE]: Migrate async runtime from monoio to compio (io_uring). [#212](https://github.com/lonewolf-io/narwhal/pull/212)
