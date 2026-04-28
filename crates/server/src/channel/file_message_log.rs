@@ -281,6 +281,11 @@ struct Inner {
   /// Channel directory path.
   channel_dir: PathBuf,
 
+  /// Maximum payload size accepted by `append`. Entries with a larger payload
+  /// would not fit in the read-side `EntryReader::body` buffer, so we reject
+  /// them at the write boundary.
+  max_payload_size: u32,
+
   /// Maximum segment file size before rolling to a new segment.
   segment_max_bytes: u64,
 
@@ -336,6 +341,7 @@ impl FileMessageLog {
   ) -> Self {
     let mut inner = Inner {
       channel_dir,
+      max_payload_size,
       segment_max_bytes,
       segments: Vec::new(),
       active_log: None,
@@ -831,6 +837,17 @@ impl MessageLog for FileMessageLog {
     let timestamp = params.timestamp;
     let from = params.from.as_ref().as_bytes();
     let payload_bytes = payload.as_slice();
+
+    // Reject oversized entries before any state change. The read-side
+    // `EntryReader::body` buffer is sized for `NID_MAX_LENGTH + max_payload_size
+    // + CRC_SIZE`; anything larger would be unreadable on recovery and the
+    // segment tail would be silently truncated.
+    if from.len() > NID_MAX_LENGTH {
+      anyhow::bail!("from field too large: {} > {NID_MAX_LENGTH}", from.len());
+    }
+    if payload_bytes.len() > inner.max_payload_size as usize {
+      anyhow::bail!("payload too large: {} > {}", payload_bytes.len(), inner.max_payload_size);
+    }
 
     // Ensure we have an active segment.
     if inner.active_log.is_none() {
@@ -1456,6 +1473,61 @@ mod tests {
     assert_eq!(visitor.entries[0].payload.len(), 0);
     assert_eq!(visitor.entries[1].payload, b"short");
     assert_eq!(visitor.entries[2].payload.len(), 4096);
+  }
+
+  // ===== Size validation =====
+
+  #[compio::test]
+  async fn test_append_rejects_oversized_from() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = create_log(tmp.path()).await;
+
+    let oversized_from = "a".repeat(NID_MAX_LENGTH + 1);
+    let msg = make_message(&oversized_from, "!test@localhost", 1, 1000, 4);
+    let pool_buf = make_payload(b"data").await;
+    let err = log.append(&msg, &pool_buf, 100).await.unwrap_err();
+    assert!(err.to_string().contains("from field too large"), "unexpected error: {err}");
+
+    // Log state is unchanged: a subsequent valid append still uses seq 1.
+    assert_eq!(log.last_seq(), 0);
+    append_message(&log, 1, "alice@localhost", b"data", 100).await;
+    assert_eq!(log.last_seq(), 1);
+  }
+
+  #[compio::test]
+  async fn test_append_rejects_oversized_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = create_log(tmp.path()).await;
+
+    let oversized = vec![0xABu8; TEST_MAX_PAYLOAD_SIZE as usize + 1];
+    let msg = make_message("alice@localhost", "!test@localhost", 1, 1000, oversized.len() as u32);
+    let pool_buf = make_payload(&oversized).await;
+    let err = log.append(&msg, &pool_buf, 100).await.unwrap_err();
+    assert!(err.to_string().contains("payload too large"), "unexpected error: {err}");
+
+    // Log state is unchanged: a subsequent valid append still uses seq 1.
+    assert_eq!(log.last_seq(), 0);
+    append_message(&log, 1, "alice@localhost", b"data", 100).await;
+    assert_eq!(log.last_seq(), 1);
+  }
+
+  #[compio::test]
+  async fn test_append_accepts_max_sized_from_and_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = create_log(tmp.path()).await;
+
+    let max_from = "a".repeat(NID_MAX_LENGTH);
+    let max_payload = vec![0xCDu8; TEST_MAX_PAYLOAD_SIZE as usize];
+    let msg = make_message(&max_from, "!test@localhost", 1, 1000, max_payload.len() as u32);
+    let pool_buf = make_payload(&max_payload).await;
+    log.append(&msg, &pool_buf, 100).await.unwrap();
+    log.flush().await.unwrap();
+
+    let mut visitor = CollectingVisitor::new();
+    log.read(1, 10, &mut visitor).await.unwrap();
+    assert_eq!(visitor.entries.len(), 1);
+    assert_eq!(visitor.entries[0].from.len(), NID_MAX_LENGTH);
+    assert_eq!(visitor.entries[0].payload.len(), TEST_MAX_PAYLOAD_SIZE as usize);
   }
 
   // ===== Delete =====
