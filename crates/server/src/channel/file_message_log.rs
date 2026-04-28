@@ -529,7 +529,10 @@ impl Inner {
   /// - the first entry is `(relative_seq=0, offset=0)` (entry-0 rule),
   /// - both `relative_seq` and `offset` are strictly monotonically increasing
   ///   across consecutive entries,
-  /// - the last entry's `offset` is strictly less than `log_file_size`.
+  /// - the last entry's `offset` leaves room for at least one full entry
+  ///   header in the `.log` file (i.e. `offset + ENTRY_HEADER_SIZE <=
+  ///   log_file_size`); otherwise an indexed read at that offset would fail
+  ///   `EntryReader`'s remaining-bytes check anyway.
   ///
   /// Returns `false` if the file is missing, malformed, or fails any check.
   async fn looks_like_valid_index(idx_path: &Path, log_file_size: u64, idx_capacity: u64) -> bool {
@@ -574,8 +577,9 @@ impl Inner {
       prev_offset = offset;
     }
 
-    // After the loop `prev_offset` is the last entry's offset.
-    prev_offset < log_file_size
+    // After the loop `prev_offset` is the last entry's offset. It must point
+    // at a position where a full entry header fits in the .log file.
+    prev_offset.saturating_add(ENTRY_HEADER_SIZE as u64) <= log_file_size
   }
 
   /// Compute bytes written since the last index entry for the active segment.
@@ -2068,6 +2072,61 @@ mod tests {
     let _log = create_log(tmp.path()).await;
     let after = std::fs::read(&sealed_idx_path).unwrap();
     assert_ne!(after, bad_idx, "non-monotonic .idx should have been rebuilt");
+  }
+
+  #[compio::test]
+  async fn test_recovery_rebuilds_sealed_index_when_last_offset_no_room_for_header() {
+    // Regression for the tightened bound `offset + ENTRY_HEADER_SIZE <=
+    // log_file_size`. An offset that is < log_file_size but leaves no room
+    // for a full entry header passes the older `< log_file_size` check, but
+    // EntryReader::read_at would fail at runtime. The new bound rejects the
+    // index; recovery rebuilds it so reads still work.
+    let tmp = tempfile::tempdir().unwrap();
+    {
+      let log = create_log_with_segment_max(tmp.path(), 256).await;
+      for seq in 1..=20 {
+        let payload = format!("msg_{seq:03}");
+        append_message(&log, seq, "alice@localhost", payload.as_bytes(), 10_000).await;
+      }
+      log.flush().await.unwrap();
+    }
+
+    let channel_dir = {
+      let hash = channel_hash(&StringAtom::from("test_channel"));
+      tmp.path().join(hash.as_ref())
+    };
+
+    let mut log_files: Vec<_> = std::fs::read_dir(&channel_dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .filter(|e| e.path().extension().is_some_and(|ext| ext == SEGMENT_EXT))
+      .collect();
+    log_files.sort_by_key(|e| e.file_name());
+    assert!(log_files.len() >= 2);
+    let sealed_log_path = log_files[0].path();
+    let sealed_idx_path = sealed_log_path.with_extension(INDEX_EXT);
+    let sealed_log_size = std::fs::metadata(&sealed_log_path).unwrap().len();
+    assert!(
+      sealed_log_size > ENTRY_HEADER_SIZE as u64,
+      "test assumes the sealed segment holds at least one full entry"
+    );
+
+    // Two valid-looking entries (monotonic, in-range), but the second's
+    // offset is the smallest value that's `< log_size` while still failing
+    // `+ ENTRY_HEADER_SIZE <= log_size`. Derive it from `ENTRY_HEADER_SIZE`
+    // so the test stays correct if the header layout ever changes.
+    let bad_offset = sealed_log_size - ENTRY_HEADER_SIZE as u64 + 1;
+    let mut bad_idx = Vec::with_capacity(2 * INDEX_ENTRY_SIZE);
+    bad_idx.extend_from_slice(&0u32.to_le_bytes());
+    bad_idx.extend_from_slice(&0u64.to_le_bytes());
+    bad_idx.extend_from_slice(&1u32.to_le_bytes());
+    bad_idx.extend_from_slice(&bad_offset.to_le_bytes());
+    std::fs::write(&sealed_idx_path, &bad_idx).unwrap();
+
+    // Recovery must rebuild this index.
+    let _log = create_log(tmp.path()).await;
+    let after = std::fs::read(&sealed_idx_path).unwrap();
+    assert_ne!(after, bad_idx, ".idx whose last offset leaves no room for a header should have been rebuilt");
   }
 
   #[compio::test]

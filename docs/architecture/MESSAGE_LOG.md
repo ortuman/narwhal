@@ -554,7 +554,8 @@ start of recovery and reused across all segments to avoid per-segment allocation
    file size is not a multiple of INDEX_ENTRY_SIZE, the first entry is not
    `(relative_seq=0, offset=0)` (entry-0 rule), `relative_seq` or `offset` is
    not strictly monotonically increasing across consecutive entries, or the
-   last entry's offset is not strictly less than the .log file size. Subtle
+   last entry's offset does not leave room for a full entry header in the
+   `.log` file (i.e. `offset + ENTRY_HEADER_SIZE > log_file_size`). Subtle
    corruption (e.g. a wrong middle-entry offset that lies inside the .log
    while still preserving monotonicity) is not detected by these checks. A
    bad but in-range offset can cause an indexed read to start at the wrong
@@ -567,13 +568,18 @@ start of recovery and reused across all segments to avoid per-segment allocation
 3. For the active (last) segment:
    ├─ Scan forward with EntryReader, validating CRC32 per entry
    ├─ Truncate at the first invalid/partial entry (file.set_len().await)
-   ├─ Rebuild .idx from valid entries (reusing index buffer)
-   ├─ Compute bytes_since_index: read the last index entry to find its offset,
-   │   scan forward from there to count bytes written after it, so the index
-   │   interval resumes correctly on the next append
-   ├─ Open .log for writes (positioned I/O at seg.file_size)
-   ├─ Extend .idx to pre-allocated capacity
-   └─ Memory-map read-write (MmapMut), set write_pos to actual index size
+   ├─ If the scan yielded zero valid entries → delete `.log` + `.idx` and
+   │   skip the open-for-append step below. The next `append()` falls
+   │   through `Inner::create_segment` and creates a fresh segment named
+   │   after that entry's seq. Sealed segments are unaffected.
+   ├─ Otherwise:
+   │   ├─ Rebuild .idx from valid entries (reusing index buffer)
+   │   ├─ Compute bytes_since_index: read the last index entry to find its offset,
+   │   │   scan forward from there to count bytes written after it, so the index
+   │   │   interval resumes correctly on the next append
+   │   ├─ Open .log for writes (positioned I/O at seg.file_size)
+   │   ├─ Extend .idx to pre-allocated capacity
+   │   └─ Memory-map read-write (MmapMut), set write_pos to actual index size
 
 4. Empty/zero-byte .log files → delete (compio::fs::remove_file().await)
 
