@@ -547,8 +547,23 @@ start of recovery and reused across all segments to avoid per-segment allocation
    │   Segments with zero valid entries are deleted.
    ├─ .idx looks valid? → memory-map read-only (Mmap)
    └─ .idx missing or visibly corrupt? → rebuild by scanning .log with
-   │                   EntryReader, write index via write_all_at, then
-   │                   mmap read-only
+   │                   EntryReader, then atomically replace the `.idx`:
+   │                   write to a `<first_seq>.tmp` sibling, `sync_all`
+   │                   the temp file, close it, and rename it onto
+   │                   `<first_seq>.idx`. After a successful rename, the
+   │                   parent directory is `sync_all`'d on a best-effort
+   │                   basis so the rename itself is durable across a
+   │                   crash; if that fsync fails the `.idx` content is
+   │                   still fully written, the next recovery just
+   │                   re-validates it. On any failure before the rename
+   │                   succeeds (including failure to open the `.log`,
+   │                   read its metadata, or create the temp file) both
+   │                   the temp (if any) and the existing `.idx` are
+   │                   removed so the read path falls back to a
+   │                   full-segment scan instead of trusting a partial
+   │                   or stale index. Mid-rebuild crashes leave either
+   │                   the previous `.idx` intact or the new one in
+   │                   place, never a half-written file.
 
    "Visibly corrupt" means any of: file size falls outside `(0, idx_capacity]`,
    file size is not a multiple of INDEX_ENTRY_SIZE, the first entry is not

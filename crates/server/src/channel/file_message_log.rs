@@ -710,6 +710,16 @@ impl Inner {
   }
 
   /// Rebuild the .idx file by scanning the .log file.
+  ///
+  /// The buffer is built in-memory, written to a temp sibling
+  /// (`<first_seq>.tmp`), fsync'd, and then atomically renamed to
+  /// `<first_seq>.idx`. A crash mid-rebuild leaves either the previous
+  /// `.idx` intact (if the rename hasn't happened yet) or the new one in
+  /// place (if it has) — never a half-written `.idx`. On failure both the
+  /// temp file and the existing `.idx` are removed, so the read path falls
+  /// back to scanning the segment from the start (`mmap_index` will return
+  /// `None`) instead of trusting a stale or partial index.
+  ///
   /// Reuses the caller-provided `idx_buf` to avoid per-call allocation.
   async fn rebuild_index(
     log_path: &Path,
@@ -718,13 +728,29 @@ impl Inner {
     reader: &mut EntryReader,
     idx_buf: &mut Vec<u8>,
   ) {
+    // Helper: drop the existing .idx and (if present) the temp sibling so
+    // mmap_index returns None on the next call and reads fall back to a
+    // full-segment scan rather than trusting a stale or partial index.
+    async fn drop_indexes(idx_path: &Path, tmp_path: Option<&Path>) {
+      if let Some(tmp) = tmp_path {
+        let _ = compio::fs::remove_file(tmp).await;
+      }
+      let _ = compio::fs::remove_file(idx_path).await;
+    }
+
     let file = match compio::fs::File::open(log_path).await {
       Ok(f) => f,
-      Err(_) => return,
+      Err(_) => {
+        drop_indexes(idx_path, None).await;
+        return;
+      },
     };
     let file_size = match file.metadata().await {
       Ok(m) => m.len(),
-      Err(_) => return,
+      Err(_) => {
+        drop_indexes(idx_path, None).await;
+        return;
+      },
     };
 
     idx_buf.clear();
@@ -750,21 +776,60 @@ impl Inner {
       pos += reader.entry_size;
     }
 
-    // Write the complete index in a single positioned write.
-    let idx_file = match compio::fs::File::create(idx_path).await {
+    // Write to a temp sibling, fsync, close, rename, then fsync the parent
+    // directory so the rename itself is durable across crashes. The previous
+    // `.idx` (if any) stays on disk untouched until the rename succeeds.
+    // Closing before rename avoids cross-platform issues (Windows can't
+    // rename an open file).
+    let tmp_path = idx_path.with_extension("tmp");
+    let tmp_file = match compio::fs::File::create(&tmp_path).await {
       Ok(f) => f,
-      Err(_) => return,
+      Err(_) => {
+        // A stale `<first_seq>.tmp` from a prior crashed run may still be on
+        // disk; clean it up so it doesn't accumulate over time.
+        drop_indexes(idx_path, Some(&tmp_path)).await;
+        return;
+      },
     };
+
     let buf = std::mem::take(idx_buf);
-    let mut file_ref = &idx_file;
+    let mut file_ref = &tmp_file;
     let BufResult(result, buf) = file_ref.write_all_at(buf, 0).await;
     *idx_buf = buf;
     if result.is_err() {
-      let _ = std_fs::remove_file(idx_path);
+      // Close before unlinking — Windows can't remove an open file.
+      let _ = tmp_file.close().await;
+      drop_indexes(idx_path, Some(&tmp_path)).await;
       return;
     }
-    if idx_file.sync_all().await.is_err() {
-      let _ = std_fs::remove_file(idx_path);
+
+    if tmp_file.sync_all().await.is_err() {
+      let _ = tmp_file.close().await;
+      drop_indexes(idx_path, Some(&tmp_path)).await;
+      return;
+    }
+
+    // `close` consumes `tmp_file`; from here on it can't be referenced again.
+    if tmp_file.close().await.is_err() {
+      drop_indexes(idx_path, Some(&tmp_path)).await;
+      return;
+    }
+
+    if compio::fs::rename(&tmp_path, idx_path).await.is_err() {
+      drop_indexes(idx_path, Some(&tmp_path)).await;
+      return;
+    }
+
+    // Best-effort: fsync the parent directory so the rename is durable
+    // across a crash. Failure here only affects post-crash visibility of
+    // the rename — the file contents are fully written and the next
+    // recovery validates the index regardless. Close the handle explicitly
+    // to avoid leaking a file descriptor.
+    if let Some(parent) = idx_path.parent()
+      && let Ok(dir_file) = compio::fs::File::open(parent).await
+    {
+      let _ = dir_file.sync_all().await;
+      let _ = dir_file.close().await;
     }
   }
 
@@ -2176,6 +2241,64 @@ mod tests {
     assert_eq!(count, 5);
     assert_eq!(visitor.entries[0].seq, 2, "fall-through to active_idx_mmap dropped segment 0 reads");
     assert_eq!(visitor.entries[0].payload, b"msg_002");
+  }
+
+  #[compio::test]
+  async fn test_rebuild_index_uses_atomic_rename() {
+    // The rebuild path writes through a `.tmp` sibling and renames it to the
+    // final `.idx`. After a successful rebuild the `.tmp` must not be left
+    // on disk, and a stale `.tmp` from a prior crashed run must not prevent
+    // the new rebuild from succeeding.
+    let tmp = tempfile::tempdir().unwrap();
+    {
+      let log = create_log_with_segment_max(tmp.path(), 256).await;
+      for seq in 1..=20 {
+        let payload = format!("msg_{seq:03}");
+        append_message(&log, seq, "alice@localhost", payload.as_bytes(), 10_000).await;
+      }
+      log.flush().await.unwrap();
+    }
+
+    let channel_dir = {
+      let hash = channel_hash(&StringAtom::from("test_channel"));
+      tmp.path().join(hash.as_ref())
+    };
+
+    // Pick the first sealed segment, corrupt its .idx, and plant a stale
+    // .tmp from a prior run at the path the rebuild would use.
+    let mut log_files: Vec<_> = std::fs::read_dir(&channel_dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .filter(|e| e.path().extension().is_some_and(|ext| ext == SEGMENT_EXT))
+      .collect();
+    log_files.sort_by_key(|e| e.file_name());
+    assert!(log_files.len() >= 2);
+    let sealed_log_path = log_files[0].path();
+    let sealed_idx_path = sealed_log_path.with_extension(INDEX_EXT);
+    let stale_tmp_path = sealed_log_path.with_extension("tmp");
+
+    // Corrupt the .idx so recovery triggers a rebuild.
+    let mut bad_idx = Vec::with_capacity(INDEX_ENTRY_SIZE);
+    bad_idx.extend_from_slice(&0u32.to_le_bytes());
+    bad_idx.extend_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(&sealed_idx_path, &bad_idx).unwrap();
+    std::fs::write(&stale_tmp_path, b"junk left over from a prior crash").unwrap();
+
+    // Recovery should rebuild the .idx atomically.
+    let _log = create_log(tmp.path()).await;
+
+    // The rebuild produced a valid .idx (different from the bogus content).
+    let after = std::fs::read(&sealed_idx_path).unwrap();
+    assert_ne!(after, bad_idx, ".idx should have been rebuilt");
+
+    // No .tmp files should be left in the channel directory after a
+    // successful rebuild — the rename consumes the temp file.
+    let tmp_files: Vec<_> = std::fs::read_dir(&channel_dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
+      .collect();
+    assert!(tmp_files.is_empty(), "leftover .tmp files: {tmp_files:?}");
   }
 
   // ===== Factory =====
