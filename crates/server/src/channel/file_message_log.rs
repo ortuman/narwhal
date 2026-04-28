@@ -782,7 +782,8 @@ impl Inner {
     // (`mmap_index` returns `None`) instead of trusting a stale index.
     let tmp_path = idx_path.with_extension("tmp");
     let buf = std::mem::take(idx_buf);
-    let (result, buf) = crate::util::file::atomic_write(idx_path, &tmp_path, buf).await;
+    let (result, buf) =
+      crate::util::file::atomic_write(idx_path, &tmp_path, buf, crate::util::file::DirSync::BestEffort).await;
     *idx_buf = buf;
     if result.is_err() {
       drop_indexes(idx_path, Some(&tmp_path)).await;

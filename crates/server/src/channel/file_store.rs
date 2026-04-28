@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use narwhal_util::string_atom::StringAtom;
 
 use super::store::{ChannelStore, PersistedChannel};
-use crate::util::file::atomic_write;
+use crate::util::file::{DirSync, atomic_write};
 
 const METADATA_FILE: &str = "metadata.bin";
 const METADATA_TMP_FILE: &str = "metadata.bin.tmp";
@@ -54,7 +54,7 @@ impl ChannelStore for FileChannelStore {
     let data = postcard::to_allocvec(channel)?;
     let final_path = dir.join(METADATA_FILE);
     let tmp_path = dir.join(METADATA_TMP_FILE);
-    let (result, _) = atomic_write(&final_path, &tmp_path, data).await;
+    let (result, _) = atomic_write(&final_path, &tmp_path, data, DirSync::Strict).await;
     result?;
     Ok(hash)
   }
