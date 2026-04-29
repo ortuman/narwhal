@@ -268,6 +268,13 @@ zero-filled pre-allocated tail.
 pub trait MessageLog: 'static {
     /// Append a message and its payload to the log.
     /// When message count exceeds `max_messages`, oldest segments are evicted.
+    ///
+    /// **Caller-contract validation:** `append` rejects (with `Err`) any
+    /// message whose `seq` is `0` (the empty-log sentinel) or `<= last_seq()`
+    /// (non-strictly-monotonic). These cases would silently corrupt the
+    /// log's in-memory `first_seq`/`last_seq` tracking and the sparse
+    /// index's monotonicity invariant respectively, so they are surfaced
+    /// loudly rather than persisted.
     async fn append(
         &self,
         message: &Message,
@@ -311,7 +318,9 @@ pub trait MessageLog: 'static {
         from_seq: u64,
         limit: u32,
         visitor: &mut impl LogVisitor,
-    ) -> anyhow::Result<u32>;
+    ) -> anyhow::Result<u32>
+    where
+        Self: Sized;
 }
 ```
 
@@ -357,10 +366,28 @@ to the transmitter, channel name, `history_id`, and the payload pool:
 │                                                            │
 │  For each LogEntry:                                        │
 │    1. Construct Message::Message { history_id, ... }       │
-│    2. Copy payload into PoolBuffer (no heap alloc)         │
+│       — decodes `from` as UTF-8 to a StringAtom and        │
+│         clones channel/history_id atoms                    │
+│    2. Copy payload into a pooled buffer via                │
+│       `Pool::acquire_buffer` — no heap allocation on the   │
+│       payload path                                         │
 │    3. Call transmitter.send_message_with_payload()         │
 └────────────────────────────────────────────────────────────┘
 ```
+
+The "no heap allocation" guarantee applies to the **payload** path — the
+`PoolBuffer` is recycled across reads. The frame header path still allocates
+small `StringAtom`s (decoding `from`, cloning `channel` and `history_id`) per
+entry; those allocations are intentional and bounded.
+
+If `entry.from` contains bytes that are not valid UTF-8 (only possible if a
+corrupt entry passes CRC validation, e.g. across a binary-format change),
+`std::str::from_utf8` returns an error. The visitor propagates it, `read()`
+returns `Err`, and `ChannelShard::history()` exits *before* sending
+`HistoryAck` — the client receives no `HISTORY_ACK` for that request and must
+treat the in-flight `MESSAGE` frames already received as the truncated
+result. Operators should treat repeated UTF-8 decode errors as a signal of
+on-disk corruption.
 
 ### MessageLogFactory
 
@@ -368,15 +395,18 @@ to the transmitter, channel name, `history_id`, and the payload pool:
 #[async_trait(?Send)]
 pub trait MessageLogFactory: Clone + Send + Sync + 'static {
     type Log: MessageLog;
-    async fn create(&self, handler: &StringAtom) -> Self::Log;
+    async fn create(&self, handler: &StringAtom) -> anyhow::Result<Self::Log>;
 }
 ```
 
 The factory holds `base_dir` and `max_payload_size` at construction time.
 `create()` is async because it performs recovery (scanning segment files,
-validating CRC checksums, rebuilding indexes) using `compio::fs` I/O. It
-derives the channel directory using the shared SHA-256 path utility (same as
-`FileChannelStore`).
+validating CRC checksums, rebuilding indexes) using `compio::fs` I/O — and
+it returns `anyhow::Result<Self::Log>` because that recovery may fail (e.g.
+unable to open the active segment for writes or memory-map its index, see
+[Recovery](#recovery)). On `Err`, callers refuse to bring the affected
+channel online; other channels keep running. It derives the channel
+directory using the shared SHA-256 path utility (same as `FileChannelStore`).
 
 ## Write Path
 
@@ -437,13 +467,14 @@ After write completes:
 │   ├─ No  → done
 │   └─ Yes → roll:
 │       1. Close active .log file handle
-│       2. sync_all() active .idx file
+│       2. sync_all() active .idx file (flushes MmapMut-dirtied pages)
 │       3. Drop active .idx MmapMut
 │       4. Truncate .idx from pre-allocated size to actual written size
-│       5. Re-open .idx as read-only Mmap (now a sealed segment)
-│       6. Create new .log file (named after next seq to be written)
-│       7. Pre-allocate new .idx to max capacity and MmapMut it
-│       8. New segment becomes the active segment
+│       5. sync_all() active .idx file again so the truncation itself is durable
+│       6. Re-open .idx as read-only Mmap (now a sealed segment)
+│       7. Create new .log file (named after next seq to be written)
+│       8. Pre-allocate new .idx to max capacity and MmapMut it
+│       9. New segment becomes the active segment
 ```
 
 ## Read Path
@@ -457,7 +488,10 @@ To read from `from_seq`:
    whose first_seq <= from_seq
 
 2. Binary search the segment's .idx for the largest
-   relative_seq <= (from_seq - segment_base_seq)
+   relative_seq <= (from_seq - segment_base_seq).
+   If no such entry exists (empty or malformed index, which the entry-0
+   rule normally prevents), fall back to offset 0 — correctness is
+   preserved at the cost of a full-segment scan.
 
 3. Start positioned reads at the offset from the index entry
 
@@ -549,8 +583,10 @@ Eviction is **count-based**, driven by `max_persist_messages`.
 ```
 After each append:
 │
-├─ If max_persist_messages == 0 → skip eviction (no retention limit)
+├─ If max_persist_messages == 0 OR the log is empty → skip eviction
+│   (no retention limit, or nothing to retain)
 ├─ Compute logical first_seq = last_seq - max_persist_messages + 1
+│   (saturating at 0 when max_persist_messages > last_seq)
 ├─ For each sealed segment (oldest first; the active segment is never evicted):
 │   └─ Is segment's last_seq < logical first_seq?
 │       ├─ Yes → delete .log + .idx, update in-memory segment list
@@ -691,10 +727,10 @@ Client                        Server (ChannelShard)
   │  history_id=h1 from_seq=50    │
   │  limit=10                     │
   │──────────────────────────────►│
+  │                               ├─ Clamp limit to max_history_limit
+  │                               │
   │                               ├─ Validate: local domain, channel exists,
   │                               │   membership, read ACL, persistence enabled
-  │                               │
-  │                               ├─ Clamp limit to max_history_limit
   │                               │
   │                               ├─ message_log.read(from_seq, limit, &mut visitor)
   │                               │     │
@@ -765,20 +801,27 @@ no concurrent read/write access to a channel's message log.
 
 ## Testing
 
-Integration tests live in `crates/server/tests/c2s_channel_persistence.rs`.
+Tests are split between **unit tests** (low-level log mechanics, including
+CRC validation and recovery) inline in `crates/server/src/channel/file_message_log.rs`
+and **integration tests** (end-to-end client/server flows like HISTORY round-trip
+and survives_restart) in `crates/server/tests/c2s_channel_persistence.rs` and
+`crates/server/tests/c2s_channel_persistence_failure.rs`.
 
-**Test categories:**
+**Test categories and where they live:**
 
-| Category | What it verifies |
-|----------|-----------------|
-| Append + read | Single entry, multiple entries, round-trip correctness |
-| Sparse index | Binary search finds the correct offset |
-| Segment roll | Cross-segment reads return continuous data |
-| Eviction | Segment deletion when all messages fall outside retention |
-| Seq tracking | `first_seq` / `last_seq` correctness through append and eviction |
-| CRC validation | Corrupt entries detected, partial writes rejected |
-| Recovery | Truncation at corrupt tail, index rebuild from log |
-| Edge cases | Empty log, `from_seq` beyond `last_seq`, single-entry segments |
+| Category | Layer | What it verifies |
+|----------|-------|-----------------|
+| Append + read | unit | Single entry, multiple entries, round-trip correctness |
+| Sparse index | unit | Binary search finds the correct offset |
+| Segment roll | unit | Cross-segment reads return continuous data |
+| Eviction | unit | Segment deletion when all messages fall outside retention |
+| Seq tracking | unit + integration | `first_seq` / `last_seq` correctness through append, eviction, restart |
+| CRC validation | unit | Corrupt entries detected, partial writes rejected |
+| Recovery | unit | Truncation at corrupt tail, index rebuild from log, sealed-segment-not-promoted invariant |
+| Edge cases | unit | Empty log, `from_seq` beyond `last_seq`, single-entry segments, oversized append rejection |
+| HISTORY / CHAN_SEQ | integration | Wire-level round-trip including ACK frames |
+| Persistence toggling | integration | Turning persistence on/off mid-channel |
+| Append failure paths | integration | Broadcast/JOIN/SET_ACL/SET_CONFIG/LEAVE behavior when the store or message log fails |
 
 Tests use `tempfile::TempDir` for isolated file system state.
 
@@ -789,8 +832,9 @@ manager logic independently of persistence.
 
 | File | Purpose |
 |------|---------|
-| `crates/server/src/channel/file_message_log.rs` | `FileMessageLog` implementation |
-| `crates/server/src/channel/store.rs` | `MessageLog` and `MessageLogFactory` trait definitions |
+| `crates/server/src/channel/file_message_log.rs` | `FileMessageLog` implementation and unit tests |
+| `crates/server/src/channel/store.rs` | `MessageLog` and `MessageLogFactory` trait definitions; `NoopMessageLog` |
 | `crates/server/src/channel/file_store.rs` | `FileChannelStore` (shares path utility) |
-| `crates/server/src/channel/manager.rs` | `ChannelShard::history()` and `channel_seq()` integration |
-| `crates/server/tests/c2s_channel_persistence.rs` | Integration tests |
+| `crates/server/src/channel/manager.rs` | `ChannelShard::history()` and `channel_seq()` integration; `HistoryVisitor` |
+| `crates/server/tests/c2s_channel_persistence.rs` | Integration tests (HISTORY/CHAN_SEQ wire flows, restart) |
+| `crates/server/tests/c2s_channel_persistence_failure.rs` | Integration tests for store/append failure paths |
