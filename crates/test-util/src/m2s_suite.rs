@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_broadcast;
-use narwhal_common::runtime::TcpStream;
+use compio::net::TcpStream;
 
 use narwhal_common::core_dispatcher::CoreDispatcher;
 use narwhal_modulator::{M2sListener, OutboundPrivatePayload};

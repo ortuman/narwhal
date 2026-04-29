@@ -20,7 +20,7 @@ async fn test_m2s_connect_timeout() -> anyhow::Result<()> {
   let mut socket = suite.socket_connect().await?;
 
   // Wait for the connection to timeout.
-  narwhal_common::runtime::sleep(Duration::from_millis(250)).await;
+  compio::runtime::time::sleep(Duration::from_millis(250)).await;
 
   // Verify that the connection timed out and the server sent an error message.
   assert_message!(
@@ -52,13 +52,13 @@ async fn test_m2s_ping_timeout() -> anyhow::Result<()> {
   let mut conn = suite.connect(None).await?;
 
   // Wait until ping is received.
-  narwhal_common::runtime::sleep(Duration::from_millis(150)).await;
+  compio::runtime::time::sleep(Duration::from_millis(150)).await;
 
   let ping_msg = conn.read_message().await?;
   assert!(matches!(ping_msg, Message::Ping { .. }));
 
   // Wait for keep-alive timeout.
-  narwhal_common::runtime::sleep(Duration::from_millis(200)).await;
+  compio::runtime::time::sleep(Duration::from_millis(200)).await;
 
   // Verify that the server sent the proper error message.
   assert_message!(
@@ -180,7 +180,7 @@ async fn test_m2s_mod_direct_message() -> anyhow::Result<()> {
 
   // Verify the payload was broadcast to the channel
   let mut recv = std::pin::pin!(payload_rx.recv().fuse());
-  let mut timeout = std::pin::pin!(narwhal_common::runtime::sleep(Duration::from_millis(100)).fuse());
+  let mut timeout = std::pin::pin!(compio::runtime::time::sleep(Duration::from_millis(100)).fuse());
 
   futures::select! {
     result = recv => {

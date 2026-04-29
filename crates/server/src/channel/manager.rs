@@ -458,12 +458,12 @@ impl<ML: MessageLog> Channel<ML> {
     let interval = std::time::Duration::from_millis(interval_ms as u64);
     let metrics = metrics.clone();
 
-    narwhal_common::runtime::spawn_detached(async move {
+    compio::runtime::spawn(async move {
       use futures::FutureExt;
 
       loop {
         futures::select! {
-          _ = narwhal_common::runtime::sleep(interval).fuse() => {},
+          _ = compio::runtime::time::sleep(interval).fuse() => {},
           _ = cancel_rx.recv().fuse() => break,
         }
         let start = Instant::now();
@@ -473,7 +473,8 @@ impl<ML: MessageLog> Channel<ML> {
           warn!(channel = %handler, error = %e, "periodic message log flush failed");
         }
       }
-    });
+    })
+    .detach();
 
     self.flush_cancel_tx = Some(cancel_tx);
   }

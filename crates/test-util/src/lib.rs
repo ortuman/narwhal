@@ -19,7 +19,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use narwhal_common::runtime;
 use narwhal_protocol::{Message, deserialize, serialize};
 use narwhal_util::pool::MutablePoolBuffer;
 
@@ -170,7 +169,7 @@ impl<S: compio::io::AsyncRead + compio::io::AsyncWrite> TestConn<S> {
   pub async fn try_read_message(&mut self, timeout: Duration) -> anyhow::Result<Option<Message>> {
     let reader = &mut self.reader;
 
-    let line = match runtime::timeout(timeout, reader.next()).await {
+    let line = match compio::runtime::time::timeout(timeout, reader.next()).await {
       Ok(Ok(true)) => reader.get_line().unwrap(),
       Ok(Ok(false)) => return Err(anyhow!("no message received")),
       Ok(Err(e)) => return Err(anyhow!("error reading from stream: {}", e)),
@@ -216,7 +215,7 @@ impl<S: compio::io::AsyncRead + compio::io::AsyncWrite> TestConn<S> {
   pub async fn expect_read_timeout(&mut self, timeout: Duration) -> anyhow::Result<()> {
     let reader = &mut self.reader;
 
-    match runtime::timeout(timeout, reader.next()).await {
+    match compio::runtime::time::timeout(timeout, reader.next()).await {
       Ok(Ok(true)) => Err(anyhow!("expected timeout, but received a message")),
       Ok(Ok(false)) => Err(anyhow!("no message received")),
       Ok(Err(e)) => Err(anyhow!("error reading from stream: {}", e)),

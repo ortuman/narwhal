@@ -5,7 +5,6 @@ use async_channel;
 use futures::{FutureExt, select};
 use tracing::warn;
 
-use narwhal_common::runtime;
 use narwhal_modulator::OutboundPrivatePayload;
 
 mod config;
@@ -49,7 +48,7 @@ pub fn route_m2s_private_payload(
 ) -> (narwhal_common::core_dispatcher::Task, async_channel::Sender<()>) {
   let (shutdown_tx, shutdown_rx) = async_channel::bounded::<()>(1);
 
-  let handle = runtime::spawn(route_loop(m2s_payload_rx, router, shutdown_rx));
+  let handle = compio::runtime::spawn(route_loop(m2s_payload_rx, router, shutdown_rx));
 
   (handle, shutdown_tx)
 }

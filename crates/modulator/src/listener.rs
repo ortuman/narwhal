@@ -6,14 +6,13 @@ use std::path::Path;
 
 use anyhow::anyhow;
 use async_channel::Sender;
-use narwhal_common::runtime::TcpListener;
+use compio::net::TcpListener;
 
 use futures::{FutureExt, select};
 use tracing::{error, info, trace, warn};
 
 use narwhal_common::conn::{ConnRuntime, Dispatcher, DispatcherFactory};
 use narwhal_common::core_dispatcher::CoreDispatcher;
-use narwhal_common::runtime;
 use narwhal_common::service::{M2sService, S2mService, Service};
 
 use prometheus_client::metrics::counter::Counter;
@@ -341,9 +340,10 @@ async fn run_tcp_accept_loop<D, DF, ST>(
             let conn_rt = conn_rt.clone();
             let dispatcher_factory = dispatcher_factory.clone();
 
-            runtime::spawn_detached(async move {
+            compio::runtime::spawn(async move {
               conn_rt.run_connection(tcp_stream, dispatcher_factory).await;
-            });
+            })
+            .detach();
           }
           Err(e) => {
             warn!(worker_id, error = ?e, service_type = ST::NAME, "TCP accept error");
@@ -393,9 +393,10 @@ async fn run_unix_accept_loop<D, DF, ST>(
             let conn_rt = conn_rt.clone();
             let dispatcher_factory = dispatcher_factory.clone();
 
-            runtime::spawn_detached(async move {
+            compio::runtime::spawn(async move {
               conn_rt.run_connection(unix_stream, dispatcher_factory).await;
-            });
+            })
+            .detach();
           }
           Err(e) => {
             warn!(error = ?e, service_type = ST::NAME, "Unix accept error");
@@ -461,12 +462,12 @@ fn create_plain_tcp_listener(addr: SocketAddr) -> anyhow::Result<std::net::TcpLi
   Ok(listener)
 }
 
-fn create_unix_listener(socket_path: &str) -> anyhow::Result<narwhal_common::runtime::UnixListener> {
+fn create_unix_listener(socket_path: &str) -> anyhow::Result<compio::net::UnixListener> {
   let std_listener = std::os::unix::net::UnixListener::bind(socket_path)
     .map_err(|e| anyhow!("failed to bind to Unix socket {}: {}", socket_path, e))?;
   std_listener.set_nonblocking(true)?;
 
-  let listener = narwhal_common::runtime::UnixListener::from_std(std_listener)
+  let listener = compio::net::UnixListener::from_std(std_listener)
     .map_err(|e| anyhow!("failed to wrap Unix listener: {}", e))?;
 
   Ok(listener)

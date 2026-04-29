@@ -36,7 +36,6 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 
 use crate::core_dispatcher::Task;
-use crate::runtime;
 use crate::service::Service;
 
 const SERVER_OVERLOADED_ERROR: &[u8] = b"ERROR reason=SERVER_OVERLOADED detail=\\\"max connections reached\\\"\n";
@@ -501,7 +500,7 @@ impl<ST: Service> ConnRuntime<ST> {
         break;
       }
 
-      runtime::sleep(SHUTDOWN_DRAIN_POLL_INTERVAL).await;
+      compio::runtime::time::sleep(SHUTDOWN_DRAIN_POLL_INTERVAL).await;
     }
 
     info!(service_type = ST::NAME, "connection runtime stopped");
@@ -760,8 +759,8 @@ impl<D: Dispatcher> Conn<D> {
     let task_slot = self.request_tasks.borrow().vacant_key();
     let request_tasks = self.request_tasks.clone();
 
-    let task = runtime::spawn(async move {
-      let timeout_future = runtime::timeout(request_timeout, future);
+    let task = compio::runtime::spawn(async move {
+      let timeout_future = compio::runtime::time::timeout(request_timeout, future);
       let mut timeout_future = std::pin::pin!(timeout_future.fuse());
       let mut cancelled = std::pin::pin!(cancellation_token.cancelled().fuse());
 
@@ -806,8 +805,8 @@ impl<D: Dispatcher> Conn<D> {
     let tx = self.tx.clone();
     let (cancel_tx, cancel_rx) = bounded::<()>(1);
 
-    runtime::spawn_detached(async move {
-      let mut sleep = std::pin::pin!(runtime::sleep(timeout).fuse());
+    compio::runtime::spawn(async move {
+      let mut sleep = std::pin::pin!(compio::runtime::time::sleep(timeout).fuse());
       let mut cancel = std::pin::pin!(cancel_rx.recv().fuse());
 
       futures::select! {
@@ -816,7 +815,8 @@ impl<D: Dispatcher> Conn<D> {
         },
         _ = cancel => {},
       }
-    });
+    })
+    .detach();
 
     self.scheduled_task = Some(cancel_tx);
   }
@@ -838,14 +838,14 @@ impl<D: Dispatcher> Conn<D> {
     // Create cancellation channel for the scheduled task
     let (cancel_tx, cancel_rx) = bounded::<()>(1);
 
-    runtime::spawn_detached(async move {
+    compio::runtime::spawn(async move {
       let cancel_rx = cancel_rx;
       let mut cancel = std::pin::pin!(cancel_rx.recv().fuse());
       let mut last_check_counter = activity_counter.get();
 
       loop {
         // Sleep with cancellation
-        let mut sleep = std::pin::pin!(runtime::sleep(heartbeat_interval).fuse());
+        let mut sleep = std::pin::pin!(compio::runtime::time::sleep(heartbeat_interval).fuse());
         futures::select! {
           _ = sleep => {},
           _ = cancel => break,
@@ -864,7 +864,8 @@ impl<D: Dispatcher> Conn<D> {
 
         // Wait for PONG or timeout, with cancellation
         let pong_rx_recv = pong_rx.clone();
-        let timeout_fut = runtime::timeout(heartbeat_timeout, async move { pong_rx_recv.recv().await });
+        let timeout_fut =
+          compio::runtime::time::timeout(heartbeat_timeout, async move { pong_rx_recv.recv().await });
         let mut timeout_fut = std::pin::pin!(timeout_fut.fuse());
         futures::select! {
           result = timeout_fut => {
@@ -895,7 +896,8 @@ impl<D: Dispatcher> Conn<D> {
           _ = cancel => break,
         }
       }
-    });
+    })
+    .detach();
 
     self.scheduled_task = Some(cancel_tx);
   }
@@ -1077,7 +1079,7 @@ impl<D: Dispatcher> Conn<D> {
 
     // Spawn the read loop as a separate task.
     // The task handle is dropped at scope exit to stop polling the reader.
-    let reader_task = runtime::spawn(Self::run_read_loop::<R>(
+    let reader_task = compio::runtime::spawn(Self::run_read_loop::<R>(
       reader,
       read_tx,
       payload_buffer_pool,
@@ -1228,7 +1230,7 @@ impl<D: Dispatcher> Conn<D> {
                 }
                 payload_length = payload_info.length as u32;
 
-                match runtime::timeout(
+                match compio::runtime::time::timeout(
                   payload_read_timeout,
                   reader.read_payload(&payload_buffer_pool, payload_info.length, payload_info.id),
                 )

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use async_broadcast;
 use async_channel;
-use narwhal_common::runtime::TcpStream;
+use compio::net::TcpStream;
 
 use compio_tls::TlsConnector;
 

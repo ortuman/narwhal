@@ -10,12 +10,10 @@ use libc::{
 };
 use tracing::{error, info, trace, warn};
 
-use crate::runtime;
-
 /// Type alias for runtime task handles.
 ///
 /// This represents a spawned task that can be awaited or detached.
-pub type Task = crate::runtime::JoinHandle<()>;
+pub type Task = compio::runtime::JoinHandle<()>;
 
 type SpawnFn = Box<dyn FnOnce() + Send + 'static>;
 
@@ -85,21 +83,23 @@ impl CoreDispatcher {
             let _ = core_affinity::set_for_current(core_id);
           }
 
-          runtime::try_block_on(async move {
+          let rt = compio::runtime::Runtime::new()
+            .map_err(|e| anyhow!("failed to create runtime for worker {}: {}", worker_id, e))?;
+          rt.block_on(async move {
             // Spawn a task that drains incoming work from the task channel.
-            runtime::spawn_detached(async move {
+            compio::runtime::spawn(async move {
               while let Ok(f) = task_rx.recv().await {
                 f();
               }
-            });
+            })
+            .detach();
 
             // Signal readiness.
             let _ = ready_tx.send(()).await;
 
             // Keep the runtime alive until shutdown signal.
             let _ = shutdown_rx.recv().await;
-          })
-          .map_err(|e| anyhow!("failed to create runtime for worker {}: {}", worker_id, e))?;
+          });
 
           trace!(worker_id, "core worker thread stopped");
 
@@ -132,7 +132,7 @@ impl CoreDispatcher {
     Fut: std::future::Future<Output = ()> + 'static,
   {
     let task: SpawnFn = Box::new(move || {
-      runtime::spawn_detached(f());
+      compio::runtime::spawn(f()).detach();
     });
 
     self.senders[shard].send(task).await.map_err(|_| anyhow!("shard {} channel closed", shard))
