@@ -608,8 +608,12 @@ impl Inner {
       return 0;
     }
     let Ok(idx_data) = compio::fs::read(idx_path).await else {
-      // Index missing or unreadable — treat the whole valid range as
-      // un-indexed so the next append re-establishes an entry-0.
+      // Index missing or unreadable — conservatively treat the whole valid
+      // range as un-indexed. This seeds `bytes_since_index` from the full
+      // validated log size; the normal append/index-interval logic decides
+      // when the next index entry is written. In a successful recovery
+      // the active `.idx` is rebuilt earlier on this same path, so this
+      // branch is primarily a fallback for prior open/read failures.
       return valid_size;
     };
     let entry_count = idx_data.len() / INDEX_ENTRY_SIZE;
@@ -1814,10 +1818,10 @@ mod tests {
     // restart.
     let tmp = tempfile::tempdir().unwrap();
 
-    // Append a handful of varied-size entries. None of them is large
-    // enough to trigger a second index entry on its own, so the active
-    // segment ends with a single index entry at offset 0 and
-    // `bytes_since_index` equal to the full validated log size.
+    // Append a handful of varied-size entries. Their total appended bytes
+    // remain below `INDEX_INTERVAL_BYTES`, so the active segment still has
+    // only the initial index entry at offset 0 and `bytes_since_index`
+    // equals the full validated log size.
     let runtime_value = {
       let log = create_log(tmp.path()).await;
       append_message(&log, 1, "alice@localhost", &[0u8; 1000], 0).await;
