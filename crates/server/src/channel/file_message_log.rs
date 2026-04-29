@@ -994,10 +994,7 @@ impl MessageLog for FileMessageLog {
       anyhow::bail!("seq must be > 0 (0 is reserved as the empty-log sentinel)");
     }
     if seq <= inner.cached_last_seq {
-      anyhow::bail!(
-        "seq must be strictly greater than last_seq: got {seq}, last_seq is {}",
-        inner.cached_last_seq
-      );
+      anyhow::bail!("seq must be strictly greater than last_seq: got {seq}, last_seq is {}", inner.cached_last_seq);
     }
 
     // Reject oversized entries before any state change. The read-side
