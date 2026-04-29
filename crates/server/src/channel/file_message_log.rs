@@ -1944,11 +1944,7 @@ mod tests {
     {
       let log = create_log_with_segment_max_and_metrics(tmp.path(), 4096, metrics.clone()).await;
       // Recovery should have detected the truncation on the sealed segment.
-      assert_eq!(
-        metrics.sealed_segment_truncations.get(),
-        1,
-        "expected one sealed-segment truncation to be recorded"
-      );
+      assert_eq!(metrics.sealed_segment_truncations.get(), 1, "expected one sealed-segment truncation to be recorded");
 
       // Reads of the corrupted segment terminate at the last validated
       // entry, so a sweep over the full range returns fewer entries than
