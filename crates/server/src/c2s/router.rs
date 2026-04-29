@@ -294,7 +294,6 @@ mod tests {
   use narwhal_util::pool::PoolBuffer;
 
   use crate::transmitter::Resource;
-  use narwhal_common::runtime;
 
   /// A mock transmitter that records whether a message was received.
   #[derive(Clone)]
@@ -333,9 +332,10 @@ mod tests {
     let (tx, rx) = async_channel::bounded(64);
 
     let tc = total_connections.clone();
-    runtime::spawn_detached(async move {
+    compio::runtime::spawn(async move {
       RouterShard::new(rx, tc).run().await;
-    });
+    })
+    .detach();
 
     Router {
       local_domain: StringAtom::from("localhost"),

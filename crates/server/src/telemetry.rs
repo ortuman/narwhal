@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use anyhow::anyhow;
-use narwhal_common::runtime::{AsyncWriteExt, TcpListener};
+use compio::io::AsyncWriteExt;
+use compio::net::TcpListener;
 use prometheus_client::registry::Registry;
 use serde::{Deserialize, Serialize};
 use std::io::stdout;
@@ -10,8 +11,6 @@ use std::sync::Arc;
 use tracing::metadata::LevelFilter;
 use tracing::warn;
 use tracing_subscriber::fmt;
-
-use narwhal_common::runtime;
 
 /// A metrics registry that supports dynamic metric registration.
 pub type MetricsRegistry = Arc<async_lock::Mutex<Registry>>;
@@ -143,7 +142,7 @@ fn start_scrape_endpoint(config: &MetricsConfig, registry: MetricsRegistry) -> a
     TcpListener::from_std(std_listener)?
   };
 
-  runtime::spawn_detached(async move {
+  compio::runtime::spawn(async move {
     loop {
       match listener.accept().await {
         Ok((mut stream, _)) => {
@@ -164,7 +163,8 @@ fn start_scrape_endpoint(config: &MetricsConfig, registry: MetricsRegistry) -> a
         },
       }
     }
-  });
+  })
+  .detach();
 
   Ok(())
 }

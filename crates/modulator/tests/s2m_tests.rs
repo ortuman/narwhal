@@ -32,7 +32,7 @@ async fn test_s2m_connect_timeout() -> anyhow::Result<()> {
   let mut socket = suite.socket_connect().await?;
 
   // Wait for the connection to timeout.
-  narwhal_common::runtime::sleep(Duration::from_millis(250)).await;
+  compio::runtime::time::sleep(Duration::from_millis(250)).await;
 
   // Verify that the connection timed out and the server sent an error message.
   assert_message!(
@@ -69,13 +69,13 @@ async fn test_s2m_ping_timeout() -> anyhow::Result<()> {
   let mut conn = suite.connect(TEST_MODULATOR_SECRET).await?;
 
   // Wait until ping is received.
-  narwhal_common::runtime::sleep(Duration::from_millis(150)).await;
+  compio::runtime::time::sleep(Duration::from_millis(150)).await;
 
   let ping_msg = conn.read_message().await?;
   assert!(matches!(ping_msg, Message::Ping { .. }));
 
   // Wait for keep-alive timeout.
-  narwhal_common::runtime::sleep(Duration::from_millis(200)).await;
+  compio::runtime::time::sleep(Duration::from_millis(200)).await;
 
   // Verify that the server sent the proper error message.
   assert_message!(

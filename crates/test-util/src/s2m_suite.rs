@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use narwhal_common::runtime::TcpStream;
+use compio::net::TcpStream;
 
 use narwhal_common::core_dispatcher::CoreDispatcher;
 use narwhal_modulator::{Modulator, S2mListener};

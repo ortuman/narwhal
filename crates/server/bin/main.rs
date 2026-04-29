@@ -5,7 +5,6 @@ compile_error!("This application strictly does not support Windows.");
 
 use clap::Parser;
 
-use narwhal_common::runtime;
 use narwhal_server::version::VERSION;
 
 /// Command line arguments
@@ -22,7 +21,8 @@ struct Cli {
 fn main() {
   narwhal_server::setup_panic_hook();
 
-  runtime::block_on(async {
+  let rt = compio::runtime::Runtime::new().expect("failed to create runtime");
+  rt.block_on(async {
     let cli = Cli::parse();
 
     match narwhal_server::run(cli.config).await {

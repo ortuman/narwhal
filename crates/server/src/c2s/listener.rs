@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use anyhow::{Ok, anyhow};
 use async_channel::{Sender, bounded};
+use compio::net::TcpListener;
 use futures::{FutureExt, select};
-use narwhal_common::runtime::TcpListener;
 
 use compio_tls::TlsAcceptor;
 use prometheus_client::encoding::EncodeLabelSet;
@@ -17,7 +17,6 @@ use rustls::ServerConfig;
 use tracing::{info, trace, warn};
 
 use narwhal_common::conn::DispatcherFactory;
-use narwhal_common::runtime;
 use narwhal_common::service::{C2sService, Service};
 
 use crate::c2s::config::ListenerConfig;
@@ -326,7 +325,7 @@ async fn run_accept_loop<CS: ChannelStore, MLF: MessageLogFactory>(
             let dispatcher_factory = dispatcher_factory.clone();
             let metrics = metrics.clone();
 
-            runtime::spawn_detached(async move {
+            compio::runtime::spawn(async move {
               match acceptor.accept(tcp_stream).await {
                 std::result::Result::Ok(tls_stream) => {
                   trace!(worker_id, %remote_addr, "TLS handshake complete");
@@ -338,7 +337,7 @@ async fn run_accept_loop<CS: ChannelStore, MLF: MessageLogFactory>(
                   metrics.tls_handshakes.get_or_create(&FAILURE).inc();
                 }
               }
-            });
+            }).detach();
           }
           Err(e) => {
             warn!(worker_id, error = ?e, service_type = C2sService::NAME, "accept error");

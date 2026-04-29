@@ -7,14 +7,14 @@ use std::time::Duration;
 use anyhow::anyhow;
 use async_broadcast;
 use async_channel;
-use narwhal_common::runtime::TcpStream;
+use compio::net::TcpStream;
 
 use compio_tls::TlsConnector;
 
 type ClientTlsStream<S> = compio_tls::TlsStream<S>;
 
 use narwhal_client::compio::s2m::S2mClient;
-use narwhal_common::core_dispatcher::CoreDispatcher;
+use narwhal_common::core_dispatcher::{CoreDispatcher, await_task};
 use narwhal_modulator::{Modulator, OutboundPrivatePayload};
 use narwhal_protocol::{
   AclAction, AclType, BroadcastParameters, ConnectParameters, IdentifyParameters, JoinChannelParameters,
@@ -198,7 +198,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sSuite<CS, MLF> {
 
     if let Some((handle, shutdown_tx)) = self.m2s_router_task_handle.take() {
       shutdown_tx.close();
-      let _ = handle.await;
+      await_task(handle).await;
     }
 
     self.channel_manager.shutdown();

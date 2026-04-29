@@ -23,6 +23,7 @@ use crate::router::GlobalRouter;
 use crate::telemetry::MetricsRegistry;
 use crate::version::{GIT_BRANCH_NAME, GIT_COMMIT_HASH, VERSION};
 
+use narwhal_common::core_dispatcher::await_task;
 use rlimit::Resource;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -181,7 +182,7 @@ async fn run_server(
 
   if let Some((handle, shutdown_tx)) = route_m2s_payload_handle {
     shutdown_tx.close();
-    let _ = handle.await;
+    await_task(handle).await;
   }
 
   channel_mng.shutdown();

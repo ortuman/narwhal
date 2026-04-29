@@ -13,7 +13,7 @@ use futures::FutureExt;
 use tracing::{error, trace, warn};
 
 use narwhal_common::conn::{ConnTx, State};
-use narwhal_common::runtime;
+use narwhal_common::core_dispatcher::await_task;
 use narwhal_common::service::{M2sService, S2mService};
 use narwhal_protocol::ErrorReason::{BadRequest, Unauthorized, UnexpectedMessage, UnsupportedProtocolVersion};
 use narwhal_protocol::{Event, Nid, S2mModDirectAckParameters};
@@ -322,7 +322,7 @@ pub struct S2mDispatcherFactoryInner<M: Modulator> {
   m2s_client: Option<M2sClient>,
 
   /// Handle to the private payload reader task.
-  payload_reader_handle: Option<runtime::JoinHandle<()>>,
+  payload_reader_handle: Option<compio::runtime::JoinHandle<()>>,
 
   /// Shutdown sender for graceful shutdown.
   shutdown_tx: async_channel::Sender<()>,
@@ -421,7 +421,7 @@ impl<M: Modulator> narwhal_common::conn::DispatcherFactory<S2mDispatcher<M>> for
       let rx = response.receiver;
       let shutdown_rx = inner.shutdown_rx.clone();
 
-      let handle = runtime::spawn(Self::payload_reader_loop(rx, m2s_client.clone(), shutdown_rx));
+      let handle = compio::runtime::spawn(Self::payload_reader_loop(rx, m2s_client.clone(), shutdown_rx));
       inner.payload_reader_handle = Some(handle);
     }
     Ok(())
@@ -433,7 +433,7 @@ impl<M: Modulator> narwhal_common::conn::DispatcherFactory<S2mDispatcher<M>> for
     inner.shutdown_tx.close();
 
     if let Some(handle) = inner.payload_reader_handle.take() {
-      let _ = handle.await;
+      await_task(handle).await;
     }
 
     if let Some(m2s_client) = inner.m2s_client.take() {

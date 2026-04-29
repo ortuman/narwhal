@@ -35,7 +35,7 @@ async fn test_c2s_connect_timeout() -> anyhow::Result<()> {
   let mut tls_socket = suite.tls_socket_connect().await?;
 
   // Wait for the connection to timeout.
-  narwhal_common::runtime::sleep(Duration::from_millis(250)).await;
+  compio::runtime::time::sleep(Duration::from_millis(250)).await;
 
   // Verify that the connection timed out and the server sent an error message.
   assert_message!(
@@ -72,7 +72,7 @@ async fn test_c2s_authentication_timeout() -> anyhow::Result<()> {
   assert!(matches!(client_connected_msg, Message::ConnectAck { .. }));
 
   // Wait for the authentication to timeout.
-  narwhal_common::runtime::sleep(Duration::from_millis(250)).await;
+  compio::runtime::time::sleep(Duration::from_millis(250)).await;
 
   // Verify that the server sent the proper error message.
   assert_message!(
@@ -104,13 +104,13 @@ async fn test_c2s_ping_timeout() -> anyhow::Result<()> {
   suite.identify(TEST_USER_1).await?;
 
   // Wait until ping is received.
-  narwhal_common::runtime::sleep(Duration::from_millis(150)).await;
+  compio::runtime::time::sleep(Duration::from_millis(150)).await;
 
   let ping_msg = suite.read_message(TEST_USER_1).await?;
   assert!(matches!(ping_msg, Message::Ping { .. }));
 
   // Wait for keep-alive timeout.
-  narwhal_common::runtime::sleep(Duration::from_millis(200)).await;
+  compio::runtime::time::sleep(Duration::from_millis(200)).await;
 
   // Verify that the server sent the proper error message.
   assert_message!(
@@ -177,7 +177,7 @@ async fn test_c2s_max_connection_limit_reached() -> anyhow::Result<()> {
   assert!(matches!(connect_ack, Message::ConnectAck { .. }));
 
   // Spawn task to keep the connection alive
-  let _handle = narwhal_common::runtime::spawn(async move {
+  let _handle = compio::runtime::spawn(async move {
     let _ = rx.await;
     tls_socket.shutdown().await.ok();
   });
