@@ -1343,6 +1343,7 @@ async fn test_c2s_periodic_flush_task_does_not_race_with_appends() -> anyhow::Re
   let reply = suite.read_message(TEST_USER_1).await?;
   match reply {
     Message::ChannelSeqAck(params) => {
+      assert_eq!(params.id, 1);
       assert_eq!(params.first_seq, 1);
       assert_eq!(params.last_seq, 200);
     },

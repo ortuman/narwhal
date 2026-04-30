@@ -658,8 +658,8 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
   /// `Command::FlushChannel` posted by the per-channel periodic flush task.
   async fn flush_channel(&mut self, handler: StringAtom) -> anyhow::Result<()> {
     let Some(channel) = self.channels.get(&handler) else {
-      // Channel was deleted (or persistence was disabled) since the flush task last ticked;
-      // treat as a no-op so the task can exit cleanly on its next cancel check.
+      // Treat this stale flush tick as a no-op. The periodic flush task is stopped separately
+      // via cancellation/config-change handling or when the shard mailbox closes.
       return Ok(());
     };
     let start = Instant::now();
