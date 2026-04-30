@@ -278,8 +278,6 @@ async fn create_and_join_channel(
     },
   };
 
-  // Optionally enable message persistence on the channel. Done after the ACLs are in place so
-  // the persisted channel projection captures the locked-down ACL state, not the default-open one.
   if persist {
     match clients[0].configure_channel(channel.clone(), None, None, None, Some(true), None).await {
       Ok(()) => {
