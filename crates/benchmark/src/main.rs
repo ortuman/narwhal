@@ -62,6 +62,14 @@ struct Cli {
   /// example modulator). When unset, clients use the IDENTIFY command (no modulator).
   #[arg(long)]
   auth_password: Option<String>,
+
+  /// Channel `message_flush_interval` in milliseconds, applied via SET_CHAN_CONFIG. Only
+  /// meaningful with --persist: 0 (server default) flushes after every append, gating the
+  /// producer ACK on durability; values >0 let an async background task flush at this interval,
+  /// trading "best-effort within N ms" durability for higher throughput. Server enforces an
+  /// upper bound via `max_message_flush_interval` (default 60 000 ms).
+  #[arg(long, requires = "persist")]
+  flush_interval_ms: Option<u32>,
 }
 
 /// Parse duration from string (supports: 30s, 5m, 1h)
@@ -93,6 +101,9 @@ fn main() {
   info!("channel(s): {}", cli.channels);
   info!("duration: {:?}", cli.duration);
   info!("persist: {}", cli.persist);
+  if let Some(v) = cli.flush_interval_ms {
+    info!("flush-interval-ms: {}", v);
+  }
   info!("auth: {}", if cli.auth_password.is_some() { "PLAIN" } else { "IDENTIFY" });
 
   // Initialize compio runtime
@@ -241,6 +252,7 @@ async fn create_and_join_channel(
   num_consumers: usize,
   channel_index: usize,
   persist: bool,
+  flush_interval_ms: Option<u32>,
 ) -> Result<StringAtom> {
   // Generate a unique channel name using the provided index
   let channel_id = format!("!bench{}@localhost", channel_index);
@@ -288,7 +300,7 @@ async fn create_and_join_channel(
   };
 
   if persist {
-    match clients[0].configure_channel(channel.clone(), None, None, None, Some(true), None).await {
+    match clients[0].configure_channel(channel.clone(), None, None, None, Some(true), flush_interval_ms).await {
       Ok(()) => {
         info!("channel persistence enabled: {}", channel);
       },
@@ -597,7 +609,9 @@ async fn perform_benchmark(cli: &Cli, metrics: &mut BenchmarkMetrics) -> Result<
     if cli.channels > 1 {
       info!("creating channel {} of {}...", i + 1, cli.channels);
     }
-    let channel = create_and_join_channel(&all_clients, cli.producers, cli.consumers, i + 1, cli.persist).await?;
+    let channel =
+      create_and_join_channel(&all_clients, cli.producers, cli.consumers, i + 1, cli.persist, cli.flush_interval_ms)
+        .await?;
     channels.push(channel);
   }
 

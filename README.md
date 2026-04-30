@@ -173,7 +173,7 @@ The benchmark tool simulates multiple producer and consumer clients connecting t
 
 #### Benchmarking persistent channels
 
-Pass `--persist` to make the bench enable persistence on its channel before broadcasting. Every broadcast then writes to the channel's append-only message log and is acknowledged only after the log is flushed, so steady-state throughput becomes bounded by single-flush latency rather than the network/dispatch path.
+Pass `--persist` to make the bench enable persistence on its channel before broadcasting. By default every broadcast writes to the channel's append-only message log and is acknowledged only after the log is flushed, so steady-state throughput becomes bounded by single-flush latency rather than the network/dispatch path.
 
 ```bash
 ./target/release/narwhal-bench \
@@ -185,7 +185,20 @@ Pass `--persist` to make the bench enable persistence on its channel before broa
   --persist
 ```
 
-Inspect the `narwhal_message_log_flush_duration_seconds` histogram on the server's `/metrics` endpoint to see the dominant cost.
+To trade strict per-message durability for higher throughput, add `--flush-interval-ms <N>`. The bench sets the channel's `message_flush_interval` via `SET_CHAN_CONFIG`, which switches the server from an inline flush per append to a background flush every `N` ms:
+
+```bash
+./target/release/narwhal-bench \
+  --server 127.0.0.1:22622 \
+  --producers 1 \
+  --consumers 1 \
+  --duration 1m \
+  --payload-size 8192 \
+  --persist \
+  --flush-interval-ms 100
+```
+
+Inspect the `narwhal_message_log_flush_duration_seconds` histogram on the server's `/metrics` endpoint to see the dominant cost in either mode.
 
 ### Running with Debug Tracing
 
