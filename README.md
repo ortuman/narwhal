@@ -216,14 +216,6 @@ To trade strict per-message durability for higher throughput, add `--flush-inter
   --flush-interval-ms 100
 ```
 
-Inspect the `narwhal_message_log_flush_duration_seconds` histogram on the server's `/metrics` endpoint to see the dominant cost in either mode.
-
-### Running with Debug Tracing
-
-```bash
-RUST_LOG=debug cargo run --bin narwhal
-```
-
 ## Project Status
 
 **Current Version: 0.6.0 (Alpha)**
