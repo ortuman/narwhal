@@ -248,19 +248,6 @@ async fn create_and_join_channel(
     },
   };
 
-  // Optionally enable message persistence on the channel
-  if persist {
-    match clients[0].configure_channel(channel.clone(), None, None, None, Some(true), None).await {
-      Ok(()) => {
-        info!("channel persistence enabled: {}", channel);
-      },
-      Err(e) => {
-        error!("failed to enable persistence on channel: {}", e);
-        anyhow::bail!("failed to enable persistence on channel: {}", e);
-      },
-    };
-  }
-
   // Set channel ACL for publish
   let mut allow_publish: Vec<Nid> = Vec::with_capacity(num_producers);
   for i in 0..num_producers {
@@ -290,6 +277,20 @@ async fn create_and_join_channel(
       anyhow::bail!("failed to set channel read ACL: {}", e);
     },
   };
+
+  // Optionally enable message persistence on the channel. Done after the ACLs are in place so
+  // the persisted channel projection captures the locked-down ACL state, not the default-open one.
+  if persist {
+    match clients[0].configure_channel(channel.clone(), None, None, None, Some(true), None).await {
+      Ok(()) => {
+        info!("channel persistence enabled: {}", channel);
+      },
+      Err(e) => {
+        error!("failed to enable persistence on channel: {}", e);
+        anyhow::bail!("failed to enable persistence on channel: {}", e);
+      },
+    };
+  }
 
   // Remaining clients join the channel
   if clients.len() > 1 {
