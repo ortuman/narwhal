@@ -173,17 +173,34 @@ The benchmark tool simulates multiple producer and consumer clients connecting t
 
 #### Benchmarking persistent channels
 
-Pass `--persist` to make the bench enable persistence on its channel before broadcasting. By default every broadcast writes to the channel's append-only message log and is acknowledged only after the log is flushed, so steady-state throughput becomes bounded by single-flush latency rather than the network/dispatch path.
+Persistence requires authenticated clients server-side, so the bench needs to talk to a server that has an auth modulator attached. The repo's [`plain-authenticator`](examples/modulator/plain-authenticator) example is the simplest path. Run the three pieces in separate terminals:
 
 ```bash
+# 1. Build and run the modulator (auth-only, listens on a unix socket).
+cargo build --release --manifest-path examples/modulator/Cargo.toml -p plain-authenticator
+examples/modulator/target/release/plain-authenticator \
+  --config examples/config/s2m-benchmark-unix.toml
+```
+
+```bash
+# 2. Run the server with the bench-tuned config that dials the modulator.
+target/release/narwhal --config examples/config/c2s-benchmark-with-s2m-unix.toml
+```
+
+```bash
+# 3. Run the bench. --persist enables per-channel message persistence; --auth-password
+#    routes each client through PLAIN auth against the modulator.
 ./target/release/narwhal-bench \
   --server 127.0.0.1:22622 \
   --producers 1 \
   --consumers 1 \
   --duration 1m \
   --payload-size 8192 \
-  --persist
+  --persist \
+  --auth-password s3cret
 ```
+
+In this mode every broadcast writes to the channel's append-only message log and is acknowledged only after the log is flushed, so steady-state throughput is bounded by single-flush latency rather than the network/dispatch path.
 
 To trade strict per-message durability for higher throughput, add `--flush-interval-ms <N>`. The bench sets the channel's `message_flush_interval` via `SET_CHAN_CONFIG`, which switches the server from an inline flush per append to a background flush every `N` ms:
 
@@ -195,6 +212,7 @@ To trade strict per-message durability for higher throughput, add `--flush-inter
   --duration 1m \
   --payload-size 8192 \
   --persist \
+  --auth-password s3cret \
   --flush-interval-ms 100
 ```
 
