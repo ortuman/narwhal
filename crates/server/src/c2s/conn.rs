@@ -150,14 +150,8 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherFactory<CS, MLF> {
     auth_required: bool,
     registry: &mut Registry,
   ) -> Self {
-    let inner = C2sDispatcherFactoryInner {
-      config,
-      channel_manager,
-      c2s_router,
-      modulator,
-      modulator_ops: None,
-      auth_required,
-    };
+    let inner =
+      C2sDispatcherFactoryInner { config, channel_manager, c2s_router, modulator, modulator_ops: None, auth_required };
 
     Self { inner: Arc::new(RwLock::new(inner)), metrics: C2sDispatcherMetrics::register(registry) }
   }
@@ -1107,8 +1101,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
     };
 
     // Check if direct forwarding is supported.
-    let send_supported =
-      self.modulator_ops.as_ref().is_some_and(|ops| ops.contains(Operation::SendPrivatePayload));
+    let send_supported = self.modulator_ops.as_ref().is_some_and(|ops| ops.contains(Operation::SendPrivatePayload));
     if !send_supported {
       return Err(narwhal_protocol::Error::new(UnexpectedMessage).into());
     }
