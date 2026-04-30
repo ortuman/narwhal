@@ -26,7 +26,7 @@ use prometheus_client::registry::Registry;
 
 const MODULATOR_PROTOCOL_NAME: &str = "plain-authenticator/1.0";
 
-const PASSWORD: &str = "pass";
+const PASSWORD: &str = "s3cret";
 
 /// A simple PLAIN authentication modulator.
 ///
@@ -35,14 +35,14 @@ const PASSWORD: &str = "pass";
 ///
 /// Any non-empty username is accepted. The password is checked against a hardcoded value for
 /// demonstration purposes:
-///   - Password: `pass`
+///   - Password: `s3cret`
 ///
 /// If the password matches, authentication succeeds and the client-supplied username is returned.
 /// Otherwise, authentication fails.
 ///
-/// Example token for username `user` and password `pass`:
-///   - Raw: `\0user\0pass`
-///   - Base64: `AHVzZXIAcGFzcw==`
+/// Example token for username `user` and password `s3cret`:
+///   - Raw: `\0user\0s3cret`
+///   - Base64: `AHVzZXIAczNjcmV0`
 #[derive(Debug)]
 struct PlainAuthenticator {}
 

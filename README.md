@@ -197,7 +197,7 @@ target/release/narwhal --config examples/config/c2s-benchmark-with-s2m-unix.toml
   --duration 1m \
   --payload-size 8192 \
   --persist \
-  --auth-password pass
+  --auth-password s3cret
 ```
 
 In this mode every broadcast writes to the channel's append-only message log and is acknowledged only after the log is flushed, so steady-state throughput is bounded by single-flush latency rather than the network/dispatch path.
@@ -212,7 +212,7 @@ To trade strict per-message durability for higher throughput, add `--flush-inter
   --duration 1m \
   --payload-size 8192 \
   --persist \
-  --auth-password pass \
+  --auth-password s3cret \
   --flush-interval-ms 100
 ```
 
