@@ -17,7 +17,7 @@ use narwhal_common::conn::{ConnTx, State};
 use narwhal_common::service::C2sService;
 use narwhal_modulator::modulator::{
   AuthRequest, AuthResult, ForwardBroadcastPayloadRequest, ForwardBroadcastPayloadResult, Modulator, Operation,
-  SendPrivatePayloadRequest, SendPrivatePayloadResult,
+  Operations, SendPrivatePayloadRequest, SendPrivatePayloadResult,
 };
 use narwhal_protocol::ErrorReason::{
   BadRequest, Forbidden, InternalServerError, UnexpectedMessage, UnsupportedProtocolVersion, UsernameInUse,
@@ -150,7 +150,14 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherFactory<CS, MLF> {
     auth_required: bool,
     registry: &mut Registry,
   ) -> Self {
-    let inner = C2sDispatcherFactoryInner { config, channel_manager, c2s_router, modulator, auth_required };
+    let inner = C2sDispatcherFactoryInner {
+      config,
+      channel_manager,
+      c2s_router,
+      modulator,
+      modulator_ops: None,
+      auth_required,
+    };
 
     Self { inner: Arc::new(RwLock::new(inner)), metrics: C2sDispatcherMetrics::register(registry) }
   }
@@ -168,6 +175,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> narwhal_common::conn::DispatcherF
       inner.config.clone(),
       inner.auth_required,
       inner.modulator.clone(),
+      inner.modulator_ops,
       inner.channel_manager.clone(),
       inner.c2s_router.clone(),
       tx,
@@ -176,6 +184,11 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> narwhal_common::conn::DispatcherF
   }
 
   async fn bootstrap(&mut self) -> anyhow::Result<()> {
+    let mut inner = self.inner.write().await;
+    if let Some(modulator) = inner.modulator.as_ref() {
+      let ops = modulator.operations().await?;
+      inner.modulator_ops = Some(ops);
+    }
     Ok(())
   }
 
@@ -196,6 +209,10 @@ pub struct C2sDispatcherFactoryInner<CS: ChannelStore, MLF: MessageLogFactory> {
 
   /// The modulator, if any.
   modulator: Option<Arc<dyn Modulator>>,
+
+  /// Cached set of operations declared by the modulator, populated once in `bootstrap()`.
+  /// `None` when no modulator is attached.
+  modulator_ops: Option<Operations>,
 
   /// Whether authentication is required.
   auth_required: bool,
@@ -225,6 +242,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcher<CS, MLF> {
     config: Arc<Config>,
     auth_required: bool,
     modulator: Option<Arc<dyn Modulator>>,
+    modulator_ops: Option<Operations>,
     channel_manager: ChannelManager<CS, MLF>,
     c2s_router: c2s::Router,
     conn_tx: ConnTx,
@@ -238,6 +256,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcher<CS, MLF> {
       nid: None,
       transmitter: Arc::new(C2sTransmitter::new(handler, conn_tx)),
       modulator,
+      modulator_ops,
       auth_required,
       metrics,
     };
@@ -261,6 +280,10 @@ struct C2sDispatcherInner<CS: ChannelStore, MLF: MessageLogFactory> {
 
   /// The modulator, if any.
   modulator: Option<Arc<dyn Modulator>>,
+
+  /// Cached operations the modulator declared at server startup.
+  /// `None` when no modulator is attached.
+  modulator_ops: Option<Operations>,
 
   /// The channel manager.
   channel_manager: ChannelManager<CS, MLF>,
@@ -574,10 +597,12 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
     let nid = self.nid.as_ref().unwrap().clone();
     let transmitter = self.transmitter.clone();
 
-    // Forward the payload to the modulator (if available) for validation and alteration.
     let mut altered_payload = payload;
 
-    if let Some(modulator) = self.modulator.as_ref() {
+    let forward_supported =
+      self.modulator_ops.as_ref().is_some_and(|ops| ops.contains(Operation::ForwardBroadcastPayload));
+
+    if let Some(modulator) = self.modulator.as_ref().filter(|_| forward_supported) {
       let request = ForwardBroadcastPayloadRequest {
         payload: altered_payload.clone(),
         from: nid.clone(),
@@ -1082,7 +1107,9 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
     };
 
     // Check if direct forwarding is supported.
-    if !modulator.operations().await?.contains(Operation::SendPrivatePayload) {
+    let send_supported =
+      self.modulator_ops.as_ref().is_some_and(|ops| ops.contains(Operation::SendPrivatePayload));
+    if !send_supported {
       return Err(narwhal_protocol::Error::new(UnexpectedMessage).into());
     }
 
