@@ -184,10 +184,10 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> narwhal_common::conn::DispatcherF
   }
 
   async fn bootstrap(&mut self) -> anyhow::Result<()> {
-    let mut inner = self.inner.write().await;
-    if let Some(modulator) = inner.modulator.as_ref() {
+    let modulator = self.inner.read().await.modulator.clone();
+    if let Some(modulator) = modulator {
       let ops = modulator.operations().await?;
-      inner.modulator_ops = Some(ops);
+      self.inner.write().await.modulator_ops = Some(ops);
     }
     Ok(())
   }
