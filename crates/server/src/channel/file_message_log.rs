@@ -45,7 +45,7 @@ const INDEX_EXT: &str = "idx";
 
 /// Metric handles for `FileMessageLog` operations.
 ///
-/// Cloneable — each `FileMessageLog` instance holds a clone, so a single set of
+/// Cloneable: each `FileMessageLog` instance holds a clone, so a single set of
 /// handles is shared across all logs created by a factory.
 #[derive(Clone)]
 pub struct MessageLogMetrics {
@@ -117,7 +117,7 @@ impl MessageLogMetrics {
     }
   }
 
-  /// Returns an instance with unregistered handles — useful for tests that do
+  /// Returns an instance with unregistered handles, useful for tests that do
   /// not care about observing metric values.
   pub fn noop() -> Self {
     Self {
@@ -406,7 +406,7 @@ impl Inner {
 
     // Tracks whether the last seg_seqs entry was successfully recovered as the
     // active segment. If false (e.g. zero-byte .log, or every entry failed CRC),
-    // we must NOT promote a preceding sealed segment to active — that would
+    // we must NOT promote a preceding sealed segment to active: that would
     // open a sealed .log for writes and double-map its .idx (read-only +
     // writable) to the same file.
     let mut active_segment_recovered = false;
@@ -426,7 +426,7 @@ impl Inner {
       };
 
       if file_size == 0 {
-        // Empty segment file — leftover from crash during roll.
+        // Empty segment file: leftover from crash during roll.
         let _ = compio::fs::remove_file(&log_path).await;
         let _ = compio::fs::remove_file(&idx_path).await;
         continue;
@@ -447,7 +447,7 @@ impl Inner {
           self.segments.push(SegmentInfo { first_seq: base_seq, last_seq, file_size: valid_size, idx_mmap: None });
           active_segment_recovered = true;
         } else {
-          // No valid entries at all — remove the segment.
+          // No valid entries at all: remove the segment.
           let _ = compio::fs::remove_file(&log_path).await;
           let _ = compio::fs::remove_file(&idx_path).await;
         }
@@ -464,7 +464,7 @@ impl Inner {
         }
         // The validation scan terminated before EOF on a sealed segment.
         // This can mean a CRC mismatch, an unreadable header, oversized
-        // declared lengths, a truncated tail, or an I/O error — any of
+        // declared lengths, a truncated tail, or an I/O error, any of
         // which is silent data loss: the .log still holds the trailing
         // bytes, but `last_seq` is pinned to the last validated position
         // and reads stop there. Surface this to operators via a metric +
@@ -501,7 +501,7 @@ impl Inner {
       self.cached_last_seq = last.last_seq;
     }
 
-    // Open active segment for appending — only when the last seg_seqs entry
+    // Open active segment for appending, only when the last seg_seqs entry
     // was actually recovered. Otherwise leave active_log = None so the next
     // append creates a fresh segment via Inner::create_segment.
     //
@@ -514,7 +514,7 @@ impl Inner {
       let log_path = self.segment_log_path(seg.first_seq);
       let idx_path = self.segment_idx_path(seg.first_seq);
 
-      // No append mode in compio — use positioned writes at seg.file_size.
+      // No append mode in compio: use positioned writes at seg.file_size.
       let log_file = compio::fs::OpenOptions::new()
         .write(true)
         .open(&log_path)
@@ -565,7 +565,7 @@ impl Inner {
   /// - file exists and its size fits in `(0, idx_capacity]` (oversized `.idx`
   ///   files most often indicate corruption, but can also legitimately appear
   ///   if `segment_max_bytes` or `INDEX_INTERVAL_BYTES` was reduced between
-  ///   runs — rebuilding from the log handles both cases, and bounding the
+  ///   runs; rebuilding from the log handles both cases, and bounding the
   ///   size first also bounds the buffer we load below),
   /// - the size is a multiple of `INDEX_ENTRY_SIZE`,
   /// - the first entry is `(relative_seq=0, offset=0)` (entry-0 rule),
@@ -636,7 +636,7 @@ impl Inner {
   /// the end of the log.
   ///
   /// We mirror that invariant directly by subtracting the offset of the last
-  /// index entry from `valid_size`, instead of scanning the log forward —
+  /// index entry from `valid_size`, instead of scanning the log forward,
   /// which is both faster and avoids an off-by-one bug the scan-based
   /// version had (it skipped the indexed entry's own length, leaving the
   /// next index entry delayed by up to one entry's worth of bytes after
@@ -646,7 +646,7 @@ impl Inner {
       return 0;
     }
     let Ok(idx_data) = compio::fs::read(idx_path).await else {
-      // Index missing or unreadable — conservatively treat the whole valid
+      // Index missing or unreadable: conservatively treat the whole valid
       // range as un-indexed. This seeds `bytes_since_index` from the full
       // validated log size; the normal append/index-interval logic decides
       // when the next index entry is written. In a successful recovery
@@ -676,7 +676,7 @@ impl Inner {
   }
 
   /// List segment base sequences from `.log` filenames.
-  /// Uses `std_fs::read_dir` — no compio equivalent for directory listing.
+  /// Uses `std_fs::read_dir`: no compio equivalent for directory listing.
   fn list_segment_seqs(dir: &Path) -> Vec<u64> {
     let Ok(entries) = std_fs::read_dir(dir) else {
       return Vec::new();
@@ -751,7 +751,7 @@ impl Inner {
   /// (`<first_seq>.tmp`), fsync'd, and then atomically renamed to
   /// `<first_seq>.idx`. A crash mid-rebuild leaves either the previous
   /// `.idx` intact (if the rename hasn't happened yet) or the new one in
-  /// place (if it has) — never a half-written `.idx`. On failure both the
+  /// place (if it has), never a half-written `.idx`. On failure both the
   /// temp file and the existing `.idx` are removed, so the read path falls
   /// back to scanning the segment from the start (`mmap_index` will return
   /// `None`) instead of trusting a stale or partial index.
@@ -879,7 +879,7 @@ impl Inner {
     let log_path = self.segment_log_path(first_seq);
     let idx_path = self.segment_idx_path(first_seq);
 
-    // No append mode in compio — use positioned writes at seg.file_size.
+    // No append mode in compio: use positioned writes at seg.file_size.
     self.active_log =
       Some(compio::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&log_path).await?);
 
@@ -938,7 +938,7 @@ impl Inner {
 
     let retain_from = self.cached_last_seq.saturating_sub(max_messages as u64 - 1);
 
-    // The active (last) segment is never evicted — there must always be a
+    // The active (last) segment is never evicted: there must always be a
     // segment to append into.
     while self.segments.len() > 1 {
       if self.segments[0].last_seq < retain_from {
@@ -1007,8 +1007,8 @@ impl Inner {
   }
 }
 
-// The shard actor model guarantees single-threaded, non-reentrant access —
-// holding a RefCell borrow across .await is safe in this context.
+// The shard actor model guarantees single-threaded, non-reentrant access,
+// so holding a RefCell borrow across .await is safe in this context.
 #[allow(clippy::await_holding_refcell_ref)]
 #[async_trait(?Send)]
 impl MessageLog for FileMessageLog {
@@ -1029,7 +1029,7 @@ impl MessageLog for FileMessageLog {
     // Reject `seq == 0` and non-strictly-monotonic sequences before any state
     // change. `0` is the empty-log sentinel returned by `first_seq`/`last_seq`,
     // so writing an entry with `seq == 0` would persist data while leaving
-    // both cached values at 0 — the log would appear empty afterwards. A
+    // both cached values at 0: the log would appear empty afterwards. A
     // `seq <= cached_last_seq` would corrupt the sparse index, whose binary
     // search assumes strictly monotonic `relative_seq` per segment; a
     // subsequent recovery would mark the index as visibly corrupt and rebuild
@@ -1902,7 +1902,7 @@ mod tests {
       log.flush().await.unwrap();
     }
 
-    // Second session: create a new log from the same directory — should recover.
+    // Second session: create a new log from the same directory; should recover.
     {
       let log = create_log(tmp.path()).await;
 
@@ -2009,7 +2009,7 @@ mod tests {
   #[compio::test]
   async fn test_recovery_increments_metric_on_sealed_segment_corruption() {
     // Regression test: a CRC failure mid-way through a sealed segment is
-    // silent data loss — the bytes past the failure are unreachable but the
+    // silent data loss: the bytes past the failure are unreachable but the
     // file stays on disk. Recovery must surface this as both a metric
     // increment and a tracing warning so disk health can be investigated.
     //
@@ -2071,7 +2071,7 @@ mod tests {
       // Reads of the corrupted segment terminate at the last validated
       // entry, so a sweep over the full range returns fewer entries than
       // were originally appended. The active segment is untouched, so its
-      // entries remain visible — `last_seq()` reports the highest seq, but
+      // entries remain visible: `last_seq()` reports the highest seq, but
       // the *count* visited is short by the entries lost past the
       // corruption boundary.
       let mut visitor = CollectingVisitor::new();
@@ -2087,7 +2087,7 @@ mod tests {
   async fn test_recovery_does_not_promote_sealed_segment_when_active_invalid() {
     // Regression test: if the active (last) segment validates to zero entries,
     // recovery must delete it without "promoting" the previous sealed segment
-    // — otherwise subsequent appends would extend a sealed segment's .log and
+    // otherwise subsequent appends would extend a sealed segment's .log and
     // remap its .idx as MmapMut, corrupting filename-derived first_seq.
     let tmp = tempfile::tempdir().unwrap();
 
@@ -2265,7 +2265,7 @@ mod tests {
 
     // Read starting mid-segment (from_seq > segment's first_seq) so that the
     // read path actually consults the index. Without the rebuild, the bogus
-    // offset lands past EOF and the corrupted segment yields zero entries —
+    // offset lands past EOF and the corrupted segment yields zero entries:
     // visitor.entries[0].seq would be the next segment's first seq instead
     // of 2.
     let mut visitor = CollectingVisitor::new();
@@ -2481,7 +2481,7 @@ mod tests {
     assert_ne!(after, bad_idx, ".idx should have been rebuilt");
 
     // No .tmp files should be left in the channel directory after a
-    // successful rebuild — the rename consumes the temp file.
+    // successful rebuild; the rename consumes the temp file.
     let tmp_files: Vec<_> = std::fs::read_dir(&channel_dir)
       .unwrap()
       .filter_map(|e| e.ok())

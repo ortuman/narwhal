@@ -415,7 +415,7 @@ mod tests {
     let msg = Message::Ping(Default::default());
     router.route_to(msg, None, username.clone(), None).await.unwrap();
 
-    // Use has_connection as a barrier — it round-trips through the actor,
+    // Use has_connection as a barrier: it round-trips through the actor,
     // ensuring the prior RouteTo command has been processed.
     let _ = router.has_connection(&username).await;
 

@@ -1731,7 +1731,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelManager<CS, MLF> {
   ///
   /// When `restore_channels` is `true`, persisted channels are loaded from the
   /// store and restored into the appropriate shards. Pass `false` when auth is
-  /// disabled — without auth, memberships are ephemeral, so restoring them at
+  /// disabled; without auth, memberships are ephemeral, so restoring them at
   /// startup would leave orphaned channels.
   pub async fn bootstrap(&mut self, core_dispatcher: &CoreDispatcher, restore_channels: bool) -> anyhow::Result<()> {
     self.membership.bootstrap(core_dispatcher).await?;

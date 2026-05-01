@@ -73,7 +73,7 @@ pub struct C2sListener<CS: ChannelStore, MLF: MessageLogFactory> {
   /// The local address of the listener.
   local_address: Option<SocketAddr>,
 
-  /// Shutdown senders for each accept loop — one per shard.
+  /// Shutdown senders for each accept loop, one per shard.
   shutdown_txs: Vec<Sender<()>>,
 
   /// Listener metrics.

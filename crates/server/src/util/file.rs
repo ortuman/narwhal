@@ -36,7 +36,7 @@ pub enum DirSync {
 /// with `EXDEV` and the atomic-write guarantee does not apply.
 ///
 /// When the precondition holds, a crash mid-write leaves either the previous
-/// contents of `path` (if any) or the new contents — never a half-written
+/// contents of `path` (if any) or the new contents, never a half-written
 /// file.
 ///
 /// On error the temp file is removed (best-effort) so a stale `.tmp` doesn't

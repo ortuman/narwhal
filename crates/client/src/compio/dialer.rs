@@ -144,7 +144,7 @@ impl Dialer for UnixDialer {
 /// The concrete stream type produced by [`TlsDialer`].
 pub type TlsStream = compio_tls::TlsStream<compio::net::TcpStream>;
 
-/// TLS dialer for compio — produces [`TlsStream`].
+/// TLS dialer for compio: produces [`TlsStream`].
 #[derive(Clone)]
 pub struct TlsDialer {
   address: String,

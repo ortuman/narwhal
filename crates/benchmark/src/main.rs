@@ -474,7 +474,7 @@ async fn broadcast_messages(
           },
         }
 
-        // If we haven't reached the deadline... broadcast a new message
+        // If we haven't reached the deadline, broadcast a new message
         if Instant::now() < end_time {
           let task_channel = client_channels[channel_idx % client_channels.len()].clone();
           let task_client = client.clone();

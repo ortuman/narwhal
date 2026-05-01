@@ -1,4 +1,4 @@
-# Actor-Based Sharding — Architecture Specification
+# Actor-Based Sharding: Architecture Specification
 
 > **Status:** Implemented.
 
@@ -36,8 +36,8 @@
 Narwhal runs N OS threads, each pinned to a CPU core and hosting a
 [compio](https://github.com/compio-rs/compio) runtime (accessed through the
 `narwhal_common::runtime` shim). A small set of stateful
-subsystems — the C2S connection router, the channel manager, and the
-per-user membership tracker — shard their state across those threads. Each
+subsystems (the C2S connection router, the channel manager, and the
+per-user membership tracker) shard their state across those threads. Each
 shard is an **actor**: it owns a partition of the subsystem's data, receives
 `Command` messages through a bounded mailbox, and processes them one at a
 time on its home thread.
@@ -80,7 +80,7 @@ same four pieces:
 
 Each subsystem chooses a **sharding key**, hashes it, and routes the command to the owning shard. The shard
 holds an ordinary `HashMap<Key, State>` and mutates it with plain `&mut self`
-— no locks, no atomics on the state itself, because every command for a given
+with no locks, no atomics on the state itself, because every command for a given
 key is serialized through a single thread.
 
 ## Goals and Non-Goals
@@ -108,14 +108,14 @@ key is serialized through a single thread.
 ## CoreDispatcher
 
 `CoreDispatcher` is the shared worker pool that every sharded subsystem
-builds on top of. It knows nothing about actors, commands, or mailboxes — it
+builds on top of. It knows nothing about actors, commands, or mailboxes; it
 just accepts closures and runs them on a specific worker.
 
 ### Thread Model
 
 | Property | Value |
 |----------|-------|
-| Thread count | `num_workers()` — `NARWHAL_NUM_WORKERS` env var, or `available_parallelism()` |
+| Thread count | `num_workers()`: `NARWHAL_NUM_WORKERS` env var, or `available_parallelism()` |
 | Thread name | `core-worker-{id}` |
 | Runtime per thread | compio (via `narwhal_common::runtime::try_block_on`) |
 | CPU affinity | `core_affinity::set_for_current(core_ids[id % cores.len()])`, best-effort |
@@ -202,7 +202,7 @@ Two things to note:
 - The closure `f` is `Send + 'static` but the **future it returns** is only
   `'static`. That means `f` runs on the worker thread, constructs the
   future there, and hands it to `spawn_detached`. The future itself never
-  crosses a thread boundary, so it does not need to be `Send` — compio's
+  crosses a thread boundary, so it does not need to be `Send`. Compio's
   per-worker runtime is single-threaded and its tasks are spawned locally.
 - `dispatch_at_shard` itself does not await the future's completion. It only
   awaits enqueueing the closure on the worker's drainer task. Subsystems that
@@ -232,7 +232,7 @@ channel only terminates the drainer task, not the runtime itself. The
 
 Every sharded subsystem in narwhal is a variation on the following shape.
 Rather than abstract it into a framework, the same ~50 lines are written
-out three times (router, channel manager, membership) — each with its own
+out three times (router, channel manager, membership), each with its own
 `Command` enum, shard struct, and sharding key. The pattern is simple enough
 that explicit code reads better than a generic trait tower.
 
@@ -249,13 +249,13 @@ fn shard_for(key: &StringAtom, shard_count: usize) -> usize {
 | Property | Value |
 |----------|-------|
 | Hasher | `std::hash::DefaultHasher` (SipHash-1-3 today) |
-| Seed | Fresh per call — **stateless**, so every caller agrees on the shard for a given key |
+| Seed | Fresh per call: **stateless**, so every caller agrees on the shard for a given key |
 | Distribution | Uniform in expectation; no rebalancing |
 | Sharing | Defined independently in each subsystem; not a shared utility |
 
 Using `DefaultHasher` (rather than a faster non-cryptographic hash) gives
-resistance to accidentally-adversarial input — e.g. a client spamming
-similar usernames — at the cost of a few nanoseconds per dispatch.
+resistance to accidentally-adversarial input (e.g. a client spamming
+similar usernames) at the cost of a few nanoseconds per dispatch.
 
 ### Mailboxes and Commands
 
@@ -277,7 +277,7 @@ pub struct Subsystem {
 |----------|-------|
 | Channel type | `async_channel::bounded` (MPSC in practice, MPMC by type) |
 | Capacity | `DEFAULT_MAILBOX_CAPACITY = 16384` per shard |
-| Storage | `Arc<[Sender<Command>]>` — fixed-size after bootstrap, cheap to clone |
+| Storage | `Arc<[Sender<Command>]>`: fixed-size after bootstrap, cheap to clone |
 | Backpressure | `mailboxes[shard].send(cmd).await` parks the caller when the shard is full |
 
 The `Arc<[Sender<Command>]>` is rebuilt from a `Vec` at the end of
@@ -311,7 +311,7 @@ let _ = reply_tx.send(result).await;
 
 `async_channel::bounded(1)` is used rather than `oneshot` because the rest of
 the code already depends on `async_channel` and the one-message restriction
-is enforced by convention — every call site sends at most once. Fire-and-
+is enforced by convention: every call site sends at most once. Fire-and-
 forget commands (e.g. `Router::RouteTo`) simply omit `reply_tx`.
 
 ### Shard Actor Loop
@@ -392,7 +392,7 @@ to every connection handler, dispatcher factory, and background task:
 
 | Field | Clone cost |
 |-------|------------|
-| `mailboxes: Arc<[Sender<Command>]>` | `Arc::clone` — one atomic increment, all clones share senders |
+| `mailboxes: Arc<[Sender<Command>]>` | `Arc::clone`: one atomic increment, all clones share senders |
 | `Arc<AtomicUsize>` counters | `Arc::clone` |
 | `mailbox_capacity: usize` | `Copy` |
 | Other `Arc<_>` handles | `Arc::clone` |
@@ -424,7 +424,7 @@ if `exclusive: true` and the user already has connections, the shard
 returns `false` without mutating state.
 
 `Unregister`'s `bool` reply means "this was the last connection for the
-user" — useful to the caller for cleanup sequencing. The shard's
+user", useful to the caller for cleanup sequencing. The shard's
 per-username `Vec<Entry>` can hold multiple connections (e.g. multi-device
 sessions); only emptying it counts.
 
@@ -436,14 +436,14 @@ commands, drive message-log appends.
 | Aspect | Value |
 |--------|-------|
 | Sharding key | `channel handler` (`StringAtom`) |
-| Shard state | `HashMap<StringAtom, Channel<MLF::Log>>` — the full per-channel in-memory state (owner, ACL, members, message log, flush task) |
+| Shard state | `HashMap<StringAtom, Channel<MLF::Log>>`: the full per-channel in-memory state (owner, ACL, members, message log, flush task) |
 | Commands | `JoinChannel`, `LeaveChannel`, `LeaveChannels`, `DeleteChannel`, `BroadcastPayload`, config/ACL ops, `History`, `ChannelSeq` |
 | Extra shared state | `Arc<AtomicUsize>` total-channels counter; `Membership` handle (separately sharded) |
 | Factories | `ChannelStore` (metadata persistence) + `MessageLogFactory` (log persistence), both `Clone`-d into each shard |
 
 Every reply-bearing command returns `anyhow::Result<T>` so business-logic
-errors (`ChannelNotFound`, `Forbidden`, `PolicyViolation`, …) flow back to
-the caller on the reply channel. Shard actors never panic on bad input —
+errors (`ChannelNotFound`, `Forbidden`, `PolicyViolation`, etc.) flow back to
+the caller on the reply channel. Shard actors never panic on bad input;
 they serialize the error into `reply_tx` and keep looping.
 
 `ChannelShard::restore_and_run(hashes)` wraps the standard loop with a
@@ -461,13 +461,13 @@ disconnect cleanup.
 | Aspect | Value |
 |--------|-------|
 | Sharding key | `username` (`StringAtom`) |
-| Shard state | `HashMap<StringAtom, HashSet<StringAtom>>` — user → set of channel handlers |
+| Shard state | `HashMap<StringAtom, HashSet<StringAtom>>`: user → set of channel handlers |
 | Commands | `ReserveSlot` (→ `bool`), `ReleaseSlot`, `GetChannels` (→ `Arc<[StringAtom]>`) |
 | Callers | Channel shards (from `join_channel` / `do_leave`) and connection cleanup paths |
 
 `Membership` exists because `ChannelManager` is sharded by **channel**, not
 by user. A client that subscribes to channels across multiple shards leaves
-no single `ChannelShard` with a complete view of its subscriptions — so the
+no single `ChannelShard` with a complete view of its subscriptions, so the
 per-client subscription count can't be enforced inside a channel shard, and
 "find every channel a user is in" would require an all-shard fan-out.
 
@@ -541,7 +541,7 @@ Rationale:
 ## Concurrency Model
 
 - Each shard actor runs on exactly one worker thread. All state it owns is
-  accessed only from that thread — `HashMap<Key, State>` with `&mut self`.
+  accessed only from that thread: `HashMap<Key, State>` with `&mut self`.
 - Shared state across shards is `Arc`-wrapped and carefully chosen:
   `AtomicUsize` for counters, another sharded actor (`Membership`) for
   user-indexed queries. There is no shared `Mutex`/`RwLock` on the hot path.
@@ -551,8 +551,8 @@ Rationale:
 - `async_channel` is MPMC, but each mailbox has exactly one consumer (its
   shard actor). The multi-sender side is what every caller uses.
 - `dispatch_at_shard` ensures the shard actor is spawned on the correct
-  worker. Its type signature — `F: FnOnce() -> Fut + Send + 'static` with
-  `Fut: Future + 'static` (no `Send` bound on the future) — means the
+  worker. Its type signature, `F: FnOnce() -> Fut + Send + 'static` with
+  `Fut: Future + 'static` (no `Send` bound on the future), means the
   closure is shipped to the worker, but the future it returns is
   constructed and spawned there. The actor's state never crosses a thread
   boundary.
@@ -568,7 +568,7 @@ Rationale:
 | Shutdown channel per worker | 1 | `async_channel::bounded::<()>(1)` |
 
 `DEFAULT_MAILBOX_CAPACITY` is duplicated in each subsystem (router, channel
-manager, membership) — a deliberate choice so each subsystem can be tuned
+manager, membership): a deliberate choice so each subsystem can be tuned
 independently if traffic patterns diverge.
 
 ## Dependencies
@@ -598,8 +598,8 @@ independently if traffic patterns diverge.
 
 | File | Purpose |
 |------|---------|
-| `crates/common/src/core_dispatcher.rs` | `CoreDispatcher` — thread pool + compio runtimes |
-| `crates/common/src/runtime.rs` | `try_block_on`, `spawn_detached` — compio runtime shims |
+| `crates/common/src/core_dispatcher.rs` | `CoreDispatcher`: thread pool + compio runtimes |
+| `crates/common/src/runtime.rs` | `try_block_on`, `spawn_detached`: compio runtime shims |
 | `crates/server/src/c2s/router.rs` | `Router` + `RouterShard` (sharded by username) |
 | `crates/server/src/channel/manager.rs` | `ChannelManager` + `ChannelShard` (sharded by channel) |
 | `crates/server/src/channel/membership.rs` | `Membership` + `MembershipShard` (sharded by username) |

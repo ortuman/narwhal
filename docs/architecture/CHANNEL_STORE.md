@@ -1,4 +1,4 @@
-# Channel Store — Architecture Specification
+# Channel Store: Architecture Specification
 
 > **Status:** Implemented.
 > **Related PRs:** see `crates/server/src/channel/file_store.rs` history.
@@ -33,7 +33,7 @@
 
 ## Overview
 
-The channel store is the persistence layer for **channel metadata** — the
+The channel store is the persistence layer for **channel metadata**: the
 handler, owner, configuration, ACLs, and sorted member list of each persistent
 channel. It is separate from, but colocated with, the
 [message log](MESSAGE_LOG.md) that persists broadcast messages.
@@ -76,14 +76,14 @@ hashing the handler modulo the shard count).
   ACLs, member list).
 - Survive process restart: rebuild the full membership graph and resume
   broadcasts at the correct sequence number.
-- Atomic updates — a concurrent crash must leave either the old or the new
+- Atomic updates: a concurrent crash must leave either the old or the new
   version intact, never a half-written file.
 - Share a single on-disk directory with the message log so that deleting a
   channel is a single-directory operation.
 
 **Non-Goals:**
 - Cross-channel queries (there is no global index beyond directory enumeration).
-- Incremental metadata updates — each save rewrites the whole file.
+- Incremental metadata updates; each save rewrites the whole file.
 - Version migration tooling (the current format has no version byte; see
   [Constants](#constants)).
 - Replication or distributed consensus.
@@ -126,7 +126,7 @@ fn channel_hash(handler: &StringAtom) -> StringAtom {
 |----------|-------|
 | Algorithm | SHA-256 |
 | Encoding  | Lowercase hex, 64 characters |
-| Inputs    | `handler.as_bytes()` — no salt, no normalization |
+| Inputs    | `handler.as_bytes()`; no salt, no normalization |
 | Determinism | Same handler ⇒ same hash forever |
 
 Using a hash (instead of the raw handler) gives a fixed-length, filesystem-safe
@@ -161,9 +161,9 @@ pub struct PersistedChannel {
 | Property | Value |
 |----------|-------|
 | Encoding | postcard (varint-length-prefixed, little-endian) |
-| Header | None — the format has no magic bytes or version byte |
-| Integrity | No CRC — atomic write protocol avoids torn writes, but does not provide corruption detection (see below) |
-| Max size | 64 MiB — enforced on load to refuse obviously corrupt files |
+| Header | None; the format has no magic bytes or version byte |
+| Integrity | No CRC; atomic write protocol avoids torn writes, but does not provide corruption detection (see below) |
+| Max size | 64 MiB; enforced on load to refuse obviously corrupt files |
 
 **Why no CRC:** the atomic write protocol (write-tmp → fsync → rename → fsync
 parent dir) guarantees that readers always see either the previous successful
@@ -208,7 +208,7 @@ pub trait ChannelStore: Clone + Send + Sync + 'static {
 ```
 
 **Key design decisions:**
-- `save_channel` accepts a *projected* `PersistedChannel` — callers build the
+- `save_channel` accepts a *projected* `PersistedChannel`; callers build the
   post-change snapshot, and the store rewrites the file whole. No partial
   updates.
 - `save_channel` returns the storage hash so the caller can cache it on the
@@ -224,7 +224,7 @@ pub trait ChannelStore: Clone + Send + Sync + 'static {
 ### PersistedChannel
 
 The persisted struct mirrors the in-memory `Channel` but only the fields that
-must survive a restart — ephemeral state (subscribers, broadcast sequence
+must survive a restart. Ephemeral state (subscribers, broadcast sequence
 counter, flush tasks) is reconstructed on restore.
 
 | Field | Reconstructed on restore? |
@@ -262,10 +262,10 @@ save_channel(projected)
 
 Steps 5 and 7 are what make the write crash-safe:
 
-| Step | If the process crashes immediately after… | Result after restart |
+| Step | If the process crashes immediately after | Result after restart |
 |------|-------------------------------------------|----------------------|
 | 4 | tmp file written but not fsynced | `metadata.bin.tmp` may be zero-length or partial; ignored (only `metadata.bin` is loaded) |
-| 5 | tmp contents are durable | Ditto — `metadata.bin.tmp` ignored |
+| 5 | tmp contents are durable | Ditto; `metadata.bin.tmp` ignored |
 | 6 | rename durable in directory cache but parent not fsynced | On most filesystems the rename may not have reached disk; the *previous* `metadata.bin` remains visible |
 | 7 | parent dir fsynced | New `metadata.bin` is guaranteed visible post-crash |
 
@@ -306,7 +306,7 @@ delete_channel(hash)
 ```
 
 Step 3 succeeds only if the directory is empty. If the channel still has
-message log segments, `remove_dir` fails — which is the intended behavior:
+message log segments, `remove_dir` fails, which is the intended behavior:
 the caller (`ChannelShard::delete_persistent_storage`) always calls
 `message_log.delete()` first, so log files are gone by the time
 `delete_channel` runs. If the log delete fails, the metadata delete will
@@ -343,7 +343,7 @@ load_channel_hashes()
 └─ Return Arc<[StringAtom]>
 ```
 
-A directory **without** a `metadata.bin` is by definition not a live channel —
+A directory **without** a `metadata.bin` is by definition not a live channel:
 either a crashed-at-creation leftover or a residue of a failed delete. The
 sweep keeps the data directory tidy so repeated crashes don't accumulate
 garbage.
@@ -370,10 +370,10 @@ bootstrap(core_dispatcher, restore_channels):
 This pre-load uses two round trips per channel (`load_channel_hashes` then
 `load_channel`) but runs only once, on the coordinating thread, before any
 shard starts. The hashes (not the full metadata) are what get dispatched to
-shards — each shard re-loads its assigned channels on its own thread during
+shards. Each shard re-loads its assigned channels on its own thread during
 `restore_and_run`. This keeps `PersistedChannel`'s `Rc<[Nid]>` thread-local.
 
-`restore_channels` is `false` when auth is disabled — without authentication,
+`restore_channels` is `false` when auth is disabled. Without authentication,
 memberships are session-scoped and have no meaning across restarts, so
 restoring them would produce orphaned channels.
 
@@ -403,7 +403,7 @@ For each hash:
 
 **Guarantees:**
 - A channel whose `metadata.bin` fails to load is **skipped** (with a warning),
-  not fatal — one corrupt channel cannot prevent the server from starting.
+  not fatal; one corrupt channel cannot prevent the server from starting.
 - Broadcast sequence numbers are continuous across restarts: every new
   broadcast has `seq > last_seq` of whatever survived in the message log.
 - Per-client channel limits are only enforced on *new* joins, never on
@@ -422,7 +422,7 @@ share a directory by convention:
 | Update frequency | Rare (join/leave/config/ACL) | Every broadcast |
 | Directory derivation | `sha256_hex(handler)` | `sha256_hex(handler)` (same function) |
 
-The shared hashing function is the only coupling between the two — everything
+The shared hashing function is the only coupling between the two; everything
 else (file naming, I/O model, recovery) is independent. `FileMessageLog`
 never reads `metadata.bin`, and `FileChannelStore` never reads log segments.
 
@@ -438,12 +438,12 @@ next start.
   single-threaded on the owning shard's thread.
 - `FileChannelStore` is `Clone + Send + Sync`: cloned into each shard at
   bootstrap, each shard uses its own copy.
-- Internal state is just `Arc<PathBuf>` — no mutability, no locks, no atomics.
+- Internal state is just `Arc<PathBuf>`: no mutability, no locks, no atomics.
 - Two shards can save different channels concurrently (different directories),
   but never the **same** channel, because each channel is pinned to exactly
   one shard.
 - Within a shard, `save_channel` calls are naturally serialized by the
-  single-threaded actor loop; there is no in-flight-save coalescing — each
+  single-threaded actor loop; there is no in-flight-save coalescing; each
   mutation triggers one save.
 
 ## Constants

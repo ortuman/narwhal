@@ -128,7 +128,7 @@ git checkout -b fix/issue-description
 Write clear, descriptive commit messages:
 
 - Use the present tense ("Add feature" not "Added feature")
-- Use the imperative mood ("Move cursor to..." not "Moves cursor to...")
+- Use the imperative mood ("Move cursor to." not "Moves cursor to.")
 - Limit the first line to 72 characters or less
 - Reference issues and pull requests when relevant
 

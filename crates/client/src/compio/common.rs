@@ -202,10 +202,10 @@ where
   ///
   /// # Arguments
   ///
-  /// * `client_id` — human-readable identifier (for logs).
-  /// * `config` — connection and retry settings.
-  /// * `dialer` — factory for new transport streams.
-  /// * `handshaker` — performs the protocol handshake on each new stream.
+  /// * `client_id`: human-readable identifier (for logs).
+  /// * `config`: connection and retry settings.
+  /// * `dialer`: factory for new transport streams.
+  /// * `handshaker`: performs the protocol handshake on each new stream.
   pub fn new(
     client_id: impl Into<String>,
     config: Config,
@@ -567,7 +567,7 @@ where
 
 /// A single connection to a Narwhal server, driven by compio.
 ///
-/// The struct itself is `Send` (it holds only `Arc`, channels, tokens, ...).
+/// The struct itself is `Send` (it holds only `Arc`, channels, tokens, etc.).
 /// The actual I/O tasks (reader + writer) live on the compio event loop of
 /// the thread that called [`connect`].
 struct ClientConn<S, HS, ST>
@@ -712,7 +712,7 @@ where
     Ok(())
   }
 
-  /// Signals cancellation — the reader / writer tasks will observe it and
+  /// Signals cancellation. The reader / writer tasks will observe it and
   /// exit on their own.
   async fn shutdown(&self) -> anyhow::Result<()> {
     self.shutdown_token.cancel();
@@ -777,7 +777,7 @@ where
               }
             },
             Err(_) => {
-              // All senders dropped — exit.
+              // All senders dropped, exit.
               break;
             },
           }
@@ -891,7 +891,7 @@ where
                       },
                     }
                   } else {
-                    // Unsolicited inbound message — no correlation id.
+                    // Unsolicited inbound message: no correlation id.
                     match res {
                       Ok((msg, payload_opt)) => {
                         if let Err(e) = inbound_tx.try_send((msg, payload_opt)) {

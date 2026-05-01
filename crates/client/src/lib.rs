@@ -6,11 +6,11 @@
 //!
 //! ## I/O Models
 //!
-//! Two runtime back-ends are available as public modules — pick the one that
+//! Two runtime back-ends are available as public modules. Pick the one that
 //! matches your application's async runtime:
 //!
-//! - **[`tokio`]** — poll/readiness-based (Tokio)
-//! - **[`compio`]** — completion-based (compio)
+//! - **[`tokio`]**: poll/readiness-based (Tokio)
+//! - **[`compio`]**: completion-based (compio)
 //!
 //! Import the client types you need directly from the corresponding module,
 //! e.g. `narwhal_client::tokio::c2s::C2sClient` or `narwhal_client::compio::c2s::C2sClient`.

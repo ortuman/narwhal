@@ -1,4 +1,4 @@
-# Message Log — Architecture Specification
+# Message Log: Architecture Specification
 
 > **Status:** Implemented.
 > **Related PRs:** [#221](https://github.com/lonewolf-io/narwhal/pull/221) (HISTORY/CHAN_SEQ protocol), [#227](https://github.com/lonewolf-io/narwhal/pull/227) (FileMessageLog implementation)
@@ -22,7 +22,7 @@
   - [Segment Roll](#segment-roll)
 - [Read Path](#read-path)
   - [Index Lookup](#index-lookup)
-  - [EntryReader — Zero-Allocation Positioned Reads](#entryreader--zero-allocation-positioned-reads)
+  - [EntryReader: Zero-Allocation Positioned Reads](#entryreader-zero-allocation-positioned-reads)
   - [Visitor Invocation](#visitor-invocation)
 - [Eviction](#eviction)
 - [Recovery](#recovery)
@@ -40,8 +40,8 @@ The message log is a per-channel, segmented, append-only storage engine that
 persists broadcast messages for channels with persistence enabled. It serves two
 protocol operations introduced in PR #221:
 
-- **`HISTORY`** — retrieve archived messages from a channel.
-- **`CHAN_SEQ`** — query the available sequence range of a channel's log.
+- **`HISTORY`**: retrieve archived messages from a channel.
+- **`CHAN_SEQ`**: query the available sequence range of a channel's log.
 
 Each persistent channel maintains its own message log as a set of segment files
 with companion sparse index files, stored in the channel's existing directory.
@@ -140,8 +140,8 @@ Each entry is a self-contained binary record:
 **Fixed overhead per entry: 26 bytes.**
 
 **Omitted fields:**
-- **`channel`** — implicit from the directory/file path.
-- **`history_id`** — injected by the caller at read time, not a property of the stored message.
+- **`channel`**: implicit from the directory/file path.
+- **`history_id`**: injected by the caller at read time, not a property of the stored message.
 
 ### Sparse Index Files
 
@@ -183,7 +183,7 @@ Index files are accessed via `mmap` (using the `memmap2` crate), mirroring how
 Apache Kafka manages its offset indexes. There are two distinct modes depending
 on whether the segment is active or sealed:
 
-**Active segment — read-write `MmapMut`:**
+**Active segment, read-write `MmapMut`:**
 
 When a new segment is created, its `.idx` file is **pre-allocated** to the
 maximum capacity it could ever need, then memory-mapped read-write:
@@ -207,7 +207,7 @@ beyond `SEGMENT_MAX_BYTES`. If that final overshooting append also crosses an
 index interval boundary while the index is at peak utilization, the
 implementation has no slot left to record it. The append path guards with
 `pos + INDEX_ENTRY_SIZE <= mmap.len()` and silently drops the would-be index
-entry — correctness is preserved (no out-of-bounds write, the segment rolls
+entry. Correctness is preserved (no out-of-bounds write, the segment rolls
 on the next append), but the un-indexed tail of that segment will be reached
 by a linear scan from the previous index entry. The scan distance is bounded
 by `INDEX_INTERVAL_BYTES + max_entry_size`. Bumping the formula by one slot
@@ -216,12 +216,12 @@ pre-allocation per segment.
 
 New index entries are written directly into the mmap at the current write
 position (`active_idx_write_pos`). This avoids `write()` syscalls for index
-updates — the kernel handles page dirtying and writeback. The active `.idx`
+updates; the kernel handles page dirtying and writeback. The active `.idx`
 file handle is kept open and durability is enforced with async
 `sync_all().await` on that file (instead of synchronous `mmap.flush()`), so
 flush/roll do not block the shard runtime thread.
 
-**Sealed segments — read-only `Mmap`:**
+**Sealed segments, read-only `Mmap`:**
 
 When a segment is rolled (finalized), the index lifecycle is:
 
@@ -244,7 +244,7 @@ new entries continue from where the previous session left off.
 **Binary search:**
 
 Both `Mmap` (sealed) and `MmapMut` (active) are searched with the same
-`index_lookup_in(&[u8], target_relative_seq)` function — a standard binary
+`index_lookup_in(&[u8], target_relative_seq)` function: a standard binary
 search for the largest `relative_seq <= target`. For the active index, the
 slice is bounded to `&mmap[..active_idx_write_pos]` to exclude the
 zero-filled pre-allocated tail.
@@ -332,7 +332,7 @@ pub trait MessageLog: 'static {
 - `read` is async (io_uring positioned reads via `EntryReader`) and the visitor
   is also async, allowing it to perform I/O (e.g., sending messages) between
   entry reads.
-- No `direction` parameter — the client computes the appropriate `from_seq`
+- No `direction` parameter; the client computes the appropriate `from_seq`
   using `first_seq`/`last_seq` from the `CHAN_SEQ` response. The log always
   reads forward.
 
@@ -353,7 +353,7 @@ pub trait LogVisitor {
 ```
 
 The visitor borrows entry data directly from the `EntryReader`'s pre-allocated
-buffers — **zero heap allocations** on the read hot path. The `async` signature
+buffers, with **zero heap allocations** on the read hot path. The `async` signature
 allows visitors to perform async work (e.g., sending messages over the network)
 without blocking.
 
@@ -375,7 +375,7 @@ to the transmitter, channel name, `history_id`, and the payload pool:
 └────────────────────────────────────────────────────────────┘
 ```
 
-The "no heap allocation" guarantee applies to the **payload** path — the
+The "no heap allocation" guarantee applies to the **payload** path: the
 `PoolBuffer` is recycled across reads. The frame header path still allocates
 small `StringAtom`s (decoding `from`, cloning `channel` and `history_id`) per
 entry; those allocations are intentional and bounded.
@@ -384,7 +384,7 @@ If `entry.from` contains bytes that are not valid UTF-8 (only possible if a
 corrupt entry passes CRC validation, e.g. across a binary-format change),
 `std::str::from_utf8` returns an error. The visitor propagates it, `read()`
 returns `Err`, and `ChannelShard::history()` exits *before* sending
-`HistoryAck` — the client receives no `HISTORY_ACK` for that request and must
+`HistoryAck`. The client receives no `HISTORY_ACK` for that request and must
 treat the in-flight `MESSAGE` frames already received as the truncated
 result. Operators should treat repeated UTF-8 decode errors as a signal of
 on-disk corruption.
@@ -401,7 +401,7 @@ pub trait MessageLogFactory: Clone + Send + Sync + 'static {
 
 The factory holds `base_dir` and `max_payload_size` at construction time.
 `create()` is async because it performs recovery (scanning segment files,
-validating CRC checksums, rebuilding indexes) using `compio::fs` I/O — and
+validating CRC checksums, rebuilding indexes) using `compio::fs` I/O, and
 it returns `anyhow::Result<Self::Log>` because that recovery may fail (e.g.
 unable to open the active segment for writes or memory-map its index, see
 [Recovery](#recovery)). On `Err`, callers refuse to bring the affected
@@ -427,7 +427,7 @@ append(message, payload, max_messages)
 ```
 
 Writes use **positioned I/O** via `compio::fs::File::write_all_at()` (io_uring
-`WRITE` op). There is no append mode in compio — the file offset is tracked
+`WRITE` op). There is no append mode in compio; the file offset is tracked
 in-memory as `seg.file_size` and passed explicitly to each write. This is safe
 under the single-threaded shard actor model. Data is visible to subsequent reads
 immediately (even before fsync) because both reads and writes operate on the
@@ -443,7 +443,7 @@ same file through the kernel page cache.
 Both syncs run through compio/io_uring and avoid synchronous `mmap.flush()`
 inside async shard code.
 
-**Durability guarantee:** same as Kafka — data survives process crashes (data is
+**Durability guarantee:** same as Kafka. Data survives process crashes (data is
 in the kernel page cache) but not power loss without fsync. The existing flush
 mechanism (immediate when `message_flush_interval=0`, or periodic via background
 task) is unchanged.
@@ -451,7 +451,7 @@ task) is unchanged.
 **Linux dependency.** Skipping `mmap.flush()` (i.e. `msync`) and relying on
 `sync_all()` of the underlying file handle to flush pages dirtied through
 `MmapMut` is correct on Linux because file-backed mmaps share the unified
-page cache with regular file I/O — `fsync(2)` flushes all dirty pages backing
+page cache with regular file I/O: `fsync(2)` flushes all dirty pages backing
 the file regardless of how they were dirtied. POSIX does not guarantee this
 in general; the design assumes the io_uring/Linux runtime environment
 already required by the rest of the project.
@@ -501,7 +501,7 @@ To read from `from_seq`:
    or the segment ends (then continue to next segment)
 ```
 
-### EntryReader — Zero-Allocation Positioned Reads
+### EntryReader: Zero-Allocation Positioned Reads
 
 Instead of chunk-based buffered reading, the implementation uses an `EntryReader`
 struct that performs **two positioned reads per entry** via `compio::fs::File`
@@ -567,7 +567,7 @@ before reducing it.
 ```
 
 Buffers are moved into compio via `std::mem::take()` for each I/O op and
-reclaimed from `BufResult` — the standard compio buffer-ownership pattern.
+reclaimed from `BufResult`, the standard compio buffer-ownership pattern.
 
 ### Visitor Invocation
 
@@ -599,7 +599,7 @@ retention window. This means actual disk usage may slightly exceed
 messages), but the trade-off is clean O(1) eviction with no rewriting.
 
 **Active-segment invariant:** the active (last) segment is **never** evicted,
-even if all of its entries fall outside the retention window — there must
+even if all of its entries fall outside the retention window; there must
 always be a segment to append into. The worst-case on-disk overhead per
 channel is therefore approximately one segment's worth of data: about
 `SEGMENT_MAX_BYTES` (128 MiB) above `max_persist_messages * avg_entry_size`,
@@ -611,14 +611,14 @@ or under bursty traffic where a single segment fills before
 `max_persist_messages` worth of newer messages arrive. Operators sizing disk
 should plan accordingly.
 
-A `max_persist_messages` of `0` is interpreted as **no eviction** — the log
+A `max_persist_messages` of `0` is interpreted as **no eviction**: the log
 grows unbounded. This is the de facto behavior of `MessageLog::append` when
 called with `max_messages == 0`.
 
 ## Recovery
 
 On startup, the message log restores its state from disk. Recovery is **fully
-async** — all file I/O uses `compio::fs` (io_uring), except for `read_dir`
+async**: all file I/O uses `compio::fs` (io_uring), except for `read_dir`
 (no compio equivalent, uses `std::fs`).
 
 An `EntryReader` and an index rebuild buffer (`Vec<u8>`) are created once at the
@@ -804,8 +804,8 @@ owned by a shard actor, and the shard processes commands sequentially. There is
 no concurrent read/write access to a channel's message log.
 
 - No locks, no atomics.
-- `Rc<MessageLog>` (not `Arc`) — consistent with the existing `Channel` struct.
-- Interior mutability via `RefCell` — provides runtime borrow checking that
+- `Rc<MessageLog>` (not `Arc`); consistent with the existing `Channel` struct.
+- Interior mutability via `RefCell`; provides runtime borrow checking that
   catches violations in debug builds. The `MessageLog` trait exposes `&self`
   methods; `FileMessageLog` uses `RefCell<Inner>` to mutate internal state.
 - `read()` and `append()` are never called concurrently for the same channel.
@@ -836,7 +836,7 @@ and survives_restart) in `crates/server/tests/c2s_channel_persistence.rs` and
 
 Tests use `tempfile::TempDir` for isolated file system state.
 
-Existing tests using `NoopMessageLog` remain unchanged — they verify channel
+Existing tests using `NoopMessageLog` remain unchanged; they verify channel
 manager logic independently of persistence.
 
 ## File Locations

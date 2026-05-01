@@ -1,4 +1,4 @@
-# FIFO Channels — Architecture Specification
+# FIFO Channels: Architecture Specification
 
 > **Status:** Proposed. Not yet implemented.
 > **Related design:** [Message Log](MESSAGE_LOG.md), [Channel Store](CHANNEL_STORE.md)
@@ -16,7 +16,7 @@
   - [Living as a FIFO Channel](#living-as-a-fifo-channel)
   - [Destroying a FIFO Channel](#destroying-a-fifo-channel)
 - [Protocol Additions](#protocol-additions)
-  - [Configuration messages — `type` field](#configuration-messages--type-field)
+  - [Configuration messages: `type` field](#configuration-messages-type-field)
   - [`PUSH` / `PUSH_ACK`](#push--push_ack)
   - [`POP` / `POP_ACK`](#pop--pop_ack)
   - [`GET_CHAN_LEN` / `CHAN_LEN`](#get_chan_len--chan_len)
@@ -42,12 +42,12 @@ A **FIFO channel** is a work-queue style channel where:
 
 - The channel **owner** is the only client that can publish elements (via `PUSH`).
 - Any **JOINed, read-authorized member** can consume elements (via `POP`).
-  The existing read ACL applies — the same gate used for `MESSAGE` delivery
+  The existing read ACL applies, the same gate used for `MESSAGE` delivery
   on pub/sub channels.
 - Each element is **returned by at most one successful `POP`**
   (competing-consumers model). Under the at-most-once loss model an element
   may be returned by zero successful `POP`s if the server crashes between
-  cursor fsync and `POP_ACK` socket write — see
+  cursor fsync and `POP_ACK` socket write; see
   [Cursor Durability](#cursor-durability).
 - Consumption is **destructive**: once `POP` returns an element, it is gone from the queue.
 
@@ -86,7 +86,7 @@ be transitioned to FIFO once, but the reverse is not allowed.
 FIFO channels implement **competing consumers**: when N JOINed clients are issuing
 `POP`s concurrently against the same FIFO channel, each element is returned by
 **at most one** successful `POP` (zero if the server crashes between cursor fsync
-and `POP_ACK` socket write — see the [loss model](#loss-model)). Two clients
+and `POP_ACK` socket write; see the [loss model](#loss-model)). Two clients
 calling `POP` simultaneously will receive different elements (or one of them will
 receive `QUEUE_EMPTY`); they will never both receive the same element.
 
@@ -98,7 +98,7 @@ cursor. There is no fairness scheduler beyond mailbox arrival order
 ### Ordering and Concurrency
 
 `PUSH` and `POP` are both processed on the channel's shard actor (existing
-sharding by channel handler — see [ACTOR_SHARDING.md](ACTOR_SHARDING.md)).
+sharding by channel handler, see [ACTOR_SHARDING.md](ACTOR_SHARDING.md)).
 This serialization gives:
 
 - `PUSH`es from the owner are appended to the log in arrival order.
@@ -107,7 +107,7 @@ This serialization gives:
   (`Channel::next_seq()` in `crates/server/src/channel/manager.rs`) before
   the entry is appended; the message log persists whatever `seq` it is
   given. This matches the pub/sub `BROADCAST` path. **`seq` is not exposed
-  on the wire** for FIFO commands — it is an internal invariant only.
+  on the wire** for FIFO commands; it is an internal invariant only.
 
 ### Loss Model
 
@@ -129,7 +129,7 @@ There is **no** `CREATE` command. A FIFO channel is born from an ordinary
 pub/sub channel via reconfiguration:
 
 1. A client `JOIN`s a non-existent channel name. The channel is auto-created as
-   pub/sub. The first joiner becomes the owner (existing behavior — see
+   pub/sub. The first joiner becomes the owner (existing behavior; see
    `Channel.owner`, `crates/server/src/channel/manager.rs`).
 2. The owner sends `SET_CHAN_CONFIG id=<corr> channel=<name> type=fifo
    persist=true max_persist_messages=<N>` to convert the channel.
@@ -140,7 +140,7 @@ pub/sub channel via reconfiguration:
 unless the merged-config result satisfies all of:
 
 - `type = fifo`
-- `persist = true` (FIFO channels are inherently persistent — the head cursor
+- `persist = true` (FIFO channels are inherently persistent: the head cursor
   and segment files must survive restart).
 - `max_persist_messages > 0` (the queue depth cap; without it, `QUEUE_FULL`
   cannot be enforced).
@@ -151,21 +151,21 @@ Existing pub/sub state at transition time:
   consumers eligible to `POP`.
 - **Buffered messages are purged logically (no physical truncation).** Any
   messages held in the message log at transition time become unreachable to
-  consumers — they belong to the pub/sub semantics and have already been
+  consumers; they belong to the pub/sub semantics and have already been
   delivered (or evicted) under those rules. Head-eviction reclaims the
   now-unreachable segments lazily as the cursor stays past them, modulo
   the [tail-segment retention invariant](#segment-eviction) which keeps
   `log.last_seq()` recoverable.
 
 - **Crash-safe transition ordering.** The transition durably touches two
-  artifacts: `cursor.bin` (new — initial head) and `metadata.bin`
-  (updated — `channel_type=fifo`, possibly `persist`/`max_persist_messages`).
+  artifacts: `cursor.bin` (new: initial head) and `metadata.bin`
+  (updated: `channel_type=fifo`, possibly `persist`/`max_persist_messages`).
   Order: **flush log → write cursor → write metadata**.
 
   1. **Establish the durable log tail.** Synchronously flush the message
      log and fsync, so `log.last_seq()` reflects on-disk state and is not
      just an in-memory value. (`MessageLog::last_seq()` can otherwise
-     include unflushed appends — initializing the cursor from a
+     include unflushed appends; initializing the cursor from a
      non-durable tail risks `cursor.next_seq > log.last_seq() + 1` after
      a crash, which the recovery model treats as corruption.)
   2. Atomic write of `cursor.bin` with `next_seq = log.last_seq() + 1`
@@ -178,7 +178,7 @@ Existing pub/sub state at transition time:
 
   - **Crash before (2)** (during or after the log flush, before the
     cursor write): no FIFO state has been committed. On restart the
-    channel restores from whatever `metadata.bin` exists (or doesn't —
+    channel restores from whatever `metadata.bin` exists (or doesn't;
     see below). The transition simply did not happen; the operator
     retries `SET_CHAN_CONFIG`.
   - **Crash between (2) and (3)** has two sub-cases depending on whether
@@ -190,7 +190,7 @@ Existing pub/sub state at transition time:
       reads it). The operator retries `SET_CHAN_CONFIG`; the stranded
       `cursor.bin` is overwritten on retry or removed on `DELETE`.
     - **Was transient (`persist=false`, the auto-create default).**
-      No `metadata.bin` exists on disk — the channel store only saves
+      No `metadata.bin` exists on disk: the channel store only saves
       metadata when the merged config is persistent (see
       `set_channel_configuration` in
       `crates/server/src/channel/manager.rs`, `save_channel` is gated
@@ -200,7 +200,7 @@ Existing pub/sub state at transition time:
       never happened. The original transient channel state is gone (it
       was in-memory only), so a re-`JOIN` creates a fresh pub/sub
       channel and the operator retries the `SET_CHAN_CONFIG`. The
-      orphaned `cursor.bin` should be cleaned up — either by the
+      orphaned `cursor.bin` should be cleaned up, either by the
       channel directory's lazy-init path on the next save, or via an
       explicit startup sweep (operator may also remove the channel
       directory manually).
@@ -245,11 +245,11 @@ Existing pub/sub state at transition time:
 While a channel is FIFO:
 
 - `BROADCAST` is rejected (`WRONG_TYPE`).
-- `HISTORY` and `CHAN_SEQ` are rejected (`WRONG_TYPE`) — destructive consumption
+- `HISTORY` and `CHAN_SEQ` are rejected (`WRONG_TYPE`); destructive consumption
   has no archive contract.
 - `PUSH` and `POP` are valid.
 - `MEMBER_JOINED` / `MEMBER_LEFT` events still fire on JOIN/LEAVE.
-- `MESSAGE` is **never** pushed — `PUSH` does not fan out to subscribers.
+- `MESSAGE` is **never** pushed; `PUSH` does not fan out to subscribers.
   Consumers must explicitly `POP`.
 - The owner cannot `LEAVE` (returns `OWNER_CANNOT_LEAVE`). The only way out is
   `DELETE`. (Because the owner is always a member, the existing pub/sub
@@ -258,11 +258,11 @@ While a channel is FIFO:
 
 ### Destroying a FIFO Channel
 
-`DELETE` (existing message) is the only path. Authorization is owner-only —
+`DELETE` (existing message) is the only path. Authorization is owner-only,
 already enforced by `delete_channel` in `manager.rs`. On DELETE:
 
 - `CHANNEL_DELETED` event is broadcast to all *other* JOINed members
-  (existing path — `notify_channel_deleted` excludes the deleter's
+  (existing path; `notify_channel_deleted` excludes the deleter's
   resource); the deleting owner receives `DELETE_ACK` instead.
 - Channel metadata, message log segments, head cursor sidecar, and the
   channel's persistence directory are removed.
@@ -270,7 +270,7 @@ already enforced by `delete_channel` in `manager.rs`. On DELETE:
 
 ## Protocol Additions
 
-### Configuration messages — `type` field
+### Configuration messages: `type` field
 
 Two existing structs in `crates/protocol/src/message.rs` are extended:
 
@@ -327,7 +327,7 @@ Errors:
   (see [Head Cursor](#head-cursor)).
 - `NOT_IMPLEMENTED` if `channel_id.domain != local_domain`.
 
-`PUSH_ACK` carries no `seq` — server-side ordering is implicit and not useful
+`PUSH_ACK` carries no `seq`; server-side ordering is implicit and not useful
 to the client.
 
 ### `POP` / `POP_ACK`
@@ -359,7 +359,7 @@ on FIFO) and does **not** carry `from` (always the owner; redundant).
 The cursor advance is fsynced **before** the `POP_ACK` is written to the
 socket. This guarantees no duplication: any element whose advance has been
 fsynced is gone from the queue forever, even if the server crashes
-immediately after. The reverse is **not** guaranteed — a crash between the
+immediately after. The reverse is **not** guaranteed: a crash between the
 cursor fsync and the socket write loses that element (the queue believes it
 was delivered; the client never received it). This is at-most-once: an
 element may be lost, but never duplicated.
@@ -388,14 +388,14 @@ Errors:
   (see [Head Cursor](#head-cursor)).
 - `NOT_IMPLEMENTED` if `channel_id.domain != local_domain`.
 
-Only the owner may query the length. Consumers do not need it — they discover
+Only the owner may query the length. Consumers do not need it; they discover
 emptiness via `QUEUE_EMPTY` on `POP`. The owner uses it to gauge backpressure
 before risking `QUEUE_FULL`.
 
 ### Event: `CHANNEL_RECONFIGURED`
 
 A new `EventKind` variant fired to all JOINed members on any successful
-`SET_CHAN_CONFIG` request (not only type transitions — also `max_clients`,
+`SET_CHAN_CONFIG` request (not only type transitions, also `max_clients`,
 `max_payload_size`, `persist`, etc.).
 
 ```
@@ -475,18 +475,18 @@ On-disk format (16 bytes, fixed):
 
 CRC32 is computed over the first 8 bytes (`next_seq`, little-endian).
 
-The sidecar holds only the **head** of the queue. The **tail** (`last_seq` —
+The sidecar holds only the **head** of the queue. The **tail** (`last_seq`,
 the most recently appended seq) is recovered from the message log; the
 [tail-segment retention invariant](#segment-eviction) ensures it is always
 on disk.
 
 Fields:
 
-- `next_seq` — the lowest seq not yet **committed-as-consumed**: the seq
+- `next_seq`: the lowest seq not yet **committed-as-consumed**, the seq
   the next `POP` will read. Advances when `POP` durably commits the
   consumption (cursor fsync), which happens **before** `POP_ACK` is
   written to the socket. The cursor advance, not `POP_ACK` reaching the
-  client, is the commit point — a crash between cursor fsync and socket
+  client, is the commit point: a crash between cursor fsync and socket
   write loses that element on the consumer side (cursor past it; client
   never received bytes). This is the at-most-once consumer-side loss
   model documented in [Cursor Durability](#cursor-durability).
@@ -494,7 +494,7 @@ Fields:
 **Invariants** (on disk, after every cursor fsync):
 
 - `next_seq >= 1` (sequence numbers are 1-based; `0` is never valid).
-- `next_seq <= log.last_seq() + 1` — the cursor never advances past the
+- `next_seq <= log.last_seq() + 1`: the cursor never advances past the
   most recent durable PUSH (see [Cursor Durability](#cursor-durability)).
 - `next_seq == log.last_seq() + 1` iff the queue is empty.
 - For every seq in `[next_seq ..= log.last_seq()]`, the entry is present
@@ -539,7 +539,7 @@ existing pub/sub `BROADCAST` rules driven by `message_flush_interval`
   crash before the next periodic flush silently drops the most recent
   PUSHes that the producer received ACKs for. On restart,
   `log.last_seq()` simply reflects the last fsynced entry; the lost
-  entries do not surface — same as `BROADCAST`.
+  entries do not surface, same as `BROADCAST`.
 
 The cursor is unaffected in either case: only entries that were never
 POPed (and therefore never contributed to a cursor advance) can be
@@ -569,7 +569,7 @@ where `log.last_seq() - next_seq + 1` would underflow as a `u64`.
 
 `POP` performs an **immediate fsync** on the cursor sidecar before sending
 `POP_ACK`. `PUSH` log writes follow the existing pub/sub durability rules
-driven by `message_flush_interval` — FIFO does **not** diverge from
+driven by `message_flush_interval`; FIFO does **not** diverge from
 `BROADCAST` here. The cursor sidecar is only ever written by `POP` (and
 once at type transition).
 
@@ -577,7 +577,7 @@ once at type transition).
 
 1. Append the entry to the message log buffer.
 2. If `message_flush_interval == 0`: synchronously flush+fsync the log
-   (per the existing `BROADCAST` semantics — see
+   (per the existing `BROADCAST` semantics; see
    [`docs/PROTOCOL.md`](../PROTOCOL.md) and `broadcast_payload` in
    `crates/server/src/channel/manager.rs`). Otherwise the entry stays in
    the log buffer until the next periodic flush.
@@ -588,11 +588,11 @@ Therefore `PUSH_ACK` durability **mirrors `BROADCAST` exactly**:
 - **`message_flush_interval == 0` (the auto-create default):** the entry
   is fsynced before `PUSH_ACK` is sent. A hard crash after `PUSH_ACK`
   cannot lose the entry. (`PUSH_ACK` still does not survive an in-flight
-  network drop — see ACK-loss ambiguity below.)
+  network drop; see ACK-loss ambiguity below.)
 - **`message_flush_interval > 0`:** the entry sits in the log buffer
   until the next periodic flush (or until a concurrent `POP` forces one,
   see the `POP` path below). A hard crash before the next flush silently
-  drops the entry — same as `BROADCAST`.
+  drops the entry, same as `BROADCAST`.
 
 The choice between the two is the operator's, configured via
 `SET_CHAN_CONFIG`; FIFO does not impose its own value.
@@ -617,7 +617,7 @@ address this server-side; out of scope for v1 (see
    already covered the entry, this is a cheap no-op. **This step is
    required:** without it, `POP` could read a buffered (not-yet-fsynced)
    entry, advance the cursor durably, and crash before the log was
-   flushed — leaving `cursor.next_seq > log.last_seq() + 1` on disk,
+   flushed, leaving `cursor.next_seq > log.last_seq() + 1` on disk,
    which the recovery model treats as corruption.
 3. Update `cursor.bin` with `next_seq = previous_next_seq + 1`.
 4. `fsync` `cursor.bin`.
@@ -626,11 +626,11 @@ address this server-side; out of scope for v1 (see
 A crash between (4) and (5) loses that element on the consumer side
 (cursor advanced; client never received bytes). This is the at-most-once
 consumer-side loss model: **no duplication, possible loss**. The
-no-duplication contract is the load-bearing one — at no point can two
+no-duplication contract is the load-bearing one: at no point can two
 clients (or one client across retries) receive the same physical queue
 element.
 
-**Cursor write protocol** (atomic, mirrors the channel-store write — see
+**Cursor write protocol** (atomic, mirrors the channel-store write; see
 [CHANNEL_STORE.md](CHANNEL_STORE.md)):
 
 1. Write to `cursor.bin.tmp`.
@@ -639,7 +639,7 @@ element.
 4. `fsync` the parent directory.
 
 **Throughput cost.** `PUSH` matches `BROADCAST` semantics across both
-flush modes — synchronous fsync per `PUSH` when
+flush modes: synchronous fsync per `PUSH` when
 `message_flush_interval == 0`, batched flushing on the configured
 interval otherwise. `POP` costs **one** cursor fsync in the common
 case; in the worst case (POP racing ahead of the background flusher),
@@ -655,7 +655,7 @@ FIFO eviction has two ends:
 - **Tail eviction (existing pub/sub behavior) is disabled.** `PUSH` is
   rejected with `QUEUE_FULL` whenever the **logical queue depth** would
   exceed `max_persist_messages` after appending. Logical depth comes from
-  the cursor's `next_seq` and the log's `last_seq()` — **not** from the
+  the cursor's `next_seq` and the log's `last_seq()`, **not** from the
   physical number of entries on disk. Popped elements remain on disk until
   their segment is head-evicted, so a check against physical retention
   would spuriously reject `PUSH`es after consumers have drained part of a
@@ -692,18 +692,18 @@ channel's type (or on a flag passed at log creation time).
 `PersistedChannel` (defined in `crates/server/src/channel/store.rs`; used
 by `file_store.rs`) gains one new field:
 
-- `channel_type: ChannelType` — enum `{ PubSub, Fifo }`.
+- `channel_type: ChannelType`: enum `{ PubSub, Fifo }`.
 
 This is a positional postcard schema change. Because the project is
 **pre-production**, no migration path is required: existing on-disk
 `metadata.bin` files written before this change become unreadable and the
 expected operator action is to wipe `<channels_root>` and let the server
 start fresh. (If/when the project ships, a versioned envelope or per-version
-decoder will need to be introduced — out of scope here.)
+decoder will need to be introduced; out of scope here.)
 
 The owner is already persisted in `PersistedChannel`. No change there.
 
-The cursor is **not** part of the postcard-encoded metadata file — it is its
+The cursor is **not** part of the postcard-encoded metadata file; it is its
 own sidecar (`cursor.bin`, see above) so that the high-frequency cursor fsync
 does not require rewriting the larger metadata blob.
 
@@ -714,7 +714,7 @@ The following pub/sub paths must branch on channel type:
 | Path                                  | Pub/Sub                          | FIFO                                |
 | ------------------------------------- | -------------------------------- | ----------------------------------- |
 | `LEAVE` handler (manager.rs)          | Removes member; clears owner if owner leaves; auto-deletes channel if last member | Returns `OWNER_CANNOT_LEAVE` if owner; otherwise removes member. Auto-delete-on-empty is implicitly unreachable since the owner is always a member. |
-| `remove_member` (manager.rs)          | Clears `owner` if owner is the leaver | Never reached for owner — LEAVE rejects upstream |
+| `remove_member` (manager.rs)          | Clears `owner` if owner is the leaver | Never reached for owner; LEAVE rejects upstream |
 | Empty-channel auto-delete sites (manager.rs) | Removes channel | Unreachable for FIFO (precondition `member_count == 0` cannot be met). Defensive type-gate is optional. |
 | Message log eviction policy           | Tail-evict at cap                | Reject PUSH at cap (`QUEUE_FULL`)    |
 | `BROADCAST` handler                   | Append + fan out                 | `WRONG_TYPE`                         |
@@ -761,13 +761,13 @@ New metrics under the `narwhal` channel prefix:
 
 | Metric                        | Type      | Notes                                  |
 | ----------------------------- | --------- | -------------------------------------- |
-| `fifo_pushes{result}`         | Counter   | One label per `PUSH` outcome — see below. |
-| `fifo_pops{result}`           | Counter   | One label per `POP` outcome — see below.  |
+| `fifo_pushes{result}`         | Counter   | One label per `PUSH` outcome; see below. |
+| `fifo_pops{result}`           | Counter   | One label per `POP` outcome; see below.  |
 | `fifo_queue_depth`            | Gauge     | Per-channel? Or aggregate? (see implementation note) |
 | `fifo_cursor_fsync_seconds`   | Histogram | Wall time of cursor fsync.             |
 
 **`fifo_pushes{result}` labels** (must cover every documented `PUSH`
-outcome — see [PUSH errors](#push--push_ack)):
+outcome; see [PUSH errors](#push--push_ack)):
 
 - `success`
 - `channel_not_found`
@@ -780,7 +780,7 @@ outcome — see [PUSH errors](#push--push_ack)):
 - `not_implemented` (non-local domain)
 
 **`fifo_pops{result}` labels** (must cover every documented `POP`
-outcome — see [POP errors](#pop--pop_ack)):
+outcome; see [POP errors](#pop--pop_ack)):
 
 - `success`
 - `channel_not_found`
@@ -794,7 +794,7 @@ outcome — see [POP errors](#pop--pop_ack)):
 Implementations must emit exactly one of these labels per call. If a
 new outcome is added in the future and the implementation has not yet
 been updated, it should be bucketed into a single `other` label rather
-than dropped — and the doc updated alongside.
+than dropped, and the doc updated alongside.
 
 Per-channel gauges blow up cardinality. The `fifo_queue_depth` gauge
 should be aggregate (sum across channels) or omitted in favor of an
@@ -856,7 +856,7 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
      written + fsynced first, then `metadata.bin` updated + fsynced,
      then `SET_CHAN_CONFIG_ACK` sent. A crash before metadata is
      written must leave the channel as pub/sub (a stranded
-     `cursor.bin` is acceptable — pub/sub ignores it).
+     `cursor.bin` is acceptable; pub/sub ignores it).
    - Implement type-aware branches in `LEAVE` (reject for owner with
      `OWNER_CANNOT_LEAVE`), `BROADCAST`, `HISTORY` / `CHAN_SEQ` (all return
      `WRONG_TYPE`).
@@ -874,7 +874,7 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
      specified seq, used by `POP` when the entry it is reading is not
      yet durable.
    - `PUSH` durability follows existing pub/sub batching driven by
-     `message_flush_interval` — no FIFO-specific change.
+     `message_flush_interval`; no FIFO-specific change.
 4. **Cursor sidecar:**
    - 16-byte layout: `next_seq` (u64-LE) + `crc32` (u32-LE) + 4-byte
      zero pad. CRC32 is over `next_seq` only.
@@ -898,7 +898,7 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
    - Add `channel_type: ChannelType` (enum `{ PubSub, Fifo }`) to
      `PersistedChannel` (defined in `store.rs`). Existing on-disk
      `metadata.bin` files written before this change will fail to
-     decode — acceptable because the project is pre-production;
+     decode. Acceptable because the project is pre-production;
      operators wipe `<channels_root>` before upgrading. (A versioned
      envelope can be introduced later when production durability is
      required; out of scope here.)
@@ -935,7 +935,7 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
      elements (let the background flusher run), POP all N, restart, then
      `PUSH` one more element and verify it is assigned `seq = N + 1`. This
      exercises that the segment containing `log.last_seq()` is retained
-     across drain — without the invariant, head-eviction would remove the
+     across drain. Without the invariant, head-eviction would remove the
      last segment and the seq counter would reset on restart.
    - **Force-flush-on-POP test:** with `message_flush_interval` set to a
      long value (e.g. 60s), issue a `PUSH` followed immediately by a
@@ -953,7 +953,7 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
      `kill` does not discard. Reliably observing the loss requires an
      OS-level crash (VM reset / power cut), which is not in the unit/
      integration test budget. Keep this case to a contract assertion
-     only — do not write a test that expects the entry to be absent.
+     only; do not write a test that expects the entry to be absent.
    - Crash-during-POP test (kill between cursor fsync and `POP_ACK` socket
      write): verify the next consumer does **not** see the lost element
      (no duplication is the load-bearing contract).

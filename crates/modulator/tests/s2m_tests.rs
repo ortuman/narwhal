@@ -107,7 +107,7 @@ async fn test_s2m_max_connection_limit_reached() -> anyhow::Result<()> {
   let mut suite = S2mSuite::with_config(config, modulator).await;
   suite.setup().await?;
 
-  // Establish a first connection — keep it alive as a local variable.
+  // Establish a first connection, keeping it alive as a local variable.
   let _first = suite.socket_connect().await?;
 
   // Connect to the server again and expect an error.

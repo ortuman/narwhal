@@ -503,7 +503,7 @@ async fn test_c2s_leave_on_behalf() -> anyhow::Result<()> {
   suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
   suite.join_channel(TEST_USER_2, "!test1@localhost", None).await?;
 
-  // Ignore new member EVENT message...
+  // Ignore new member EVENT message.
   suite.ignore_reply(TEST_USER_1).await?;
 
   // Leave on behalf of another user (test_user_2@localhost).
@@ -555,7 +555,7 @@ async fn test_c2s_leave_as_owner() -> anyhow::Result<()> {
   suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
   suite.join_channel(TEST_USER_1, "!test1@localhost", Some("test_user_2@localhost")).await?;
 
-  // Ignore new member EVENT message...
+  // Ignore new member EVENT message.
   suite.ignore_reply(TEST_USER_2).await?;
 
   // Leave from the channel as owner.
@@ -640,7 +640,7 @@ async fn test_c2s_list_members() -> anyhow::Result<()> {
   suite.join_channel(TEST_USER_2, "!test1@localhost", None).await?;
   suite.join_channel(TEST_USER_3, "!test1@localhost", None).await?;
 
-  // Ignore new member EVENT messages...
+  // Ignore new member EVENT messages.
   suite.ignore_reply(TEST_USER_1).await?;
   suite.ignore_reply(TEST_USER_1).await?;
 
@@ -1350,7 +1350,7 @@ async fn test_c2s_channel_acl() -> anyhow::Result<()> {
   suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
   suite.join_channel(TEST_USER_2, "!test1@localhost", None).await?;
 
-  // Ignore new member EVENT message...
+  // Ignore new member EVENT message.
   suite.ignore_reply(TEST_USER_1).await?;
 
   // Set the channel ACL for join permissions
@@ -1772,11 +1772,11 @@ async fn test_c2s_broadcast() -> anyhow::Result<()> {
 
   suite.join_channel(TEST_USER_1, "!test1@localhost", Some("test_user_3@localhost")).await?;
 
-  // Ignore new member EVENT messages...
+  // Ignore new member EVENT messages.
   suite.ignore_reply(TEST_USER_2).await?;
   suite.ignore_reply(TEST_USER_3).await?;
 
-  // Broadcast a message to the channel...
+  // Broadcast a message to the channel.
   suite.broadcast(TEST_USER_1, "!test1@localhost", "Hello world!").await?;
 
   // Verify that the server sent the proper message to the other users.
@@ -1824,7 +1824,7 @@ async fn test_c2s_broadcast_invalid_payload() -> anyhow::Result<()> {
   // Create a channel.
   suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
 
-  // Broadcast a message to the channel...
+  // Broadcast a message to the channel.
   suite
     .write_message(
       TEST_USER_1,
@@ -1837,7 +1837,7 @@ async fn test_c2s_broadcast_invalid_payload() -> anyhow::Result<()> {
     )
     .await?;
 
-  // ... along with an invalid payload.
+  // Then send an invalid payload.
   suite.write_raw_bytes(TEST_USER_1, b"AAAA\n").await?;
 
   // Verify that the server sent the proper error message.
@@ -1884,7 +1884,7 @@ async fn test_c2s_channel_acl_publish_deny() -> anyhow::Result<()> {
     )
     .await?;
 
-  // Broadcast a message to the channel...
+  // Broadcast a message to the channel.
   suite
     .write_message(
       TEST_USER_2,
@@ -1947,7 +1947,7 @@ async fn test_c2s_channel_acl_read_deny() -> anyhow::Result<()> {
     )
     .await?;
 
-  // Broadcast a message to the channel...
+  // Broadcast a message to the channel.
   suite.broadcast(TEST_USER_1, "!test1@localhost", "Hello world!").await?;
 
   // Verify that the server sent the proper message to the other users.
@@ -2166,10 +2166,10 @@ async fn test_c2s_max_channels_reached() -> anyhow::Result<()> {
 
   suite.identify(TEST_USER_1).await?;
 
-  // Create the first channel — should succeed.
+  // Create the first channel: should succeed.
   suite.join_channel(TEST_USER_1, "!test1@localhost", None).await?;
 
-  // Try to create a second channel — should fail with ResourceLimitReached.
+  // Try to create a second channel: should fail with ResourceLimitReached.
   suite
     .write_message(
       TEST_USER_1,
@@ -2188,7 +2188,7 @@ async fn test_c2s_max_channels_reached() -> anyhow::Result<()> {
     }
   );
 
-  // Verify the client is still connected — send a valid request.
+  // Verify the client is still connected by sending a valid request.
   suite.leave_channel(TEST_USER_1, "!test1@localhost").await?;
 
   suite.teardown().await?;

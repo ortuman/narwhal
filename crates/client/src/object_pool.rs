@@ -94,7 +94,7 @@ struct ObjectPoolInner<M: Manager> {
   /// Mutable pool state.
   state: Mutex<ObjectPoolState<M>>,
 
-  /// Semaphore with `max_size` permits — gates how many objects may be
+  /// Semaphore with `max_size` permits; gates how many objects may be
   /// checked out simultaneously.  Callers of [`ObjectPool::get`] acquire a
   /// permit; the permit is released when the [`ObjectPoolObject`] is dropped.
   semaphore: Arc<Semaphore>,
@@ -248,7 +248,7 @@ impl<M: Manager> ObjectPool<M> {
       }
     };
 
-    // Double-check after waking — the pool may have been closed while we
+    // Double-check after waking: the pool may have been closed while we
     // were waiting for the permit.
     if self.inner.state.lock().closed {
       // Permit is dropped here, releasing the slot.
@@ -264,7 +264,7 @@ impl<M: Manager> ObjectPool<M> {
             return Ok(ObjectPoolObject { inner: Some(obj), pool: Arc::clone(&self.inner), _permit: permit });
           },
           Err(_) => {
-            // Unhealthy — detach and try the next idle object.
+            // Unhealthy: detach and try the next idle object.
             self.inner.manager.detach(&mut obj);
             continue;
           },
@@ -347,13 +347,13 @@ impl<M: Manager> ObjectPool<M> {
 /// semaphore permit is released.  This ensures the next waiter always finds
 /// the object in the idle list.
 pub struct ObjectPoolObject<M: Manager> {
-  // Dropped first — taken in the manual `Drop` impl.
+  // Dropped first: taken in the manual `Drop` impl.
   inner: Option<M::Type>,
 
-  // Dropped second — `return_object` is called via this Arc.
+  // Dropped second: `return_object` is called via this Arc.
   pool: Arc<ObjectPoolInner<M>>,
 
-  // Dropped last — releasing the semaphore permit.
+  // Dropped last: releasing the semaphore permit.
   _permit: SemaphoreGuardArc,
 }
 
@@ -504,7 +504,7 @@ mod tests {
     compio::runtime::time::sleep(Duration::from_millis(50)).await;
     assert!(!done.load(Ordering::SeqCst), "spawned task should still be blocked");
 
-    // Return the object — releases the permit and wakes the waiter.
+    // Return the object: releases the permit and wakes the waiter.
     drop(obj);
 
     // Yield so the spawned task can complete.
@@ -577,7 +577,7 @@ mod tests {
     compio::runtime::time::sleep(Duration::from_millis(50)).await;
     assert!(!got_closed.load(Ordering::SeqCst));
 
-    // Close the pool — should immediately wake the blocked waiter.
+    // Close the pool: should immediately wake the blocked waiter.
     pool.close();
 
     // Yield so the spawned task can observe the close signal.
@@ -596,7 +596,7 @@ mod tests {
     let err = pool.get().await;
     assert!(matches!(err, Err(ObjectPoolError::Backend(_))));
 
-    // Slot should have been released — we can try again without blocking.
+    // Slot should have been released: we can try again without blocking.
     let err = pool.get().await;
     assert!(matches!(err, Err(ObjectPoolError::Backend(_))));
   }

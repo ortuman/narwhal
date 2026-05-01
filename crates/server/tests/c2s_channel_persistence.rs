@@ -184,7 +184,7 @@ async fn test_c2s_file_channel_store_deleted_channel_not_restored() -> anyhow::R
     suite.join_channel(TEST_USER_1, CHANNEL, None).await?;
     suite.configure_channel(TEST_USER_1, CHANNEL, None, None, None, Some(true)).await?;
 
-    // Toggle persistence off — should clean up disk storage.
+    // Toggle persistence off: should clean up disk storage.
     suite.configure_channel(TEST_USER_1, CHANNEL, None, None, None, Some(false)).await?;
 
     suite.teardown().await?;
@@ -625,7 +625,7 @@ async fn test_c2s_chan_seq_after_eviction() -> anyhow::Result<()> {
   // max_persist_messages=5 so older messages get evicted.
   suite.configure_channel_full(TEST_USER_1, CHANNEL, None, Some(4096), Some(5), Some(true), Some(0)).await?;
 
-  // Broadcast 20 messages — only the last ~5 should be retained.
+  // Broadcast 20 messages; only the last ~5 should be retained.
   for i in 1..=20 {
     suite.broadcast(TEST_USER_1, CHANNEL, &format!("evict_{i}")).await?;
   }
@@ -749,7 +749,7 @@ async fn test_c2s_history_cross_user() -> anyhow::Result<()> {
   // Drain the MEMBER_JOINED event that user 1 receives.
   suite.ignore_reply(TEST_USER_1).await?;
 
-  // User 1 broadcasts 3 messages (user 2 receives them live — drain those).
+  // User 1 broadcasts 3 messages (user 2 receives them live, drain those).
   for i in 1..=3 {
     suite.broadcast(TEST_USER_1, CHANNEL, &format!("from_u1_{i}")).await?;
     // User 2 receives the live MESSAGE frame.
@@ -947,7 +947,7 @@ async fn test_c2s_history_from_seq_beyond_last() -> anyhow::Result<()> {
     suite.broadcast(TEST_USER_1, CHANNEL, &format!("msg_{i}")).await?;
   }
 
-  // Request history starting from seq 999 — well beyond last_seq.
+  // Request history starting from seq 999, well beyond last_seq.
   suite
     .write_message(
       TEST_USER_1,
@@ -1167,7 +1167,7 @@ async fn test_c2s_toggle_persistence_off_then_on() -> anyhow::Result<()> {
     suite.broadcast(TEST_USER_1, CHANNEL, &format!("old_{i}")).await?;
   }
 
-  // Disable persistence — should clean up the log.
+  // Disable persistence: should clean up the log.
   suite.configure_channel(TEST_USER_1, CHANNEL, None, None, None, Some(false)).await?;
 
   // Re-enable persistence and broadcast new messages.

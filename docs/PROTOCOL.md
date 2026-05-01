@@ -110,9 +110,9 @@ Narwhal implements a custom TCP-based protocol rather than leveraging existing p
 
 2. **Simplicity Through Constraint**: The protocol intentionally avoids complex features like nested types or recursive data structures. Message parameters are flat, consisting of simple scalar values (strings, integers) with optional binary payloads. This constraint makes the protocol easier to implement, debug, and reason about, while still providing all the functionality needed for pub/sub messaging.
 
-3. **Efficiency Without Complexity**: By avoiding nested types and keeping message structures flat, we eliminate the need for complex parsing and serialization logic. This reduces CPU overhead, memory allocations, and latency—critical factors for real-time systems handling thousands of concurrent connections.
+3. **Efficiency Without Complexity**: By avoiding nested types and keeping message structures flat, we eliminate the need for complex parsing and serialization logic. This reduces CPU overhead, memory allocations, and latency, which are critical factors for real-time systems handling thousands of concurrent connections.
 
-4. **Hybrid Design for Future Flexibility**: The protocol uses a hybrid approach with text-based message headers and binary payloads. This provides excellent debuggability during development (text headers are human-readable over the wire) while maintaining efficiency for payload delivery. Importantly, this design can be trivially migrated to a fully binary protocol if needed—the text headers can be replaced with binary-encoded message types and length-prefixed parameters without changing the protocol's semantics.
+4. **Hybrid Design for Future Flexibility**: The protocol uses a hybrid approach with text-based message headers and binary payloads. This provides excellent debuggability during development (text headers are human-readable over the wire) while maintaining efficiency for payload delivery. Importantly, this design can be trivially migrated to a fully binary protocol if needed: the text headers can be replaced with binary-encoded message types and length-prefixed parameters without changing the protocol's semantics.
 
 5. **Tailored Message Flow**: Generic protocols often impose constraints that don't align with our needs. For example, HTTP's request-response model doesn't naturally support bidirectional streaming or server-initiated messages. By building our own protocol, we can design message flows that perfectly match the pub/sub domain: connection handshakes, channel subscriptions, broadcasts, and modulator delegation.
 
@@ -518,7 +518,7 @@ Acknowledges a channel leave request.
 LEAVE_ACK id=2
 ```
 
-**Disconnect behavior**: When a user's last connection disconnects, the server automatically removes them from all **transient** (non-persistent) channels. Membership in **persistent** channels (`persist=true`) is preserved across disconnects — users remain members until they explicitly leave or are removed by the channel owner. Without authentication, all channel memberships are always cleaned up on disconnect regardless of the persistence flag.
+**Disconnect behavior**: When a user's last connection disconnects, the server automatically removes them from all **transient** (non-persistent) channels. Membership in **persistent** channels (`persist=true`) is preserved across disconnects; users remain members until they explicitly leave or are removed by the channel owner. Without authentication, all channel memberships are always cleaned up on disconnect regardless of the persistence flag.
 
 ---
 
@@ -894,7 +894,7 @@ CHAN_CONFIG id=9 channel=!42@example.com max_clients=100 max_payload_size=104857
 
 ### SET_CHAN_CONFIG
 
-Sets the configuration for a channel. Only the channel owner can modify configuration. All configuration parameters are optional — only the fields present in the message are updated; absent fields retain their current values.
+Sets the configuration for a channel. Only the channel owner can modify configuration. All configuration parameters are optional: only the fields present in the message are updated; absent fields retain their current values.
 
 **Direction**: Client → Server
 
@@ -1467,7 +1467,7 @@ Server → Other Clients: MESSAGE channel=!42@example.com from=alice@example.com
 Server → Other Clients: [payload: "Hello, World!"]
 ```
 
-The `seq` in `BROADCAST_ACK` matches the `seq` in the `MESSAGE` delivered to recipients — both refer to the same position in the channel's message log. The `timestamp` is assigned once by the server and is identical for all recipients of the same broadcast.
+The `seq` in `BROADCAST_ACK` matches the `seq` in the `MESSAGE` delivered to recipients; both refer to the same position in the channel's message log. The `timestamp` is assigned once by the server and is identical for all recipients of the same broadcast.
 
 ### Example 3a: Authentication with Modulator Support
 

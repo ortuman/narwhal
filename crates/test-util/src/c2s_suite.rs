@@ -410,7 +410,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sSuite<CS, MLF> {
       )
       .await?;
 
-    // ... along with the payload.
+    // along with the payload.
     self.write_raw_bytes(username, payload.as_bytes()).await?;
     self.write_raw_bytes(username, b"\n").await?;
 

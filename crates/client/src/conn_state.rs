@@ -53,7 +53,7 @@ pub(crate) struct PendingRequest {
   /// response arrives.
   pub sender: Option<ResponseSender>,
 
-  /// Owned semaphore permit — released when this entry is removed,
+  /// Owned semaphore permit, released when this entry is removed,
   /// allowing another request to be submitted.
   pub _permit: SemaphoreGuardArc,
 }

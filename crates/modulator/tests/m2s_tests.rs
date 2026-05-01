@@ -85,7 +85,7 @@ async fn test_m2s_max_connection_limit_reached() -> anyhow::Result<()> {
   let mut suite = M2sSuite::with_config(config).await;
   suite.setup().await?;
 
-  // Establish a first connection — keep it alive as a local variable.
+  // Establish a first connection, keeping it alive as a local variable.
   let _first = suite.socket_connect().await?;
 
   // Connect to the server again and expect an error.

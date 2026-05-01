@@ -1097,7 +1097,7 @@ async fn test_c2s_persisted_channels_restored_when_auth_enabled() -> anyhow::Res
   let store = InMemoryChannelStore::new();
   seed_persistent_channel(&store, "!persist@localhost").await?;
 
-  // Restart with auth enabled — channel should be restored.
+  // Restart with auth enabled: channel should be restored.
   let modulator = TestModulator::new()
     .with_auth_handler(|token| async move { Ok(AuthResult::Success { username: StringAtom::from(token.as_ref()) }) });
 
@@ -1157,7 +1157,7 @@ async fn test_c2s_persisted_channels_not_restored_when_auth_disabled() -> anyhow
   let store = InMemoryChannelStore::new();
   seed_persistent_channel(&store, "!persist@localhost").await?;
 
-  // Restart WITHOUT auth (no modulator) — channel should NOT be restored.
+  // Restart WITHOUT auth (no modulator): channel should NOT be restored.
   let mlf = narwhal_server::channel::NoopMessageLogFactory;
   let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), None, None, store.clone(), mlf).await?;
   suite.setup().await?;
