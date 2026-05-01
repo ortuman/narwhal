@@ -262,7 +262,7 @@ save_channel(projected)
 
 Steps 5 and 7 are what make the write crash-safe:
 
-| Step | If the process crashes immediately after | Result after restart |
+| Step | If the process crashes immediately after this step | Result after restart |
 |------|-------------------------------------------|----------------------|
 | 4 | tmp file written but not fsynced | `metadata.bin.tmp` may be zero-length or partial; ignored (only `metadata.bin` is loaded) |
 | 5 | tmp contents are durable | Ditto; `metadata.bin.tmp` ignored |

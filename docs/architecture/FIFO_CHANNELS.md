@@ -42,7 +42,7 @@ A **FIFO channel** is a work-queue style channel where:
 
 - The channel **owner** is the only client that can publish elements (via `PUSH`).
 - Any **JOINed, read-authorized member** can consume elements (via `POP`).
-  The existing read ACL applies, the same gate used for `MESSAGE` delivery
+  The existing read ACL applies; it is the same gate used for `MESSAGE` delivery
   on pub/sub channels.
 - Each element is **returned by at most one successful `POP`**
   (competing-consumers model). Under the at-most-once loss model an element
