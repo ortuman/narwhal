@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use narwhal_protocol::{Message, Nid};
-use narwhal_server::channel::store::{ChannelStore, ChannelType, LogVisitor, MessageLog, MessageLogFactory, PersistedChannel};
+use narwhal_server::channel::store::{
+  ChannelStore, ChannelType, LogVisitor, MessageLog, MessageLogFactory, PersistedChannel,
+};
 use narwhal_server::channel::{ChannelAcl, ChannelConfig};
 use narwhal_util::pool::PoolBuffer;
 use narwhal_util::string_atom::StringAtom;

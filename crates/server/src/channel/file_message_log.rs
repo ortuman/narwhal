@@ -1348,7 +1348,14 @@ impl MessageLogFactory for FileMessageLogFactory {
     let channel_dir = self.channel_dir_for(handler);
     let fifo_mode = matches!(mode, LogMode::Fifo);
     let segment_max = self.segment_max_bytes.unwrap_or(SEGMENT_MAX_BYTES);
-    FileMessageLog::open_with_segment_max(channel_dir, self.max_payload_size, segment_max, fifo_mode, self.metrics.clone()).await
+    FileMessageLog::open_with_segment_max(
+      channel_dir,
+      self.max_payload_size,
+      segment_max,
+      fifo_mode,
+      self.metrics.clone(),
+    )
+    .await
   }
 
   fn channel_dir(&self, handler: &StringAtom) -> Option<PathBuf> {

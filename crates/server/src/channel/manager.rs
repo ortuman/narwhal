@@ -1456,9 +1456,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     }
 
     // FIFO requires durable storage with a non-zero retention.
-    if new_type == ChannelType::Fifo
-      && (!is_persistent || new_config.max_persist_messages.unwrap_or(0) == 0)
-    {
+    if new_type == ChannelType::Fifo && (!is_persistent || new_config.max_persist_messages.unwrap_or(0) == 0) {
       return Err(
         narwhal_protocol::Error::new(BadRequest)
           .with_id(correlation_id)
@@ -1533,9 +1531,8 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
 
       // Steps 6/7: emit reconfigured event + ack.
       Self::emit_channel_reconfigured(channel, &channel_id, transmitter.clone(), self.local_domain.clone()).await;
-      transmitter.send_message(Message::SetChannelConfigurationAck(SetChannelConfigurationAckParameters {
-        id: correlation_id,
-      }));
+      transmitter
+        .send_message(Message::SetChannelConfigurationAck(SetChannelConfigurationAckParameters { id: correlation_id }));
       return Ok(());
     }
 

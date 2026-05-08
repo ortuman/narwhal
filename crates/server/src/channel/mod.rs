@@ -2,9 +2,9 @@
 
 mod manager;
 
+pub(crate) mod fifo_cursor;
 pub mod file_message_log;
 pub mod file_store;
-pub(crate) mod fifo_cursor;
 pub(crate) mod membership;
 pub mod store;
 

@@ -294,12 +294,9 @@ mod tests {
 
   #[test]
   fn fifo_errors_are_recoverable() {
-    for reason in [
-      ErrorReason::QueueEmpty,
-      ErrorReason::QueueFull,
-      ErrorReason::WrongType,
-      ErrorReason::CursorRecoveryRequired,
-    ] {
+    for reason in
+      [ErrorReason::QueueEmpty, ErrorReason::QueueFull, ErrorReason::WrongType, ErrorReason::CursorRecoveryRequired]
+    {
       assert!(Error::new(reason).is_recoverable(), "{reason} should be recoverable");
     }
   }

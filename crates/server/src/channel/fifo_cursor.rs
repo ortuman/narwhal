@@ -89,9 +89,7 @@ impl FifoCursor {
     }
     let queue_non_empty = next_seq <= log_last_seq;
     if queue_non_empty && log_first_seq > next_seq {
-      return Err(anyhow::anyhow!(
-        "cursor.bin: log.first_seq {log_first_seq} > next_seq {next_seq} (queue non-empty)"
-      ));
+      return Err(anyhow::anyhow!("cursor.bin: log.first_seq {log_first_seq} > next_seq {next_seq} (queue non-empty)"));
     }
 
     Ok(Self { next_seq, channel_dir })

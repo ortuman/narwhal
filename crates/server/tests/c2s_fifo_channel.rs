@@ -194,8 +194,11 @@ async fn test_fifo_transition_persists_across_restart() -> anyhow::Result<()> {
   {
     let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
     let store = FileChannelStore::new(data_dir.clone()).await?;
-    let mlf =
-      FileMessageLogFactory::new(data_dir.clone(), default_c2s_config().limits.max_payload_size, MessageLogMetrics::noop());
+    let mlf = FileMessageLogFactory::new(
+      data_dir.clone(),
+      default_c2s_config().limits.max_payload_size,
+      MessageLogMetrics::noop(),
+    );
 
     let mut suite =
       C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
@@ -215,8 +218,11 @@ async fn test_fifo_transition_persists_across_restart() -> anyhow::Result<()> {
   {
     let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
     let store = FileChannelStore::new(data_dir.clone()).await?;
-    let mlf =
-      FileMessageLogFactory::new(data_dir.clone(), default_c2s_config().limits.max_payload_size, MessageLogMetrics::noop());
+    let mlf = FileMessageLogFactory::new(
+      data_dir.clone(),
+      default_c2s_config().limits.max_payload_size,
+      MessageLogMetrics::noop(),
+    );
 
     let mut suite =
       C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
@@ -274,12 +280,7 @@ async fn test_broadcast_on_fifo_returns_wrong_type() -> anyhow::Result<()> {
   suite
     .write_message(
       TEST_USER_1,
-      Message::Broadcast(BroadcastParameters {
-        id: 7,
-        channel: StringAtom::from(CHANNEL),
-        qos: None,
-        length: 1,
-      }),
+      Message::Broadcast(BroadcastParameters { id: 7, channel: StringAtom::from(CHANNEL), qos: None, length: 1 }),
     )
     .await?;
   // The codec frames the payload as `bytes + \n` after the BROADCAST header.
@@ -369,10 +370,7 @@ async fn test_chan_seq_on_fifo_returns_wrong_type() -> anyhow::Result<()> {
   assert!(matches!(reply, Message::SetChannelConfigurationAck { .. }), "unexpected reply: {:?}", reply);
 
   suite
-    .write_message(
-      TEST_USER_1,
-      Message::ChannelSeq(ChannelSeqParameters { id: 9, channel: StringAtom::from(CHANNEL) }),
-    )
+    .write_message(TEST_USER_1, Message::ChannelSeq(ChannelSeqParameters { id: 9, channel: StringAtom::from(CHANNEL) }))
     .await?;
   match suite.read_message(TEST_USER_1).await? {
     Message::Error(p) => {
@@ -422,11 +420,7 @@ async fn test_owner_leave_on_fifo_auto_deletes() -> anyhow::Result<()> {
   suite
     .write_message(
       TEST_USER_1,
-      Message::LeaveChannel(LeaveChannelParameters {
-        id: 22,
-        channel: StringAtom::from(CHANNEL),
-        on_behalf: None,
-      }),
+      Message::LeaveChannel(LeaveChannelParameters { id: 22, channel: StringAtom::from(CHANNEL), on_behalf: None }),
     )
     .await?;
 
