@@ -392,10 +392,13 @@ impl FileMessageLog {
     let result = inner.recover().await;
     inner.metrics.recovery_duration_seconds.observe(start.elapsed().as_secs_f64());
     result?;
-    // Anything that survived recovery is on disk — and was either fsynced
-    // by a previous flush or made durable by the OS sync (in either case
-    // it is durable from this process's perspective).
-    inner.cached_durable_seq = inner.cached_last_seq;
+    // Leave `cached_durable_seq` at 0 after recovery. Recovered entries
+    // are readable from the file but were not fsynced by *this* process,
+    // and the trait contract says "highest seq fsynced via flush".
+    // Sticking to the contract means the first FIFO POP after restart
+    // forces a flush before advancing the cursor, closing a window where
+    // a fresh power loss could lose data while the cursor sidecar said
+    // it had already been consumed.
     Ok(FileMessageLog { inner: RefCell::new(inner) })
   }
 
@@ -2613,6 +2616,26 @@ mod tests {
 
     log.flush().await.unwrap();
     assert_eq!(log.last_durable_seq(), 2);
+  }
+
+  #[compio::test]
+  async fn test_last_durable_seq_resets_to_zero_after_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+      let log = create_log(tmp.path()).await;
+      append_message(&log, 1, "alice@localhost", b"a", 0).await;
+      log.flush().await.unwrap();
+      assert_eq!(log.last_durable_seq(), 1);
+    }
+
+    // Reopen on the same directory: the entry is recoverable, but
+    // durability hasn't been re-established by *this* process.
+    let log = create_log(tmp.path()).await;
+    assert_eq!(log.last_seq(), 1, "entry must survive recovery");
+    assert_eq!(log.last_durable_seq(), 0, "durable seq stays at 0 until first flush in this process");
+
+    log.flush().await.unwrap();
+    assert_eq!(log.last_durable_seq(), 1);
   }
 
   #[compio::test]

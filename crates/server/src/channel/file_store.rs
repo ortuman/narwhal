@@ -74,8 +74,21 @@ impl ChannelStore for FileChannelStore {
       Err(e) => return Err(e.into()),
     };
     for entry in entries {
-      let entry = entry?;
-      if entry.file_type()?.is_file()
+      // Files can disappear between `read_dir`'s snapshot and the per-entry
+      // stat/unlink (parallel deletes, concurrent admin tooling, etc.). Any
+      // NotFound mid-loop is consistent with our idempotent contract and is
+      // skipped instead of propagated.
+      let entry = match entry {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+        Err(e) => return Err(e.into()),
+      };
+      let file_type = match entry.file_type() {
+        Ok(ft) => ft,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+        Err(e) => return Err(e.into()),
+      };
+      if file_type.is_file()
         && let Err(e) = compio::fs::remove_file(entry.path()).await
         && e.kind() != std::io::ErrorKind::NotFound
       {

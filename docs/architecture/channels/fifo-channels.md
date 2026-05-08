@@ -248,7 +248,9 @@ While a channel is FIFO:
 - `HISTORY` and `CHAN_SEQ` are rejected (`WRONG_TYPE`); destructive consumption
   has no archive contract.
 - `PUSH` and `POP` are valid.
-- `MEMBER_JOINED` / `MEMBER_LEFT` events still fire on JOIN/LEAVE.
+- `MEMBER_JOINED` fires on JOIN. `MEMBER_LEFT` fires on **non-owner** LEAVE.
+  Owner LEAVE on a FIFO channel emits `CHANNEL_DELETED` instead of
+  `MEMBER_LEFT` (see "Owner LEAVE auto-deletes" below).
 - `MESSAGE` is **never** pushed; `PUSH` does not fan out to subscribers.
   Consumers must explicitly `POP`.
 - Owner `LEAVE` on a FIFO channel **auto-deletes the channel**: the existing
