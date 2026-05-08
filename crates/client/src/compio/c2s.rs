@@ -340,6 +340,7 @@ impl C2sClient {
       max_persist_messages,
       persist,
       message_flush_interval,
+      r#type: None,
     });
 
     let handle = self.client.send_message(message, None).await?;

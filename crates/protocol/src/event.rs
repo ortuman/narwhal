@@ -30,6 +30,13 @@ pub enum EventKind {
   /// This event is triggered when the channel owner explicitly deletes the
   /// channel. All members are removed and the channel is destroyed.
   ChannelDeleted,
+
+  /// Indicates that a channel's configuration has been changed.
+  ///
+  /// Fires after any successful `SET_CHAN_CONFIG` (including the pub/sub →
+  /// FIFO transition). The payload only carries the channel name; clients
+  /// re-query `GET_CHAN_CONFIG` to read the new configuration.
+  ChannelReconfigured,
 }
 
 impl std::fmt::Display for EventKind {
@@ -52,6 +59,7 @@ impl From<EventKind> for &str {
       EventKind::MemberJoined => "MEMBER_JOINED",
       EventKind::MemberLeft => "MEMBER_LEFT",
       EventKind::ChannelDeleted => "CHANNEL_DELETED",
+      EventKind::ChannelReconfigured => "CHANNEL_RECONFIGURED",
     }
   }
 }
@@ -72,6 +80,7 @@ impl FromStr for EventKind {
       "MEMBER_JOINED" => Ok(EventKind::MemberJoined),
       "MEMBER_LEFT" => Ok(EventKind::MemberLeft),
       "CHANNEL_DELETED" => Ok(EventKind::ChannelDeleted),
+      "CHANNEL_RECONFIGURED" => Ok(EventKind::ChannelReconfigured),
       _ => anyhow::bail!("unknown event kind: {}", s),
     }
   }
@@ -130,5 +139,18 @@ impl From<Event> for Message {
       nid: val.nid.clone(),
       owner: val.owner,
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn round_trip_channel_reconfigured() {
+    let s: &str = EventKind::ChannelReconfigured.into();
+    assert_eq!(s, "CHANNEL_RECONFIGURED");
+    let parsed = EventKind::from_str(s).unwrap();
+    assert_eq!(parsed, EventKind::ChannelReconfigured);
   }
 }

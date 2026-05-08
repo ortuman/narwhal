@@ -251,10 +251,14 @@ While a channel is FIFO:
 - `MEMBER_JOINED` / `MEMBER_LEFT` events still fire on JOIN/LEAVE.
 - `MESSAGE` is **never** pushed; `PUSH` does not fan out to subscribers.
   Consumers must explicitly `POP`.
-- The owner cannot `LEAVE` (returns `OWNER_CANNOT_LEAVE`). The only way out is
-  `DELETE`. (Because the owner is always a member, the existing pub/sub
-  auto-delete-on-empty path can never fire on a FIFO channel; the channel
-  persists until explicit `DELETE`.)
+- Owner `LEAVE` on a FIFO channel **auto-deletes the channel**: the existing
+  `DELETE` machinery runs (`CHANNEL_DELETED` to all other JOINed members,
+  flush-and-cleanup of cursor, segments, metadata, release of all membership
+  slots), and the leaving owner receives `LEAVE_ACK`. An ownerless FIFO is
+  structurally useless because `PUSH` is owner-only and ownership is
+  immutable, so the channel has no productive lifetime past the owner
+  leaving. Clients must therefore treat `LEAVE` on a FIFO they own as
+  destructive.
 
 ### Destroying a FIFO Channel
 
@@ -414,7 +418,6 @@ Added to `narwhal-protocol`:
 | ------------------ | ----------------------------------------------------------------- |
 | `QUEUE_EMPTY`       | `POP` against an empty FIFO channel.                              |
 | `QUEUE_FULL`        | `PUSH` against a full FIFO channel (at `max_persist_messages`).   |
-| `OWNER_CANNOT_LEAVE` | `LEAVE` issued by the owner of a FIFO channel.                    |
 | `WRONG_TYPE`        | Operation incompatible with channel type (e.g. `BROADCAST` on FIFO, `PUSH` on pub/sub). |
 | `CURSOR_RECOVERY_REQUIRED` | `PUSH` / `POP` / `GET_CHAN_LEN` on a FIFO channel whose head cursor is missing or corrupt; awaiting operator action. |
 
@@ -426,7 +429,7 @@ Added to `narwhal-protocol`:
 | Op             | Pub/Sub                       | FIFO                          |
 | -------------- | ----------------------------- | ----------------------------- |
 | `JOIN`         | Anyone (subject to join ACL)  | Anyone (subject to join ACL)  |
-| `LEAVE`        | Any member                    | Members ✓ / **Owner ✗**       |
+| `LEAVE`        | Any member                    | Any member; **owner LEAVE auto-deletes the channel** |
 | `BROADCAST`    | Members (subject to publish ACL) | **Rejected (`WRONG_TYPE`)** |
 | `MESSAGE`      | Sent to read-ACL members      | Never sent                    |
 | `HISTORY`      | Members (subject to read ACL) | **Rejected (`WRONG_TYPE`)**    |
@@ -713,9 +716,9 @@ The following pub/sub paths must branch on channel type:
 
 | Path                                  | Pub/Sub                          | FIFO                                |
 | ------------------------------------- | -------------------------------- | ----------------------------------- |
-| `LEAVE` handler (manager.rs)          | Removes member; clears owner if owner leaves; auto-deletes channel if last member | Returns `OWNER_CANNOT_LEAVE` if owner; otherwise removes member. Auto-delete-on-empty is implicitly unreachable since the owner is always a member. |
-| `remove_member` (manager.rs)          | Clears `owner` if owner is the leaver | Never reached for owner; LEAVE rejects upstream |
-| Empty-channel auto-delete sites (manager.rs) | Removes channel | Unreachable for FIFO (precondition `member_count == 0` cannot be met). Defensive type-gate is optional. |
+| `LEAVE` handler (manager.rs)          | Removes member; clears owner if owner leaves; auto-deletes channel if last member | Owner LEAVE invokes the DELETE machinery (CHANNEL_DELETED to other members, cursor + segments + metadata cleanup); leaver receives `LEAVE_ACK`. Non-owner LEAVE removes member as in pub/sub. |
+| `remove_member` (manager.rs)          | Clears `owner` if owner is the leaver | Not reached for owner on FIFO (owner LEAVE auto-deletes before reaching this path); non-owner path matches pub/sub |
+| Empty-channel auto-delete sites (manager.rs) | Removes channel | Reused: a non-owner LEAVE that empties the channel still triggers cleanup (with the spec-deviation auto-delete-on-owner-LEAVE handling the owner case earlier). |
 | Message log eviction policy           | Tail-evict at cap                | Reject PUSH at cap (`QUEUE_FULL`)    |
 | `BROADCAST` handler                   | Append + fan out                 | `WRONG_TYPE`                         |
 | `HISTORY` / `CHAN_SEQ` handlers       | Read from log                    | `WRONG_TYPE`                         |
@@ -839,8 +842,8 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
      message variants. `Push` and `PopAck` carry `length` like `Broadcast` /
      `Message` and a binary payload.
    - Add `EventKind::ChannelReconfigured`.
-   - Add error reasons: `QUEUE_EMPTY`, `QUEUE_FULL`, `OWNER_CANNOT_LEAVE`,
-     `WRONG_TYPE`, `CURSOR_RECOVERY_REQUIRED`.
+   - Add error reasons: `QUEUE_EMPTY`, `QUEUE_FULL`, `WRONG_TYPE`,
+     `CURSOR_RECOVERY_REQUIRED`.
    - Update serialize/deserialize/validate/test fixtures.
 2. **Channel manager (`crates/server/src/channel/manager.rs`):**
    - Add `Channel.channel_type: ChannelType` and `Channel.cursor` (head seq).
@@ -857,9 +860,11 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
      then `SET_CHAN_CONFIG_ACK` sent. A crash before metadata is
      written must leave the channel as pub/sub (a stranded
      `cursor.bin` is acceptable; pub/sub ignores it).
-   - Implement type-aware branches in `LEAVE` (reject for owner with
-     `OWNER_CANNOT_LEAVE`), `BROADCAST`, `HISTORY` / `CHAN_SEQ` (all return
-     `WRONG_TYPE`).
+   - Implement type-aware branches: `LEAVE` for owner on a FIFO channel
+     auto-deletes via the existing DELETE machinery (CHANNEL_DELETED to
+     other members, cleanup of cursor/segments/metadata) and replies
+     `LEAVE_ACK`; `BROADCAST` and `HISTORY` / `CHAN_SEQ` all return
+     `WRONG_TYPE`.
    - Emit `CHANNEL_RECONFIGURED` from `set_channel_configuration` after a
      successful change.
 3. **Message log (`crates/server/src/...message_log...`):**

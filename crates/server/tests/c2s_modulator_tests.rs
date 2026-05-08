@@ -1039,6 +1039,9 @@ async fn test_c2s_modulator_keep_persistent_channels_on_disconnect() -> anyhow::
     .await?;
   assert!(matches!(suite.read_message(TEST_USER_1).await?, Message::SetChannelConfigurationAck { .. }));
 
+  // User 2 receives a CHANNEL_RECONFIGURED event for the persist toggle.
+  suite.ignore_reply(TEST_USER_2).await?;
+
   // Drop User 1's connection (the only one for that user).
   suite.drop_client(TEST_USER_1)?;
 

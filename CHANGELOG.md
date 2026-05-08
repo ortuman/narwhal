@@ -4,6 +4,8 @@ All notable changes to Narwhal will be documented in this file.
 
 ## Unreleased
 
+* [FEATURE]: FIFO Channels — transition slice. A pub/sub channel can be promoted to a FIFO work-queue via `SET_CHAN_CONFIG type=fifo` (one-way; requires `persist=true` and `max_persist_messages > 0`). Adds error reasons `QUEUE_EMPTY`, `QUEUE_FULL`, `WRONG_TYPE`, `CURSOR_RECOVERY_REQUIRED`; event `CHANNEL_RECONFIGURED` (fires on any successful CHAN_CONFIG change, suppressed on no-op); `type` parameter on `CHAN_CONFIG` (read response, required) and `SET_CHAN_CONFIG` (mutating, optional). After transition, `BROADCAST` / `HISTORY` / `CHAN_SEQ` return `WRONG_TYPE`, and owner `LEAVE` auto-deletes the channel. The data plane (`PUSH` / `POP` / `GET_CHAN_LEN`) and the `protocol.md` update ship in a follow-up PR; FIFO is not production-ready until that lands.
+
 ## 0.6.1 (2026-05-01)
 
 * [CHANGE]: Replace the multi-value `operations` string list on `S2M_CONNECT_ACK` with a single `operation_mask` u64 bitmask. Bit positions are now the authoritative wire contract, frozen in `PROTOCOL.md`'s new `Operation Bit Assignments` section. Breaking wire change with no compatibility shim. [#283](https://github.com/lonewolf-io/narwhal/pull/283)

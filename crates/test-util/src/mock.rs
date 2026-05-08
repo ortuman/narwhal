@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use narwhal_protocol::{Message, Nid};
-use narwhal_server::channel::store::{ChannelStore, LogVisitor, MessageLog, MessageLogFactory, PersistedChannel};
+use narwhal_server::channel::store::{ChannelStore, ChannelType, LogVisitor, MessageLog, MessageLogFactory, PersistedChannel};
 use narwhal_server::channel::{ChannelAcl, ChannelConfig};
 use narwhal_util::pool::PoolBuffer;
 use narwhal_util::string_atom::StringAtom;
@@ -87,6 +87,16 @@ impl MessageLog for FailingMessageLog {
   {
     Ok(0)
   }
+
+  fn last_durable_seq(&self) -> u64 {
+    0
+  }
+
+  fn switch_to_fifo_mode(&self) {}
+
+  async fn evict_below(&self, _seq: u64) -> anyhow::Result<()> {
+    Ok(())
+  }
 }
 
 /// A message log factory that produces `FailingMessageLog` instances sharing a single failure flag.
@@ -110,7 +120,11 @@ impl FailingMessageLogFactory {
 impl MessageLogFactory for FailingMessageLogFactory {
   type Log = FailingMessageLog;
 
-  async fn create(&self, _handler: &StringAtom) -> anyhow::Result<FailingMessageLog> {
+  async fn create(
+    &self,
+    _handler: &StringAtom,
+    _mode: narwhal_server::channel::store::LogMode,
+  ) -> anyhow::Result<FailingMessageLog> {
     Ok(FailingMessageLog { should_fail: self.should_fail.clone() })
   }
 }
@@ -122,6 +136,7 @@ struct StoredChannel {
   config: ChannelConfig,
   acl: ChannelAcl,
   members: Vec<Nid>,
+  channel_type: ChannelType,
 }
 
 /// An in-memory channel store for integration tests.
@@ -146,6 +161,7 @@ impl ChannelStore for InMemoryChannelStore {
       config: channel.config.clone(),
       acl: channel.acl.clone(),
       members: channel.members.iter().cloned().collect(),
+      channel_type: channel.channel_type,
     };
     self.channels.lock().await.insert(handler.clone(), stored);
     Ok(handler)
@@ -170,6 +186,7 @@ impl ChannelStore for InMemoryChannelStore {
       config: stored.config.clone(),
       acl: stored.acl.clone(),
       members: Rc::from(stored.members.clone()),
+      channel_type: stored.channel_type,
     })
   }
 }

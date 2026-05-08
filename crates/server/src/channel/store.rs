@@ -19,6 +19,19 @@ pub struct PersistedChannel {
   pub acl: ChannelAcl,
   #[serde(with = "rc_slice_serde")]
   pub members: Rc<[Nid]>,
+  pub channel_type: ChannelType,
+}
+
+/// Server-side channel-kind marker, persisted in `metadata.bin` to recover
+/// the correct channel mode on restart.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ChannelType {
+  /// Pub/sub channel: BROADCAST → all members, persistence is opt-in for
+  /// HISTORY replay.
+  #[default]
+  PubSub,
+  /// FIFO work-queue channel: PUSH (owner) → POP (any member, destructive).
+  Fifo,
 }
 
 mod rc_slice_serde {
@@ -61,13 +74,42 @@ pub trait MessageLogFactory: Clone + Send + Sync + 'static {
   /// The message log type produced by this factory.
   type Log: MessageLog;
 
-  /// Creates a message log for the given channel handler.
+  /// Creates a message log for the given channel handler in the requested
+  /// mode.
+  ///
+  /// `mode` selects whether the log is opened in pub/sub mode (count-based
+  /// tail eviction on append) or FIFO mode (head-driven eviction via
+  /// `evict_below`, with the tail-segment-retention invariant). For
+  /// startup-restore the mode is derived from the persisted `channel_type`;
+  /// for the in-runtime pub/sub → FIFO transition the manager calls
+  /// `switch_to_fifo_mode` on the live log instead.
   ///
   /// Implementations may perform fallible I/O (e.g. opening the channel
   /// directory, recovering on-disk state, memory-mapping index files). Errors
   /// are returned so the caller can refuse to bring the affected channel
   /// online; the rest of the server keeps running.
-  async fn create(&self, handler: &StringAtom) -> anyhow::Result<Self::Log>;
+  async fn create(&self, handler: &StringAtom, mode: LogMode) -> anyhow::Result<Self::Log>;
+
+  /// On-disk directory where the FIFO head-cursor sidecar (`cursor.bin`)
+  /// for this channel lives. `None` means the backend is in-memory or
+  /// otherwise has no on-disk channel directory; FIFO transitions and FIFO
+  /// recovery require `Some`.
+  fn channel_dir(&self, _handler: &StringAtom) -> Option<std::path::PathBuf> {
+    None
+  }
+}
+
+/// Mode hint passed to `MessageLogFactory::create`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LogMode {
+  /// Pub/sub semantics: tail eviction on append once `max_persist_messages`
+  /// is exceeded; no head cursor, no head-driven eviction.
+  #[default]
+  PubSub,
+  /// FIFO semantics: tail eviction is disabled; eviction is driven by
+  /// `evict_below` from the manager (called after the head cursor advances
+  /// on POP).
+  Fifo,
 }
 
 /// A single entry read from the message log.
@@ -120,6 +162,29 @@ pub trait MessageLog: 'static {
   async fn read(&self, from_seq: u64, limit: u32, visitor: &mut impl LogVisitor) -> anyhow::Result<u32>
   where
     Self: Sized;
+
+  /// Highest sequence number that has been fsynced to disk, or 0 if no
+  /// entry has been fsynced yet. Always `<= last_seq()`.
+  ///
+  /// FIFO POP uses this to skip a redundant `flush()` when the entry at the
+  /// cursor is already durable.
+  fn last_durable_seq(&self) -> u64;
+
+  /// One-shot transition from pub/sub mode to FIFO mode. After this call:
+  ///
+  /// - `append` no longer tail-evicts based on `max_messages`.
+  /// - `evict_below(seq)` becomes the only eviction path.
+  /// - The tail-segment-retention invariant is enforced by `evict_below`.
+  ///
+  /// No-op if the log is already in FIFO mode.
+  fn switch_to_fifo_mode(&self);
+
+  /// Drops sealed segments whose `last_seq < seq`, except the segment that
+  /// contains `last_seq()` (tail-segment-retention invariant: the active
+  /// segment is never evicted, so there is always a place to append into).
+  ///
+  /// No-op in pub/sub mode and cheap when no segment qualifies.
+  async fn evict_below(&self, seq: u64) -> anyhow::Result<()>;
 }
 
 /// A no-op message log that discards all writes and returns empty results.
@@ -155,6 +220,16 @@ impl MessageLog for NoopMessageLog {
   {
     Ok(0)
   }
+
+  fn last_durable_seq(&self) -> u64 {
+    0
+  }
+
+  fn switch_to_fifo_mode(&self) {}
+
+  async fn evict_below(&self, _seq: u64) -> anyhow::Result<()> {
+    Ok(())
+  }
 }
 
 /// A no-op message log factory that produces `NoopMessageLog` instances.
@@ -167,7 +242,68 @@ pub struct NoopMessageLogFactory;
 impl MessageLogFactory for NoopMessageLogFactory {
   type Log = NoopMessageLog;
 
-  async fn create(&self, _handler: &StringAtom) -> anyhow::Result<NoopMessageLog> {
+  async fn create(&self, _handler: &StringAtom, _mode: LogMode) -> anyhow::Result<NoopMessageLog> {
     Ok(NoopMessageLog)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::channel::manager::{ChannelAcl, ChannelConfig};
+
+  fn sample_channel(channel_type: ChannelType) -> PersistedChannel {
+    PersistedChannel {
+      handler: StringAtom::from("ch"),
+      owner: None,
+      config: ChannelConfig::default(),
+      acl: ChannelAcl::default(),
+      members: Rc::from([]),
+      channel_type,
+    }
+  }
+
+  #[test]
+  fn channel_type_postcard_round_trip() {
+    for ct in [ChannelType::PubSub, ChannelType::Fifo] {
+      let bytes = postcard::to_allocvec(&ct).unwrap();
+      let decoded: ChannelType = postcard::from_bytes(&bytes).unwrap();
+      assert_eq!(decoded, ct);
+    }
+  }
+
+  #[test]
+  fn persisted_channel_postcard_round_trip() {
+    for ct in [ChannelType::PubSub, ChannelType::Fifo] {
+      let original = sample_channel(ct);
+      let bytes = postcard::to_allocvec(&original).unwrap();
+      let decoded: PersistedChannel = postcard::from_bytes(&bytes).unwrap();
+      assert_eq!(decoded.channel_type, ct);
+      assert_eq!(decoded.handler, original.handler);
+    }
+  }
+
+  // The pre-FIFO PersistedChannel layout (without `channel_type`).
+  #[derive(serde::Serialize)]
+  struct LegacyPersistedChannel {
+    handler: StringAtom,
+    owner: Option<narwhal_protocol::Nid>,
+    config: ChannelConfig,
+    acl: ChannelAcl,
+    members: Vec<narwhal_protocol::Nid>,
+  }
+
+  #[test]
+  fn legacy_metadata_fails_to_decode() {
+    let legacy = LegacyPersistedChannel {
+      handler: StringAtom::from("ch"),
+      owner: None,
+      config: ChannelConfig::default(),
+      acl: ChannelAcl::default(),
+      members: Vec::new(),
+    };
+    let bytes = postcard::to_allocvec(&legacy).unwrap();
+    let result: Result<PersistedChannel, _> = postcard::from_bytes(&bytes);
+    assert!(result.is_err(), "legacy bytes must not deserialize into the new schema");
   }
 }

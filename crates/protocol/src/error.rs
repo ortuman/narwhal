@@ -59,6 +59,17 @@ pub enum ErrorReason {
   ResourceLimitReached,
   /// The response exceeds the maximum message size limit.
   ResponseTooLarge,
+  /// POP attempted on an empty FIFO channel queue.
+  QueueEmpty,
+  /// PUSH attempted on a FIFO channel whose queue is at `max_persist_messages`.
+  QueueFull,
+  /// Operation requested on a channel whose declared type does not support it
+  /// (e.g. BROADCAST on a FIFO channel, PUSH on a pub/sub channel).
+  WrongType,
+  /// FIFO data-plane operation on a channel whose head cursor failed recovery.
+  /// Operator must restore `cursor.bin`, write a fresh sidecar, or DELETE the
+  /// channel before normal operation can resume.
+  CursorRecoveryRequired,
 }
 
 impl From<ErrorReason> for StringAtom {
@@ -94,6 +105,10 @@ impl From<ErrorReason> for &str {
       ErrorReason::UserNotRegistered => "USER_NOT_REGISTERED",
       ErrorReason::ResourceLimitReached => "RESOURCE_LIMIT_REACHED",
       ErrorReason::ResponseTooLarge => "RESPONSE_TOO_LARGE",
+      ErrorReason::QueueEmpty => "QUEUE_EMPTY",
+      ErrorReason::QueueFull => "QUEUE_FULL",
+      ErrorReason::WrongType => "WRONG_TYPE",
+      ErrorReason::CursorRecoveryRequired => "CURSOR_RECOVERY_REQUIRED",
     }
   }
 }
@@ -135,6 +150,10 @@ impl FromStr for ErrorReason {
       "USER_NOT_REGISTERED" => Ok(ErrorReason::UserNotRegistered),
       "RESOURCE_LIMIT_REACHED" => Ok(ErrorReason::ResourceLimitReached),
       "RESPONSE_TOO_LARGE" => Ok(ErrorReason::ResponseTooLarge),
+      "QUEUE_EMPTY" => Ok(ErrorReason::QueueEmpty),
+      "QUEUE_FULL" => Ok(ErrorReason::QueueFull),
+      "WRONG_TYPE" => Ok(ErrorReason::WrongType),
+      "CURSOR_RECOVERY_REQUIRED" => Ok(ErrorReason::CursorRecoveryRequired),
       _ => anyhow::bail!("unknown error reason: {}", s),
     }
   }
@@ -195,6 +214,10 @@ impl Error {
         | ErrorReason::ServerOverloaded
         | ErrorReason::ResourceLimitReached
         | ErrorReason::ResponseTooLarge
+        | ErrorReason::QueueEmpty
+        | ErrorReason::QueueFull
+        | ErrorReason::WrongType
+        | ErrorReason::CursorRecoveryRequired
     )
   }
 }
@@ -230,3 +253,54 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn round_trip(reason: ErrorReason) {
+    let s: &str = reason.into();
+    let parsed = ErrorReason::from_str(s).unwrap();
+    assert_eq!(parsed, reason);
+  }
+
+  #[test]
+  fn round_trip_queue_empty() {
+    round_trip(ErrorReason::QueueEmpty);
+    let s: &str = ErrorReason::QueueEmpty.into();
+    assert_eq!(s, "QUEUE_EMPTY");
+  }
+
+  #[test]
+  fn round_trip_queue_full() {
+    round_trip(ErrorReason::QueueFull);
+    let s: &str = ErrorReason::QueueFull.into();
+    assert_eq!(s, "QUEUE_FULL");
+  }
+
+  #[test]
+  fn round_trip_wrong_type() {
+    round_trip(ErrorReason::WrongType);
+    let s: &str = ErrorReason::WrongType.into();
+    assert_eq!(s, "WRONG_TYPE");
+  }
+
+  #[test]
+  fn round_trip_cursor_recovery_required() {
+    round_trip(ErrorReason::CursorRecoveryRequired);
+    let s: &str = ErrorReason::CursorRecoveryRequired.into();
+    assert_eq!(s, "CURSOR_RECOVERY_REQUIRED");
+  }
+
+  #[test]
+  fn fifo_errors_are_recoverable() {
+    for reason in [
+      ErrorReason::QueueEmpty,
+      ErrorReason::QueueFull,
+      ErrorReason::WrongType,
+      ErrorReason::CursorRecoveryRequired,
+    ] {
+      assert!(Error::new(reason).is_recoverable(), "{reason} should be recoverable");
+    }
+  }
+}

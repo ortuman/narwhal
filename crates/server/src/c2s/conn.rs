@@ -805,6 +805,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
     let mut channel_id: Option<ChannelId> = None;
 
     let mut channel_config = ChannelConfig::default();
+    let mut requested_type: Option<crate::channel::ChannelType> = None;
 
     if let Message::SetChannelConfiguration(params) = msg {
       correlation_id = params.id;
@@ -818,6 +819,21 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
         persist: params.persist,
         message_flush_interval: params.message_flush_interval,
       };
+
+      if let Some(type_atom) = params.r#type {
+        requested_type = Some(match type_atom.as_ref() {
+          "pubsub" => crate::channel::ChannelType::PubSub,
+          "fifo" => crate::channel::ChannelType::Fifo,
+          other => {
+            return Err(
+              narwhal_protocol::Error::new(BadRequest)
+                .with_id(correlation_id)
+                .with_detail(format!("unknown channel type: {other}"))
+                .into(),
+            );
+          },
+        });
+      }
     }
 
     if channel_config.persist == Some(true) && !self.auth_required {
@@ -834,7 +850,14 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
     // Submit the request to set the channel configuration.
     self
       .channel_manager
-      .set_channel_configuration(channel_config, channel_id.clone(), nid.clone(), transmitter, correlation_id)
+      .set_channel_configuration(
+        channel_config,
+        requested_type,
+        channel_id.clone(),
+        nid.clone(),
+        transmitter,
+        correlation_id,
+      )
       .await?;
 
     trace!(

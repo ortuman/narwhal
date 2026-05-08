@@ -295,8 +295,8 @@ mod tests {
     },
     TestCase {
             name: "CHAN_CONFIG",
-            input: b"CHAN_CONFIG id=1 channel=!1@localhost max_clients=100 max_payload_size=16",
-            expected: Ok(Message::ChannelConfiguration(ChannelConfigurationParameters { id: 1, channel: StringAtom::from("!1@localhost"),  max_clients: 100, max_payload_size:16, ..Default::default() })),
+            input: b"CHAN_CONFIG id=1 channel=!1@localhost max_clients=100 max_payload_size=16 type=pubsub",
+            expected: Ok(Message::ChannelConfiguration(ChannelConfigurationParameters { id: 1, channel: StringAtom::from("!1@localhost"),  max_clients: 100, max_payload_size:16, r#type: StringAtom::from("pubsub"), ..Default::default() })),
         },
     TestCase {
             name: "CONNECT",

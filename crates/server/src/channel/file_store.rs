@@ -137,6 +137,7 @@ mod tests {
   use narwhal_util::string_atom::StringAtom;
 
   use super::*;
+  use crate::channel::store::ChannelType;
   use crate::channel::{ChannelAcl, ChannelConfig};
 
   fn test_channel(handler: &str) -> PersistedChannel {
@@ -155,6 +156,7 @@ mod tests {
         Nid::new_unchecked(StringAtom::from("alice"), StringAtom::from("localhost")),
         Nid::new_unchecked(StringAtom::from("bob"), StringAtom::from("localhost")),
       ]),
+      channel_type: ChannelType::PubSub,
     }
   }
 

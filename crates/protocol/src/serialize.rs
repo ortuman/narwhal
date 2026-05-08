@@ -249,9 +249,10 @@ mod tests {
                     channel: "!1@localhost".into(),
                     max_clients: 100,
                     max_payload_size: 16,
+                    r#type: "pubsub".into(),
                     ..Default::default()
                 }),
-                expected_out: Some("CHAN_CONFIG id=1 channel=!1@localhost max_clients=100 max_payload_size=16 max_persist_messages=0 message_flush_interval=0 persist=false\n".to_string()),
+                expected_out: Some("CHAN_CONFIG id=1 channel=!1@localhost max_clients=100 max_payload_size=16 max_persist_messages=0 message_flush_interval=0 persist=false type=pubsub\n".to_string()),
             },
             TestCase {
                 name: "CONNECT",
