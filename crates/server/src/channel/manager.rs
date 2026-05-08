@@ -1077,9 +1077,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     let mut fifo_cursor_to_delete: Option<FifoCursor> = None;
     if let Some(channel) = self.channels.get_mut(&channel_id.handler) {
       channel.cancel_flush_task();
-      if let ChannelKind::Fifo(FifoState::Healthy(cursor)) =
-        std::mem::replace(&mut channel.kind, ChannelKind::PubSub)
-      {
+      if let ChannelKind::Fifo(FifoState::Healthy(cursor)) = std::mem::replace(&mut channel.kind, ChannelKind::PubSub) {
         fifo_cursor_to_delete = Some(cursor);
       }
       if is_persistent {
