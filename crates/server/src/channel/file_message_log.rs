@@ -1196,23 +1196,25 @@ impl MessageLog for FileMessageLog {
       return Ok(());
     }
     // Drop sealed segments whose entire range sits below `seq`. Never
-    // evict the segment that contains `cached_last_seq` — it is the tail
-    // (active or last-rolled) segment and there must always be a place to
-    // append into. With `segments.len() > 1` we always preserve at least
-    // one segment.
-    while inner.segments.len() > 1 {
-      let head = &inner.segments[0];
-      if head.last_seq >= seq {
-        break;
-      }
-      let removed = inner.segments.remove(0);
-      let log_path = inner.segment_log_path(removed.first_seq);
-      let idx_path = inner.segment_idx_path(removed.first_seq);
-      let fallback_size = removed.file_size;
+    // evict the segment that contains `cached_last_seq` (the tail-segment
+    // retention invariant: there must always be a place to append into),
+    // so the eviction count is capped at `segments.len() - 1`.
+    //
+    // Compute the cutoff once and `drain(..cutoff)` so the remaining tail
+    // shifts a single time, instead of O(n) per removed segment with
+    // `Vec::remove(0)` in a loop.
+    let max_evict = inner.segments.len().saturating_sub(1);
+    let cutoff = inner.segments.iter().take(max_evict).position(|s| s.last_seq >= seq).unwrap_or(max_evict);
+
+    let removed: Vec<SegmentInfo> = inner.segments.drain(..cutoff).collect();
+    for r in removed {
+      let log_path = inner.segment_log_path(r.first_seq);
+      let idx_path = inner.segment_idx_path(r.first_seq);
+      let fallback_size = r.file_size;
       let physical_size = compio::fs::metadata(&log_path).await.map(|m| m.len()).unwrap_or(fallback_size);
       inner.metrics.segments_evicted.inc();
       inner.metrics.evicted_bytes.inc_by(physical_size);
-      drop(removed);
+      drop(r);
       let _ = compio::fs::remove_file(log_path).await;
       let _ = compio::fs::remove_file(idx_path).await;
     }

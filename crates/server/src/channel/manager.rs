@@ -965,7 +965,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
 
     let owner_leaving_fifo = {
       let channel = self.channels.get(&channel_id.handler).unwrap();
-      matches!(channel.kind, ChannelKind::Fifo(_)) && channel.is_owner(&left_member_nid)
+      matches!(&channel.kind, ChannelKind::Fifo(_)) && channel.is_owner(&left_member_nid)
     };
     if owner_leaving_fifo {
       let Some(tx) = transmitter else {
@@ -1131,7 +1131,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
     };
 
-    if matches!(channel.kind, ChannelKind::Fifo(_)) {
+    if matches!(&channel.kind, ChannelKind::Fifo(_)) {
       return Err(narwhal_protocol::Error::new(WrongType).with_id(correlation_id).into());
     }
 
@@ -1695,7 +1695,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
     };
 
-    if matches!(channel.kind, ChannelKind::Fifo(_)) {
+    if matches!(&channel.kind, ChannelKind::Fifo(_)) {
       return Err(narwhal_protocol::Error::new(WrongType).with_id(correlation_id).into());
     }
 
@@ -1749,7 +1749,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
     };
 
-    if matches!(channel.kind, ChannelKind::Fifo(_)) {
+    if matches!(&channel.kind, ChannelKind::Fifo(_)) {
       return Err(narwhal_protocol::Error::new(WrongType).with_id(correlation_id).into());
     }
 
