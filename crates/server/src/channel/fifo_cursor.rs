@@ -111,18 +111,6 @@ impl FifoCursor {
     self.next_seq = new_next_seq;
     Ok(())
   }
-
-  /// Removes `cursor.bin` from disk. Called by the DELETE machinery when
-  /// cleaning up a FIFO channel. NotFound is treated as success (matches
-  /// the existing pattern in `FileChannelStore::delete_channel`).
-  pub async fn delete(&self) -> anyhow::Result<()> {
-    let path = self.channel_dir.join(CURSOR_FILE);
-    match compio::fs::remove_file(&path).await {
-      Ok(()) => Ok(()),
-      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-      Err(e) => Err(e.into()),
-    }
-  }
 }
 
 fn encode(next_seq: u64) -> Vec<u8> {
@@ -168,17 +156,6 @@ mod tests {
 
     let loaded = FifoCursor::load(tmp.path().to_path_buf(), 1, 5).await.unwrap();
     assert_eq!(loaded.next_seq(), 2);
-  }
-
-  #[compio::test]
-  async fn delete_removes_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cursor = FifoCursor::write_initial(tmp.path().to_path_buf(), 3).await.unwrap();
-    assert!(tmp.path().join(CURSOR_FILE).exists());
-    cursor.delete().await.unwrap();
-    assert!(!tmp.path().join(CURSOR_FILE).exists());
-    // Idempotent.
-    cursor.delete().await.unwrap();
   }
 
   #[compio::test]

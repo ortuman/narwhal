@@ -333,7 +333,10 @@ enum Command {
 /// FIFO-side state that is *not* persisted (e.g. the head cursor handle).
 pub(crate) enum ChannelKind {
   PubSub,
-  Fifo(FifoState),
+  // The `FifoState` payload is constructed by restore/transition and is
+  // read by the PR 2 data plane (PUSH/POP/GET_CHAN_LEN); PR 1 only
+  // discriminates the variant.
+  Fifo(#[allow(dead_code)] FifoState),
 }
 
 /// FIFO runtime state. `Healthy` carries an open cursor; `NeedsRecovery` is
@@ -341,7 +344,8 @@ pub(crate) enum ChannelKind {
 /// cursor recovery (PUSH/POP/GET_CHAN_LEN return `CursorRecoveryRequired`
 /// while DELETE/JOIN/LEAVE-non-owner/etc still work).
 pub(crate) enum FifoState {
-  Healthy(super::fifo_cursor::FifoCursor),
+  // Cursor is unused in PR 1; PR 2's POP path reads and advances it.
+  Healthy(#[allow(dead_code)] super::fifo_cursor::FifoCursor),
   NeedsRecovery,
 }
 
@@ -1069,17 +1073,13 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       self.membership.release_slot(username, &channel_id.handler).await;
     }
 
-    // Cancel flush task and perform final flush before cleanup. Capture
-    // the FIFO cursor (if any) up front so we can delete its sidecar
-    // outside the &mut channel borrow once `delete_persistent_storage`
-    // takes the channel mutably.
+    // Cancel flush task and perform final flush before cleanup. The
+    // FIFO cursor sidecar (if any) is wiped by `store.delete_channel`
+    // along with everything else in the channel directory, so the
+    // manager does not need a separate cursor.delete() step.
     let is_persistent = self.channels.get(&channel_id.handler).is_some_and(|c| c.config.persist == Some(true));
-    let mut fifo_cursor_to_delete: Option<FifoCursor> = None;
     if let Some(channel) = self.channels.get_mut(&channel_id.handler) {
       channel.cancel_flush_task();
-      if let ChannelKind::Fifo(FifoState::Healthy(cursor)) = std::mem::replace(&mut channel.kind, ChannelKind::PubSub) {
-        fifo_cursor_to_delete = Some(cursor);
-      }
       if is_persistent {
         let start = Instant::now();
         let result = channel.message_log.flush().await;
@@ -1088,16 +1088,6 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
           warn!(channel = %channel_id.handler, error = %e, "final flush on delete failed");
         }
       }
-    }
-
-    // Best-effort cursor sidecar removal. Errors here would only matter
-    // if the channel directory itself stays around for some reason; the
-    // store cleanup below removes the directory, so a stranded cursor
-    // bin is harmless beyond the immediate failure log.
-    if let Some(cursor) = fifo_cursor_to_delete
-      && let Err(e) = cursor.delete().await
-    {
-      warn!(channel = %channel_id.handler, error = %e, "failed to remove FIFO cursor sidecar");
     }
 
     // Clean up persistent storage. Best effort, must not block channel removal or leak slots.
