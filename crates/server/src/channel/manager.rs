@@ -1052,7 +1052,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
   /// Runs the full delete-channel machinery: notify members, release
   /// membership slots, cancel flush task, final flush, drop persistent
   /// storage (including the FIFO cursor sidecar), and remove the
-  /// in-memory channel. Does **not** send the request ack — callers do
+  /// in-memory channel. Does **not** send the request ack; callers do
   /// that based on which command initiated the delete (DELETE_ACK,
   /// LEAVE_ACK, etc.).
   async fn do_delete_channel(
@@ -1505,7 +1505,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
           // Cursor is stranded on disk. `load_channel_hashes` cleans up
           // directories whose metadata.bin is absent on next restart, and
           // the next successful retry of this same transition will
-          // overwrite it. No in-memory state changed yet — leave the
+          // overwrite it. No in-memory state changed yet, so leave the
           // channel as pub/sub and surface the error.
           return Err(e);
         },
