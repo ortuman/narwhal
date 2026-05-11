@@ -1517,6 +1517,21 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       channel.kind = ChannelKind::Fifo(FifoState::Healthy(cursor));
       channel.config = new_config.clone();
 
+      // Reconcile the periodic flush task against the new interval. FIFO is
+      // always persistent so the persistence-toggle branch is a no-op here,
+      // but a `flush_interval_changed` request still needs the cancel +
+      // optional restart logic that the non-transition path runs below.
+      Self::reconcile_flush_task_after_config_change(
+        channel,
+        &channel_id.handler,
+        false,
+        flush_interval_changed,
+        true,
+        &self.metrics,
+        self.mailbox_tx.clone(),
+      )
+      .await;
+
       // Steps 6/7: emit reconfigured event + ack.
       Self::emit_channel_reconfigured(channel, &channel_id, transmitter.clone(), self.local_domain.clone()).await;
       transmitter
@@ -1546,27 +1561,16 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
 
     channel.config = new_config;
 
-    // Cancel the flush task if persist was toggled off or flush interval changed.
-    if (!is_persistent && was_persistent) || flush_interval_changed {
-      channel.cancel_flush_task();
-
-      // When the flush interval changed but persistence is still enabled, flush any buffered
-      // messages and restart the periodic task immediately so they are not left pending
-      // indefinitely waiting for the next broadcast.
-      if flush_interval_changed && is_persistent {
-        let start = Instant::now();
-        let result = channel.message_log.flush().await;
-        self.metrics.record_flush(start, &result);
-        if let Err(e) = result {
-          warn!(channel = %channel_id.handler, error = %e, "flush on interval change failed");
-        }
-        if let Some(interval) = channel.config.message_flush_interval
-          && interval > 0
-        {
-          channel.ensure_flush_task(interval, self.mailbox_tx.clone());
-        }
-      }
-    }
+    Self::reconcile_flush_task_after_config_change(
+      channel,
+      &channel_id.handler,
+      !is_persistent && was_persistent,
+      flush_interval_changed,
+      is_persistent,
+      &self.metrics,
+      self.mailbox_tx.clone(),
+    )
+    .await;
 
     if !is_persistent && was_persistent {
       self.delete_persistent_storage(&channel_id.handler).await;
@@ -1583,6 +1587,47 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       .send_message(Message::SetChannelConfigurationAck(SetChannelConfigurationAckParameters { id: correlation_id }));
 
     Ok(())
+  }
+
+  /// Reconciles the per-channel periodic flush task with the post-change
+  /// config. Used by both the FIFO transition and non-transition branches of
+  /// `set_channel_configuration` so that toggling persistence or changing
+  /// `message_flush_interval` always cancels the running task and restarts
+  /// a new one when the new interval is non-zero and the channel is still
+  /// persistent.
+  ///
+  /// `channel.config` must already reflect the new configuration when this
+  /// is called.
+  async fn reconcile_flush_task_after_config_change(
+    channel: &mut Channel<MLF::Log>,
+    channel_handler: &StringAtom,
+    persistence_disabled: bool,
+    flush_interval_changed: bool,
+    is_persistent: bool,
+    metrics: &ChannelManagerMetrics,
+    mailbox_tx: Sender<Command>,
+  ) {
+    if !(persistence_disabled || flush_interval_changed) {
+      return;
+    }
+    channel.cancel_flush_task();
+
+    // When the flush interval changed but persistence is still enabled, flush any buffered
+    // messages and restart the periodic task immediately so they are not left pending
+    // indefinitely waiting for the next broadcast.
+    if flush_interval_changed && is_persistent {
+      let start = Instant::now();
+      let result = channel.message_log.flush().await;
+      metrics.record_flush(start, &result);
+      if let Err(e) = result {
+        warn!(channel = %channel_handler, error = %e, "flush on interval change failed");
+      }
+      if let Some(interval) = channel.config.message_flush_interval
+        && interval > 0
+      {
+        channel.ensure_flush_task(interval, mailbox_tx);
+      }
+    }
   }
 
   /// Notifies all members of a successful CHAN_CONFIG change. The event

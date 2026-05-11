@@ -521,6 +521,8 @@ LEAVE_ACK id=2
 
 **Disconnect behavior**: When a user's last connection disconnects, the server automatically removes them from all **transient** (non-persistent) channels. Membership in **persistent** channels (`persist=true`) is preserved across disconnects; users remain members until they explicitly leave or are removed by the channel owner. Without authentication, all channel memberships are always cleaned up on disconnect regardless of the persistence flag.
 
+**FIFO channels**: If the owner of a FIFO channel issues `LEAVE` against it, the server treats it as a channel deletion. The channel is destroyed, a `CHANNEL_DELETED` event is sent to every other member, and the caller receives a `LEAVE_ACK` (not a `DELETE_ACK`).
+
 ---
 
 ### DELETE
@@ -575,6 +577,9 @@ Sends a message to all members of a channel. This message includes a payload.
 BROADCAST id=3 channel=!42@example.com qos=1 length=1024
 [1024 bytes of binary payload follow]
 ```
+
+**Notes**:
+- `BROADCAST` is only valid on `pubsub` channels. On a `fifo` channel the server returns [ERROR](#error) with `WRONG_TYPE`.
 
 ---
 
@@ -885,10 +890,13 @@ Returns the configuration for a channel.
 - `max_persist_messages` (u32, required): Maximum number of messages to persist for this channel (0 = no limit configured)
 - `persist` (bool, required): Whether message persistence is enabled for this channel
 - `message_flush_interval` (u32, required): Interval in milliseconds between periodic message log flushes (0 = flush immediately after each append)
+- `type` (string, required): Channel type (must be non-empty). One of:
+  - `pubsub`: pub/sub channel (default for newly created channels); `BROADCAST` fans out to all members and `HISTORY`/`CHAN_SEQ` are available when persistence is enabled.
+  - `fifo`: FIFO work-queue channel; the data plane uses PUSH/POP/GET_CHAN_LEN. `BROADCAST`, `HISTORY`, and `CHAN_SEQ` return [ERROR](#error) with `WRONG_TYPE` on FIFO channels.
 
 **Example**:
 ```
-CHAN_CONFIG id=9 channel=!42@example.com max_clients=100 max_payload_size=1048576 max_persist_messages=50 message_flush_interval=5000 persist=true
+CHAN_CONFIG id=9 channel=!42@example.com max_clients=100 max_payload_size=1048576 max_persist_messages=50 message_flush_interval=5000 persist=true type=pubsub
 ```
 
 ---
@@ -907,10 +915,22 @@ Sets the configuration for a channel. Only the channel owner can modify configur
 - `max_persist_messages` (u32, optional): Maximum number of messages to persist for this channel
 - `persist` (bool, optional): Whether message persistence is enabled for this channel
 - `message_flush_interval` (u32, optional): Interval in milliseconds between periodic message log flushes (0 = flush immediately after each append)
+- `type` (string, optional): Requested channel type. Accepted values are `pubsub` and `fifo`; any other value is rejected with `BAD_REQUEST`. Omitting the field leaves the type unchanged.
+
+**Type Transitions**:
+- Newly created channels are always `pubsub`. A channel becomes `fifo` only through a `SET_CHAN_CONFIG type=fifo` transition issued by the owner.
+- The transition is one-way: requesting `type=pubsub` on a channel that is already `fifo` is rejected with `BAD_REQUEST`.
+- Transitioning to `fifo` requires `persist=true` and `max_persist_messages > 0` on the resulting configuration (combining the merged values with any unchanged fields). Otherwise the request is rejected with `BAD_REQUEST`.
+- On success, the server emits a [CHANNEL_RECONFIGURED](#event-kinds) event to the other channel members before sending the `SET_CHAN_CONFIG_ACK`.
 
 **Example**:
 ```
 SET_CHAN_CONFIG id=10 channel=!42@example.com max_clients=200 max_payload_size=2097152 message_flush_interval=5000 persist=true
+```
+
+**Example (transition to FIFO)**:
+```
+SET_CHAN_CONFIG id=11 channel=!42@example.com type=fifo persist=true max_persist_messages=1000
 ```
 
 **Response**: [SET_CHAN_CONFIG_ACK](#set_chan_config_ack) or [ERROR](#error)
@@ -952,6 +972,7 @@ CHAN_SEQ id=11 channel=!42@example.com
 
 **Notes**:
 - The server requires the caller to be a member of the channel, to have `read` permission in the channel ACL, and for persistence to be enabled on the channel. Otherwise an [ERROR](#error) with `USER_NOT_IN_CHANNEL`, `NOT_ALLOWED`, or `PERSISTENCE_NOT_ENABLED` is returned.
+- `CHAN_SEQ` is only valid on `pubsub` channels. On a `fifo` channel the server returns [ERROR](#error) with `WRONG_TYPE`.
 
 ---
 
@@ -998,6 +1019,7 @@ HISTORY id=12 channel=!42@example.com from_seq=50 history_id=h1 limit=10
 
 **Notes**:
 - The server requires the caller to be a member of the channel, to have `read` permission in the channel ACL, and for persistence to be enabled on the channel. Otherwise an [ERROR](#error) with `USER_NOT_IN_CHANNEL`, `NOT_ALLOWED`, or `PERSISTENCE_NOT_ENABLED` is returned.
+- `HISTORY` is only valid on `pubsub` channels. On a `fifo` channel the server returns [ERROR](#error) with `WRONG_TYPE`.
 - Requests for a non-local `channel` domain return `NOT_IMPLEMENTED`.
 
 ---
@@ -1371,6 +1393,7 @@ The following error reasons can be returned in [ERROR](#error) messages:
 | `BAD_REQUEST` | The request is malformed or contains invalid parameters |
 | `CHANNEL_NOT_FOUND` | The specified channel does not exist |
 | `CHANNEL_IS_FULL` | The channel has reached its maximum capacity |
+| `CURSOR_RECOVERY_REQUIRED` | A FIFO data-plane operation was rejected because the channel's head cursor failed recovery; the operator must restore `cursor.bin`, write a fresh sidecar, or DELETE the channel before normal operation can resume |
 | `FORBIDDEN` | The request is not allowed due to lack of permissions |
 | `INTERNAL_SERVER_ERROR` | An unexpected error occurred on the server |
 | `NOT_ALLOWED` | The operation is not allowed for the current user or context |
@@ -1378,6 +1401,8 @@ The following error reasons can be returned in [ERROR](#error) messages:
 | `OUTBOUND_QUEUE_FULL` | The connection's outbound queue is full and cannot accept new messages |
 | `PERSISTENCE_NOT_ENABLED` | The target channel does not have message persistence enabled |
 | `POLICY_VIOLATION` | The request violates server policies or rules |
+| `QUEUE_EMPTY` | A `POP` was attempted on an empty FIFO channel queue |
+| `QUEUE_FULL` | A `PUSH` was attempted on a FIFO channel whose queue is at `max_persist_messages` |
 | `RESOURCE_LIMIT_REACHED` | A server-wide resource limit has been reached (e.g., maximum number of channels) |
 | `RESPONSE_TOO_LARGE` | The response exceeds the maximum message size limit |
 | `SERVER_OVERLOADED` | The server is overloaded and cannot handle the request |
@@ -1390,16 +1415,20 @@ The following error reasons can be returned in [ERROR](#error) messages:
 | `USER_NOT_IN_CHANNEL` | The user is not a member of the specified channel |
 | `USERNAME_IN_USE` | The requested username is already taken |
 | `USER_NOT_REGISTERED` | The user has not completed the registration process |
+| `WRONG_TYPE` | The requested operation is not allowed for the channel's declared type (e.g. `BROADCAST` on a FIFO channel, `PUSH` on a pub/sub channel) |
 
 ### Recoverable vs Non-Recoverable Errors
 
 **Recoverable errors** (client can retry or take corrective action):
 - `CHANNEL_IS_FULL`
 - `CHANNEL_NOT_FOUND`
+- `CURSOR_RECOVERY_REQUIRED`
 - `FORBIDDEN`
 - `NOT_ALLOWED`
 - `NOT_IMPLEMENTED`
 - `PERSISTENCE_NOT_ENABLED`
+- `QUEUE_EMPTY`
+- `QUEUE_FULL`
 - `RESOURCE_LIMIT_REACHED`
 - `RESPONSE_TOO_LARGE`
 - `SERVER_OVERLOADED`
@@ -1407,6 +1436,7 @@ The following error reasons can be returned in [ERROR](#error) messages:
 - `USER_NOT_IN_CHANNEL`
 - `USERNAME_IN_USE`
 - `USER_NOT_REGISTERED`
+- `WRONG_TYPE`
 
 **Non-recoverable errors** (connection should be closed):
 - `BAD_REQUEST`
@@ -1444,6 +1474,7 @@ The following event kinds can be sent in [EVENT](#event) and [S2M_FORWARD_EVENT]
 | `MEMBER_JOINED` | A member has joined a channel |
 | `MEMBER_LEFT` | A member has left a channel |
 | `CHANNEL_DELETED` | A channel has been deleted by its owner |
+| `CHANNEL_RECONFIGURED` | A channel's configuration has changed |
 
 ### Event Context
 
@@ -1452,6 +1483,7 @@ Events contain contextual information that varies depending on the event kind:
 - **MEMBER_JOINED**: Includes `channel`, `nid` (the member who joined), and `owner` (whether they are the channel owner)
 - **MEMBER_LEFT**: Includes `channel`, `nid` (the member who left), and `owner` (whether they were the channel owner)
 - **CHANNEL_DELETED**: Includes `channel` (the channel that was deleted). No `nid` or `owner` fields are set.
+- **CHANNEL_RECONFIGURED**: Includes `channel` (the channel whose configuration changed). No `nid` or `owner` fields are set. Fires after any successful [SET_CHAN_CONFIG](#set_chan_config) that actually changes the configuration (including the pub/sub to FIFO transition). The event is delivered to every other channel member; the originating client receives the `SET_CHAN_CONFIG_ACK` instead. Clients should re-issue [GET_CHAN_CONFIG](#get_chan_config) to read the new configuration.
 
 ## Protocol Flow Examples
 
