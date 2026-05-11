@@ -49,51 +49,6 @@ mod rc_slice_serde {
   }
 }
 
-/// Pre-FIFO `PersistedChannel` layout, without `channel_type`. Used to
-/// decode `metadata.bin` files written by a build that predates the FIFO
-/// channel slice. Postcard is non-self-describing, so the canonical
-/// schema cannot be made tolerant of the missing trailing field with
-/// `#[serde(default)]` alone; this struct backs an explicit fallback
-/// decode in `decode_persisted_channel`.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(super) struct LegacyPersistedChannel {
-  pub handler: StringAtom,
-  pub owner: Option<Nid>,
-  pub config: ChannelConfig,
-  pub acl: ChannelAcl,
-  pub members: Vec<Nid>,
-}
-
-impl LegacyPersistedChannel {
-  fn into_persisted(self) -> PersistedChannel {
-    PersistedChannel {
-      handler: self.handler,
-      owner: self.owner,
-      config: self.config,
-      acl: self.acl,
-      members: Rc::from(self.members),
-      channel_type: ChannelType::PubSub,
-    }
-  }
-}
-
-/// Decodes a `PersistedChannel` from on-disk bytes. If the canonical
-/// (FIFO-aware) schema fails to decode, falls back to the pre-FIFO
-/// layout and defaults `channel_type` to [`ChannelType::PubSub`] so a
-/// server upgraded from a build without the field keeps its persisted
-/// channels on restart. If both decodes fail, the canonical schema's
-/// error is returned so the diagnostic reflects the format the server
-/// actually expects.
-pub(super) fn decode_persisted_channel(bytes: &[u8]) -> Result<PersistedChannel, postcard::Error> {
-  match postcard::from_bytes::<PersistedChannel>(bytes) {
-    Ok(channel) => Ok(channel),
-    Err(canonical_err) => match postcard::from_bytes::<LegacyPersistedChannel>(bytes) {
-      Ok(legacy) => Ok(legacy.into_persisted()),
-      Err(_) => Err(canonical_err),
-    },
-  }
-}
-
 /// Storage backend for persisting channel metadata.
 #[async_trait(?Send)]
 pub trait ChannelStore: Clone + Send + Sync + 'static {
@@ -328,8 +283,18 @@ mod tests {
     }
   }
 
+  // The pre-FIFO PersistedChannel layout (without `channel_type`).
+  #[derive(serde::Serialize)]
+  struct LegacyPersistedChannel {
+    handler: StringAtom,
+    owner: Option<narwhal_protocol::Nid>,
+    config: ChannelConfig,
+    acl: ChannelAcl,
+    members: Vec<narwhal_protocol::Nid>,
+  }
+
   #[test]
-  fn legacy_metadata_decodes_as_pubsub() {
+  fn legacy_metadata_fails_to_decode() {
     let legacy = LegacyPersistedChannel {
       handler: StringAtom::from("ch"),
       owner: None,
@@ -338,19 +303,7 @@ mod tests {
       members: Vec::new(),
     };
     let bytes = postcard::to_allocvec(&legacy).unwrap();
-    let decoded = decode_persisted_channel(&bytes).expect("legacy bytes must decode via fallback");
-    assert_eq!(decoded.channel_type, ChannelType::PubSub);
-    assert_eq!(decoded.handler.as_ref(), "ch");
-  }
-
-  #[test]
-  fn current_metadata_decodes_via_helper() {
-    for ct in [ChannelType::PubSub, ChannelType::Fifo] {
-      let original = sample_channel(ct);
-      let bytes = postcard::to_allocvec(&original).unwrap();
-      let decoded = decode_persisted_channel(&bytes).expect("current bytes must decode");
-      assert_eq!(decoded.channel_type, ct);
-      assert_eq!(decoded.handler, original.handler);
-    }
+    let result: Result<PersistedChannel, _> = postcard::from_bytes(&bytes);
+    assert!(result.is_err(), "legacy bytes must not deserialize into the new schema");
   }
 }

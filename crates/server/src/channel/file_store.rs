@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use narwhal_util::string_atom::StringAtom;
 
-use super::store::{ChannelStore, PersistedChannel, decode_persisted_channel};
+use super::store::{ChannelStore, PersistedChannel};
 use crate::util::file::{DirSync, atomic_write};
 
 const METADATA_FILE: &str = "metadata.bin";
@@ -145,7 +145,7 @@ impl ChannelStore for FileChannelStore {
       return Err(anyhow::anyhow!("metadata file exceeds {} bytes", MAX_METADATA_SIZE));
     }
     let data = compio::fs::read(&path).await?;
-    let channel = decode_persisted_channel(&data)?;
+    let channel = postcard::from_bytes(&data)?;
     Ok(channel)
   }
 }
@@ -288,45 +288,6 @@ mod tests {
 
     let result = store.load_channel(&hash).await;
     assert!(result.is_err());
-  }
-
-  #[compio::test]
-  async fn test_load_legacy_metadata_decodes_as_pubsub() {
-    // Simulates the on-disk shape produced by a build that predates the FIFO
-    // slice: `metadata.bin` is missing the trailing `channel_type` field.
-    // `load_channel` must fall back to the legacy schema and tag the result
-    // as `PubSub` so the channel survives the upgrade.
-    use crate::channel::store::LegacyPersistedChannel;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let store = FileChannelStore::new(tmp.path().to_path_buf()).await.unwrap();
-
-    let handler = StringAtom::from("legacy_channel");
-    let legacy = LegacyPersistedChannel {
-      handler: handler.clone(),
-      owner: Some(Nid::new_unchecked(StringAtom::from("alice"), StringAtom::from("localhost"))),
-      config: ChannelConfig {
-        persist: Some(true),
-        max_clients: Some(50),
-        max_payload_size: Some(1024),
-        max_persist_messages: Some(100),
-        message_flush_interval: Some(0),
-      },
-      acl: ChannelAcl::default(),
-      members: vec![Nid::new_unchecked(StringAtom::from("alice"), StringAtom::from("localhost"))],
-    };
-    let bytes = postcard::to_allocvec(&legacy).unwrap();
-
-    let hash = channel_hash(&handler);
-    let dir = tmp.path().join(hash.as_ref());
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join(METADATA_FILE), bytes).unwrap();
-
-    let loaded = store.load_channel(&hash).await.unwrap();
-    assert_eq!(loaded.handler, handler);
-    assert_eq!(loaded.channel_type, ChannelType::PubSub);
-    assert_eq!(loaded.config.persist, Some(true));
-    assert_eq!(loaded.members.len(), 1);
   }
 
   #[compio::test]
