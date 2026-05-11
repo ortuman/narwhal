@@ -1,7 +1,7 @@
 # FIFO Channels: Architecture Specification
 
 > **Status:** Proposed. Not yet implemented.
-> **Related design:** [Message Log](../persistence/message-log.md), [Channel Store](../persistence/channel-store.md)
+> **Related design:** [Message Log](./message-log.md), [Channel Store](./channel-store.md)
 
 ## Table of Contents
 
@@ -318,7 +318,7 @@ PUSH id=<corr> channel=<name> length=<N>
 ```
 
 `length` is required (u32, non-zero) and follows the existing
-payload-bearing message convention (see `BROADCAST` in `docs/protocol.md`).
+payload-bearing message convention (see `BROADCAST` in `docs/PROTOCOL.md`).
 
 Errors:
 
@@ -447,7 +447,7 @@ Added to `narwhal-protocol`:
 ### Reusing the Message Log
 
 FIFO channels reuse the existing per-channel segmented append-only message log
-(see [message-log.md](../persistence/message-log.md)) without modification to its on-disk
+(see [message-log.md](./message-log.md)) without modification to its on-disk
 format. Each `PUSH` is appended exactly like a pub/sub `BROADCAST`:
 
 - 22-byte header + `from` (owner Nid) + payload + CRC32.
@@ -583,7 +583,7 @@ once at type transition).
 1. Append the entry to the message log buffer.
 2. If `message_flush_interval == 0`: synchronously flush+fsync the log
    (per the existing `BROADCAST` semantics; see
-   [`docs/protocol.md`](../../protocol.md) and `broadcast_payload` in
+   [`docs/PROTOCOL.md`](../../PROTOCOL.md) and `broadcast_payload` in
    `crates/server/src/channel/manager.rs`). Otherwise the entry stays in
    the log buffer until the next periodic flush.
 3. Send `PUSH_ACK`.
@@ -636,7 +636,7 @@ clients (or one client across retries) receive the same physical queue
 element.
 
 **Cursor write protocol** (atomic, mirrors the channel-store write; see
-[channel-store.md](../persistence/channel-store.md)):
+[channel-store.md](./channel-store.md)):
 
 1. Write to `cursor.bin.tmp`.
 2. `fsync` the tmp file.
@@ -968,6 +968,6 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
      verify the channel refuses `PUSH`/`POP`/`GET_CHAN_LEN` with
      `CURSOR_RECOVERY_REQUIRED` until an operator-supplied recovery action.
 9. **Docs:**
-   - Update `docs/protocol.md` to document the new messages, errors, and the
+   - Update `docs/PROTOCOL.md` to document the new messages, errors, and the
      `type` field. Add a 1.5 changelog entry.
    - Mark this doc's status as **Implemented** once 1–8 land.
