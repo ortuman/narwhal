@@ -301,6 +301,7 @@ async fn test_c2s_set_config_fails_when_store_save_fails() -> anyhow::Result<()>
         persist: None,
         max_persist_messages: None,
         message_flush_interval: None,
+        r#type: None,
       }),
     )
     .await?;
@@ -336,6 +337,7 @@ async fn test_c2s_set_config_fails_when_store_save_fails() -> anyhow::Result<()>
       max_persist_messages: default_c2s_config().limits.max_persist_messages,
       persist: true,
       message_flush_interval: 0,
+      r#type: StringAtom::from("pubsub"),
     }
   );
 

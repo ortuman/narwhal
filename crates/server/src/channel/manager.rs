@@ -14,6 +14,7 @@ use narwhal_common::core_dispatcher::CoreDispatcher;
 use narwhal_protocol::ErrorReason::{
   BadRequest, ChannelIsFull, ChannelNotFound, Forbidden, InternalServerError, NotAllowed, NotImplemented,
   PersistenceNotEnabled, PolicyViolation, ResourceLimitReached, UserInChannel, UserNotInChannel, UserNotRegistered,
+  WrongType,
 };
 use narwhal_protocol::{
   AclAction, AclType, BroadcastAckParameters, ChannelAclParameters, ChannelConfigurationParameters,
@@ -39,8 +40,11 @@ use crate::notifier::Notifier;
 use crate::router::GlobalRouter;
 use crate::transmitter::{Resource, Transmitter};
 
+use super::fifo_cursor::FifoCursor;
 use super::membership::Membership;
-use super::store::{ChannelStore, LogEntry, LogVisitor, MessageLog, MessageLogFactory, PersistedChannel};
+use super::store::{
+  ChannelStore, ChannelType, LogEntry, LogMode, LogVisitor, MessageLog, MessageLogFactory, PersistedChannel,
+};
 
 const DEFAULT_MAILBOX_CAPACITY: usize = 16384;
 
@@ -278,6 +282,7 @@ enum Command {
   },
   SetChannelConfiguration {
     config: ChannelConfig,
+    requested_type: Option<ChannelType>,
     channel_id: ChannelId,
     nid: Nid,
     transmitter: Arc<dyn Transmitter>,
@@ -324,6 +329,26 @@ enum Command {
   },
 }
 
+/// In-memory channel kind. Mirrors `store::ChannelType` but carries the
+/// FIFO-side state that is *not* persisted (e.g. the head cursor handle).
+pub(crate) enum ChannelKind {
+  PubSub,
+  // The `FifoState` payload is constructed by restore/transition and is
+  // read by the PR 2 data plane (PUSH/POP/GET_CHAN_LEN); PR 1 only
+  // discriminates the variant.
+  Fifo(#[allow(dead_code)] FifoState),
+}
+
+/// FIFO runtime state. `Healthy` carries an open cursor; `NeedsRecovery` is
+/// the explicit landing pad for FIFO data-plane operations after a failed
+/// cursor recovery (PUSH/POP/GET_CHAN_LEN return `CursorRecoveryRequired`
+/// while DELETE/JOIN/LEAVE-non-owner/etc still work).
+pub(crate) enum FifoState {
+  // Cursor is unused in PR 1; PR 2's POP path reads and advances it.
+  Healthy(#[allow(dead_code)] super::fifo_cursor::FifoCursor),
+  NeedsRecovery,
+}
+
 /// A channel.
 struct Channel<ML: MessageLog> {
   handler: StringAtom,
@@ -338,6 +363,7 @@ struct Channel<ML: MessageLog> {
   flush_cancel_tx: Option<Sender<()>>,
   /// The storage hash for this channel. `Some` for persistent channels, `None` for transient.
   store_hash: Option<StringAtom>,
+  kind: ChannelKind,
 }
 
 // === impl Channel ===
@@ -356,6 +382,7 @@ impl<ML: MessageLog> Channel<ML> {
       message_log: Rc::new(message_log),
       flush_cancel_tx: None,
       store_hash: None,
+      kind: ChannelKind::PubSub,
     }
   }
 
@@ -501,6 +528,21 @@ impl<ML: MessageLog> Channel<ML> {
       config: self.config.clone(),
       acl: self.acl.clone(),
       members: self.members.clone(),
+      channel_type: self.channel_type(),
+    }
+  }
+
+  fn channel_type(&self) -> ChannelType {
+    match &self.kind {
+      ChannelKind::PubSub => ChannelType::PubSub,
+      ChannelKind::Fifo(_) => ChannelType::Fifo,
+    }
+  }
+
+  fn wire_type_str(&self) -> &'static str {
+    match &self.kind {
+      ChannelKind::PubSub => "pubsub",
+      ChannelKind::Fifo(_) => "fifo",
     }
   }
 }
@@ -563,11 +605,36 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       };
 
       let handler = persisted.handler.clone();
-      let message_log = match self.message_log_factory.create(&handler).await {
+      let mode = match persisted.channel_type {
+        ChannelType::PubSub => LogMode::PubSub,
+        ChannelType::Fifo => LogMode::Fifo,
+      };
+      let message_log = match self.message_log_factory.create(&handler, mode).await {
         Ok(log) => log,
         Err(e) => {
           warn!(handler = %handler, error = %e, "skipping channel restore: failed to create message log");
           continue;
+        },
+      };
+
+      let kind = match persisted.channel_type {
+        ChannelType::PubSub => ChannelKind::PubSub,
+        ChannelType::Fifo => {
+          let log_first = message_log.first_seq();
+          let log_last = message_log.last_seq();
+          match self.message_log_factory.channel_dir(&handler) {
+            Some(channel_dir) => match FifoCursor::load(channel_dir, log_first, log_last).await {
+              Ok(cursor) => ChannelKind::Fifo(FifoState::Healthy(cursor)),
+              Err(e) => {
+                warn!(handler = %handler, error = %e, "FIFO cursor recovery failed; channel restored in NeedsRecovery state");
+                ChannelKind::Fifo(FifoState::NeedsRecovery)
+              },
+            },
+            None => {
+              warn!(handler = %handler, "FIFO channel restore: factory has no on-disk channel_dir; restoring as NeedsRecovery");
+              ChannelKind::Fifo(FifoState::NeedsRecovery)
+            },
+          }
         },
       };
 
@@ -577,6 +644,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       channel.members = persisted.members;
       channel.store_hash = Some(hash.clone());
       channel.seq = channel.message_log.last_seq() + 1;
+      channel.kind = kind;
       channel.update_allowed_targets();
 
       // Use u32::MAX to bypass the per-client limit: persisted membership is authoritative
@@ -626,8 +694,17 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
         let result = self.get_channel_configuration(channel_id, nid, transmitter, correlation_id);
         let _ = reply_tx.send(result).await;
       },
-      Command::SetChannelConfiguration { config, channel_id, nid, transmitter, correlation_id, reply_tx } => {
-        let result = self.set_channel_configuration(config, channel_id, nid, transmitter, correlation_id).await;
+      Command::SetChannelConfiguration {
+        config,
+        requested_type,
+        channel_id,
+        nid,
+        transmitter,
+        correlation_id,
+        reply_tx,
+      } => {
+        let result =
+          self.set_channel_configuration(config, requested_type, channel_id, nid, transmitter, correlation_id).await;
         let _ = reply_tx.send(result).await;
       },
       Command::FilterOwnedChannels { nid, handlers, reply_tx } => {
@@ -705,7 +782,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
         persist: Some(false),
         message_flush_interval: Some(0),
       };
-      let message_log = match self.message_log_factory.create(&handler).await {
+      let message_log = match self.message_log_factory.create(&handler, LogMode::PubSub).await {
         Ok(log) => log,
         Err(e) => {
           warn!(handler = %handler, error = %e, "failed to create message log for new channel");
@@ -890,6 +967,20 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       }
     }
 
+    let owner_leaving_fifo = {
+      let channel = self.channels.get(&channel_id.handler).unwrap();
+      matches!(&channel.kind, ChannelKind::Fifo(_)) && channel.is_owner(&left_member_nid)
+    };
+    if owner_leaving_fifo {
+      let Some(tx) = transmitter else {
+        return Err(narwhal_protocol::Error::new(InternalServerError).with_id(correlation_id).into());
+      };
+      self.do_delete_channel(&channel_id, tx.clone()).await?;
+      tx.send_message(Message::LeaveChannelAck(LeaveChannelAckParameters { id: correlation_id }));
+      self.metrics.channel_leaves.inc();
+      return Ok(());
+    }
+
     let excluding_resource = transmitter.as_ref().map(|t| t.resource());
     self.do_leave(&channel_id.handler.clone(), &left_member_nid, excluding_resource).await?;
 
@@ -953,7 +1044,26 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       return Err(narwhal_protocol::Error::new(Forbidden).with_id(correlation_id).into());
     }
 
-    channel.notify_channel_deleted(Some(transmitter.resource()), self.local_domain.clone()).await?;
+    self.do_delete_channel(&channel_id, transmitter.clone()).await?;
+    transmitter.send_message(Message::DeleteChannelAck(DeleteChannelAckParameters { id: correlation_id }));
+    Ok(())
+  }
+
+  /// Runs the full delete-channel machinery: notify members, release
+  /// membership slots, cancel flush task, final flush, drop persistent
+  /// storage (including the FIFO cursor sidecar), and remove the
+  /// in-memory channel. Does **not** send the request ack; callers do
+  /// that based on which command initiated the delete (DELETE_ACK,
+  /// LEAVE_ACK, etc.).
+  async fn do_delete_channel(
+    &mut self,
+    channel_id: &ChannelId,
+    transmitter: Arc<dyn Transmitter>,
+  ) -> anyhow::Result<()> {
+    {
+      let channel = self.channels.get(&channel_id.handler).expect("caller verified channel exists");
+      channel.notify_channel_deleted(Some(transmitter.resource()), self.local_domain.clone()).await?;
+    }
 
     // Collect member usernames to release membership slots.
     let member_usernames: Vec<StringAtom> =
@@ -963,7 +1073,10 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       self.membership.release_slot(username, &channel_id.handler).await;
     }
 
-    // Cancel flush task and perform final flush before cleanup.
+    // Cancel flush task and perform final flush before cleanup. The
+    // FIFO cursor sidecar (if any) is wiped by `store.delete_channel`
+    // along with everything else in the channel directory, so the
+    // manager does not need a separate cursor.delete() step.
     let is_persistent = self.channels.get(&channel_id.handler).is_some_and(|c| c.config.persist == Some(true));
     if let Some(channel) = self.channels.get_mut(&channel_id.handler) {
       channel.cancel_flush_task();
@@ -983,8 +1096,6 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     }
 
     self.channels.remove(&channel_id.handler);
-
-    transmitter.send_message(Message::DeleteChannelAck(DeleteChannelAckParameters { id: correlation_id }));
 
     self.total_channels.fetch_sub(1, Ordering::SeqCst);
     self.metrics.channels_deleted.inc();
@@ -1009,6 +1120,10 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     let Some(channel) = self.channels.get_mut(&channel_id.handler) else {
       return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
     };
+
+    if matches!(&channel.kind, ChannelKind::Fifo(_)) {
+      return Err(narwhal_protocol::Error::new(WrongType).with_id(correlation_id).into());
+    }
 
     if !channel.is_member(&nid) {
       return Err(narwhal_protocol::Error::new(Forbidden).with_id(correlation_id).into());
@@ -1226,14 +1341,17 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       max_persist_messages: config.max_persist_messages.unwrap_or(0),
       persist: config.persist.unwrap_or(false),
       message_flush_interval: config.message_flush_interval.unwrap_or(0),
+      r#type: StringAtom::from(channel.wire_type_str()),
     }));
 
     Ok(())
   }
 
+  #[allow(clippy::too_many_arguments)]
   async fn set_channel_configuration(
     &mut self,
     config: ChannelConfig,
+    requested_type: Option<ChannelType>,
     channel_id: ChannelId,
     nid: Nid,
     transmitter: Arc<dyn Transmitter>,
@@ -1294,6 +1412,22 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       return Err(narwhal_protocol::Error::new(Forbidden).with_id(correlation_id).into());
     }
 
+    let current_type = channel.channel_type();
+    // FIFO is one-way: pub/sub → fifo is allowed, fifo → pub/sub is not.
+    if let Some(req) = requested_type
+      && current_type == ChannelType::Fifo
+      && req == ChannelType::PubSub
+    {
+      return Err(
+        narwhal_protocol::Error::new(BadRequest)
+          .with_id(correlation_id)
+          .with_detail("FIFO is one-way; cannot revert to pubsub")
+          .into(),
+      );
+    }
+    let new_type = requested_type.unwrap_or(current_type);
+    let transitioning_to_fifo = current_type == ChannelType::PubSub && new_type == ChannelType::Fifo;
+
     let was_persistent = channel.config.persist == Some(true);
     let flush_interval_changed =
       config.message_flush_interval.is_some() && config.message_flush_interval != channel.config.message_flush_interval;
@@ -1309,6 +1443,104 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       );
     }
 
+    // FIFO requires durable storage with a non-zero retention.
+    if new_type == ChannelType::Fifo && (!is_persistent || new_config.max_persist_messages.unwrap_or(0) == 0) {
+      return Err(
+        narwhal_protocol::Error::new(BadRequest)
+          .with_id(correlation_id)
+          .with_detail("FIFO requires persist=true and max_persist_messages > 0")
+          .into(),
+      );
+    }
+
+    let config_unchanged = new_config_equals(&channel.config, &new_config);
+    let no_op = config_unchanged && !transitioning_to_fifo;
+
+    if transitioning_to_fifo {
+      // Step 1: flush so log.last_seq() is durable.
+      let start = Instant::now();
+      let flush_result = channel.message_log.flush().await;
+      self.metrics.record_flush(start, &flush_result);
+      flush_result?;
+
+      // Step 2: derive the new starting seq.
+      let new_next_seq = channel.message_log.last_seq() + 1;
+
+      // Step 3: atomic-write cursor.bin (durable) before publishing the
+      // FIFO type via metadata.bin.
+      let channel_dir = match self.message_log_factory.channel_dir(&channel_id.handler) {
+        Some(dir) => dir,
+        None => {
+          return Err(
+            narwhal_protocol::Error::new(InternalServerError)
+              .with_id(correlation_id)
+              .with_detail("FIFO transition not supported by this storage backend")
+              .into(),
+          );
+        },
+      };
+      let cursor = match FifoCursor::write_initial(channel_dir, new_next_seq).await {
+        Ok(cursor) => cursor,
+        Err(e) => {
+          warn!(channel = %channel_id.handler, error = %e, "FIFO cursor write failed; transition aborted");
+          return Err(narwhal_protocol::Error::new(InternalServerError).with_id(correlation_id).into());
+        },
+      };
+
+      // Step 4: persist metadata with channel_type=Fifo. After this point
+      // the transition is durable on disk.
+      let mut projected = channel.to_persisted();
+      projected.config = new_config.clone();
+      projected.channel_type = ChannelType::Fifo;
+      let store_start = Instant::now();
+      let save_result = self.store.save_channel(&projected).await;
+      self.metrics.store_save_duration_seconds.observe(store_start.elapsed().as_secs_f64());
+      match save_result {
+        Ok(hash) => {
+          self.metrics.store_saves.get_or_create(&SUCCESS).inc();
+          channel.store_hash = Some(hash);
+        },
+        Err(e) => {
+          self.metrics.store_saves.get_or_create(&FAILURE).inc();
+          // Cursor is stranded on disk. `load_channel_hashes` cleans up
+          // directories whose metadata.bin is absent on next restart, and
+          // the next successful retry of this same transition will
+          // overwrite it. No in-memory state changed yet, so leave the
+          // channel as pub/sub and surface the error.
+          return Err(e);
+        },
+      }
+
+      // Step 5: in-memory mutations (infallible from here).
+      channel.message_log.switch_to_fifo_mode();
+      channel.seq = new_next_seq;
+      channel.kind = ChannelKind::Fifo(FifoState::Healthy(cursor));
+      channel.config = new_config.clone();
+
+      // Reconcile the periodic flush task against the new interval. FIFO is
+      // always persistent so the persistence-toggle branch is a no-op here,
+      // but a `flush_interval_changed` request still needs the cancel +
+      // optional restart logic that the non-transition path runs below.
+      Self::reconcile_flush_task_after_config_change(
+        channel,
+        &channel_id.handler,
+        false,
+        flush_interval_changed,
+        true,
+        &self.metrics,
+        self.mailbox_tx.clone(),
+      )
+      .await;
+
+      // Steps 6/7: emit reconfigured event + ack.
+      Self::emit_channel_reconfigured(channel, &channel_id, transmitter.clone(), self.local_domain.clone()).await;
+      transmitter
+        .send_message(Message::SetChannelConfigurationAck(SetChannelConfigurationAckParameters { id: correlation_id }));
+      return Ok(());
+    }
+
+    // Non-transition path (unchanged from pre-FIFO behavior, plus event
+    // emission on any successful change).
     if is_persistent {
       let mut projected = channel.to_persisted();
       projected.config = new_config.clone();
@@ -1329,27 +1561,16 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
 
     channel.config = new_config;
 
-    // Cancel the flush task if persist was toggled off or flush interval changed.
-    if (!is_persistent && was_persistent) || flush_interval_changed {
-      channel.cancel_flush_task();
-
-      // When the flush interval changed but persistence is still enabled, flush any buffered
-      // messages and restart the periodic task immediately so they are not left pending
-      // indefinitely waiting for the next broadcast.
-      if flush_interval_changed && is_persistent {
-        let start = Instant::now();
-        let result = channel.message_log.flush().await;
-        self.metrics.record_flush(start, &result);
-        if let Err(e) = result {
-          warn!(channel = %channel_id.handler, error = %e, "flush on interval change failed");
-        }
-        if let Some(interval) = channel.config.message_flush_interval
-          && interval > 0
-        {
-          channel.ensure_flush_task(interval, self.mailbox_tx.clone());
-        }
-      }
-    }
+    Self::reconcile_flush_task_after_config_change(
+      channel,
+      &channel_id.handler,
+      !is_persistent && was_persistent,
+      flush_interval_changed,
+      is_persistent,
+      &self.metrics,
+      self.mailbox_tx.clone(),
+    )
+    .await;
 
     if !is_persistent && was_persistent {
       self.delete_persistent_storage(&channel_id.handler).await;
@@ -1357,10 +1578,72 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       channel.store_hash = None;
     }
 
+    if !no_op {
+      let channel = self.channels.get(&channel_id.handler).unwrap();
+      Self::emit_channel_reconfigured(channel, &channel_id, transmitter.clone(), self.local_domain.clone()).await;
+    }
+
     transmitter
       .send_message(Message::SetChannelConfigurationAck(SetChannelConfigurationAckParameters { id: correlation_id }));
 
     Ok(())
+  }
+
+  /// Reconciles the per-channel periodic flush task with the post-change
+  /// config. Used by both the FIFO transition and non-transition branches of
+  /// `set_channel_configuration` so that toggling persistence or changing
+  /// `message_flush_interval` always cancels the running task and restarts
+  /// a new one when the new interval is non-zero and the channel is still
+  /// persistent.
+  ///
+  /// `channel.config` must already reflect the new configuration when this
+  /// is called.
+  async fn reconcile_flush_task_after_config_change(
+    channel: &mut Channel<MLF::Log>,
+    channel_handler: &StringAtom,
+    persistence_disabled: bool,
+    flush_interval_changed: bool,
+    is_persistent: bool,
+    metrics: &ChannelManagerMetrics,
+    mailbox_tx: Sender<Command>,
+  ) {
+    if !(persistence_disabled || flush_interval_changed) {
+      return;
+    }
+    channel.cancel_flush_task();
+
+    // When the flush interval changed but persistence is still enabled, flush any buffered
+    // messages and restart the periodic task immediately so they are not left pending
+    // indefinitely waiting for the next broadcast.
+    if flush_interval_changed && is_persistent {
+      let start = Instant::now();
+      let result = channel.message_log.flush().await;
+      metrics.record_flush(start, &result);
+      if let Err(e) = result {
+        warn!(channel = %channel_handler, error = %e, "flush on interval change failed");
+      }
+      if let Some(interval) = channel.config.message_flush_interval
+        && interval > 0
+      {
+        channel.ensure_flush_task(interval, mailbox_tx);
+      }
+    }
+  }
+
+  /// Notifies all members of a successful CHAN_CONFIG change. The event
+  /// excludes the caller's resource (the issuing client receives the ACK,
+  /// not the event).
+  async fn emit_channel_reconfigured(
+    channel: &Channel<MLF::Log>,
+    channel_id: &ChannelId,
+    transmitter: Arc<dyn Transmitter>,
+    local_domain: StringAtom,
+  ) {
+    let event_channel_id = ChannelId::new_unchecked(channel_id.handler.clone(), local_domain);
+    let event = Event::new(EventKind::ChannelReconfigured).with_channel(event_channel_id.into());
+    if let Err(e) = channel.notifier.notify(event, channel.members.iter(), Some(transmitter.resource())).await {
+      warn!(channel = %channel_id.handler, error = %e, "failed to notify CHANNEL_RECONFIGURED");
+    }
   }
 
   fn filter_owned_channels(&self, nid: &Nid, handlers: &[StringAtom]) -> Vec<StringAtom> {
@@ -1447,6 +1730,10 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
     };
 
+    if matches!(&channel.kind, ChannelKind::Fifo(_)) {
+      return Err(narwhal_protocol::Error::new(WrongType).with_id(correlation_id).into());
+    }
+
     if !channel.is_member(&nid) {
       return Err(narwhal_protocol::Error::new(UserNotInChannel).with_id(correlation_id).into());
     }
@@ -1496,6 +1783,10 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     let Some(channel) = self.channels.get(&channel_id.handler) else {
       return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
     };
+
+    if matches!(&channel.kind, ChannelKind::Fifo(_)) {
+      return Err(narwhal_protocol::Error::new(WrongType).with_id(correlation_id).into());
+    }
 
     if !channel.is_member(&nid) {
       return Err(narwhal_protocol::Error::new(UserNotInChannel).with_id(correlation_id).into());
@@ -1650,6 +1941,20 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
 
     Ok(true)
   }
+}
+
+/// Field-by-field equality on `ChannelConfig` used to detect a no-op
+/// `SET_CHAN_CONFIG` (so `CHANNEL_RECONFIGURED` does not fire for an
+/// identical re-submission). `ChannelConfig` does not derive `PartialEq`
+/// because it is shared with `PersistedChannel` via serde and adding the
+/// derive there would lock us into pre-prod schema decisions; a small
+/// local helper is cheaper than that.
+fn new_config_equals(a: &ChannelConfig, b: &ChannelConfig) -> bool {
+  a.max_clients == b.max_clients
+    && a.max_payload_size == b.max_payload_size
+    && a.max_persist_messages == b.max_persist_messages
+    && a.persist == b.persist
+    && a.message_flush_interval == b.message_flush_interval
 }
 
 /// Limits for the channel manager.
@@ -2032,9 +2337,11 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelManager<CS, MLF> {
   }
 
   /// Sets the configuration for a channel.
+  #[allow(clippy::too_many_arguments)]
   pub async fn set_channel_configuration(
     &self,
     config: ChannelConfig,
+    requested_type: Option<ChannelType>,
     channel_id: ChannelId,
     nid: Nid,
     transmitter: Arc<dyn Transmitter>,
@@ -2046,7 +2353,15 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelManager<CS, MLF> {
     let (reply_tx, reply_rx) = async_channel::bounded(1);
 
     self.mailboxes[shard]
-      .send(Command::SetChannelConfiguration { config, channel_id, nid, transmitter, correlation_id, reply_tx })
+      .send(Command::SetChannelConfiguration {
+        config,
+        requested_type,
+        channel_id,
+        nid,
+        transmitter,
+        correlation_id,
+        reply_tx,
+      })
       .await?;
 
     reply_rx.recv().await?

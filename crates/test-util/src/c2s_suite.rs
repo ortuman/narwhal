@@ -358,6 +358,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sSuite<CS, MLF> {
           persist,
           max_persist_messages,
           message_flush_interval,
+          r#type: None,
         }),
       )
       .await?;

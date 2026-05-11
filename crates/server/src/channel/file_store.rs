@@ -61,18 +61,39 @@ impl ChannelStore for FileChannelStore {
 
   async fn delete_channel(&self, hash: &StringAtom) -> anyhow::Result<()> {
     let dir = self.channel_dir(hash.as_ref());
-    // Remove metadata files, then the directory. Treat NotFound as success.
-    let metadata_path = dir.join(METADATA_FILE);
-    if let Err(e) = compio::fs::remove_file(&metadata_path).await
-      && e.kind() != std::io::ErrorKind::NotFound
-    {
-      return Err(e.into());
-    }
-    let tmp_path = dir.join(METADATA_TMP_FILE);
-    if let Err(e) = compio::fs::remove_file(&tmp_path).await
-      && e.kind() != std::io::ErrorKind::NotFound
-    {
-      return Err(e.into());
+    // Remove every file in the channel directory before removing the
+    // directory itself. The dir may contain `metadata.bin`, an in-flight
+    // `metadata.bin.tmp`, the FIFO `cursor.bin`/`cursor.bin.tmp`
+    // sidecars, or any future per-channel artifact: the store contract
+    // is "delete = wipe everything", so a partial cleanup leaves the
+    // directory non-empty and `remove_dir` would fail. NotFound at any
+    // step is treated as success (idempotent delete).
+    let entries = match std::fs::read_dir(&dir) {
+      Ok(entries) => entries,
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+      Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+      // Files can disappear between `read_dir`'s snapshot and the per-entry
+      // stat/unlink (parallel deletes, concurrent admin tooling, etc.). Any
+      // NotFound mid-loop is consistent with our idempotent contract and is
+      // skipped instead of propagated.
+      let entry = match entry {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+        Err(e) => return Err(e.into()),
+      };
+      let file_type = match entry.file_type() {
+        Ok(ft) => ft,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+        Err(e) => return Err(e.into()),
+      };
+      if file_type.is_file()
+        && let Err(e) = compio::fs::remove_file(entry.path()).await
+        && e.kind() != std::io::ErrorKind::NotFound
+      {
+        return Err(e.into());
+      }
     }
     if let Err(e) = compio::fs::remove_dir(&dir).await
       && e.kind() != std::io::ErrorKind::NotFound
@@ -137,6 +158,7 @@ mod tests {
   use narwhal_util::string_atom::StringAtom;
 
   use super::*;
+  use crate::channel::store::ChannelType;
   use crate::channel::{ChannelAcl, ChannelConfig};
 
   fn test_channel(handler: &str) -> PersistedChannel {
@@ -155,6 +177,7 @@ mod tests {
         Nid::new_unchecked(StringAtom::from("alice"), StringAtom::from("localhost")),
         Nid::new_unchecked(StringAtom::from("bob"), StringAtom::from("localhost")),
       ]),
+      channel_type: ChannelType::PubSub,
     }
   }
 
@@ -205,6 +228,26 @@ mod tests {
 
     let hashes = store.load_channel_hashes().await.unwrap();
     assert_eq!(hashes.len(), 0);
+  }
+
+  #[compio::test]
+  async fn test_delete_channel_wipes_unknown_sidecars() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FileChannelStore::new(tmp.path().to_path_buf()).await.unwrap();
+
+    // Save a channel so the directory exists with metadata.bin.
+    store.save_channel(&test_channel("withcursor")).await.unwrap();
+    let hash = channel_hash(&StringAtom::from("withcursor"));
+    let dir = tmp.path().join(hash.as_ref());
+
+    // Stand in for a FIFO cursor sidecar plus an arbitrary unknown file
+    // that some future feature might add.
+    std::fs::write(dir.join("cursor.bin"), b"\x00").unwrap();
+    std::fs::write(dir.join("future_artifact.bin"), b"\x00").unwrap();
+
+    store.delete_channel(&hash).await.unwrap();
+
+    assert!(!dir.exists(), "channel directory should be fully removed even with unknown files");
   }
 
   #[compio::test]

@@ -158,6 +158,9 @@ pub struct ChannelConfigurationParameters {
   pub max_persist_messages: u32,
   pub persist: bool,
   pub message_flush_interval: u32,
+
+  #[param(name = "type", validate = "non_empty")]
+  pub r#type: StringAtom,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
@@ -578,6 +581,9 @@ pub struct SetChannelConfigurationParameters {
   pub max_persist_messages: Option<u32>,
   pub persist: Option<bool>,
   pub message_flush_interval: Option<u32>,
+
+  #[param(name = "type")]
+  pub r#type: Option<StringAtom>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
@@ -1065,6 +1071,68 @@ impl Message {
       Message::ModDirect(params) => params.id,
 
       _ => None,
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{deserialize::deserialize, serialize::serialize};
+  use std::io::Cursor;
+
+  fn roundtrip(msg: Message) -> Message {
+    let mut buf = vec![0u8; 1024];
+    let n = serialize(&msg, &mut buf).expect("serialize");
+    // serialize emits a trailing '\n'; the framing layer strips it before
+    // deserialize, so do the same here.
+    let end = if n > 0 && buf[n - 1] == b'\n' { n - 1 } else { n };
+    deserialize(Cursor::new(&buf[..end])).expect("deserialize")
+  }
+
+  #[test]
+  fn set_channel_configuration_with_type_round_trip() {
+    let original = Message::SetChannelConfiguration(SetChannelConfigurationParameters {
+      id: 42,
+      channel: "!c@localhost".into(),
+      max_clients: Some(8),
+      r#type: Some("fifo".into()),
+      ..Default::default()
+    });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn set_channel_configuration_without_type_round_trip() {
+    let original = Message::SetChannelConfiguration(SetChannelConfigurationParameters {
+      id: 42,
+      channel: "!c@localhost".into(),
+      max_clients: Some(8),
+      r#type: None,
+      ..Default::default()
+    });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn channel_configuration_emits_type_field() {
+    let params = ChannelConfigurationParameters {
+      id: 1,
+      channel: "!c@localhost".into(),
+      max_clients: 1,
+      max_payload_size: 1,
+      max_persist_messages: 1,
+      persist: true,
+      message_flush_interval: 0,
+      r#type: "fifo".into(),
+    };
+    let msg = Message::ChannelConfiguration(params.clone());
+    let round = roundtrip(msg);
+    if let Message::ChannelConfiguration(p) = round {
+      assert_eq!(p.r#type.as_ref(), "fifo");
+      assert_eq!(p, params);
+    } else {
+      panic!("expected ChannelConfiguration");
     }
   }
 }

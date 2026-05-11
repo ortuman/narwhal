@@ -19,7 +19,7 @@ use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
 use super::file_store::channel_hash;
-use super::store::{LogEntry, LogVisitor, MessageLog, MessageLogFactory};
+use super::store::{LogEntry, LogMode, LogVisitor, MessageLog, MessageLogFactory};
 
 /// Maximum segment file size before rolling to a new segment.
 const SEGMENT_MAX_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
@@ -337,6 +337,18 @@ struct Inner {
   /// Pre-allocated entry reader for the read path and recovery.
   reader: EntryReader,
 
+  /// Highest seq successfully fsynced via `flush`. 0 until the first flush.
+  /// Capped at `cached_last_seq` and updated only on flush success so that
+  /// callers can distinguish "appended but not yet fsynced" from "durable".
+  cached_durable_seq: u64,
+
+  /// Whether the log is operating in FIFO mode. In FIFO mode `append` does
+  /// **not** tail-evict on `max_messages`; eviction is driven by
+  /// `evict_below` from the manager. Toggled on at startup (when the
+  /// persisted `channel_type` is FIFO) or via `switch_to_fifo_mode` during
+  /// the in-runtime pub/sub → FIFO transition.
+  fifo_mode: bool,
+
   /// Metric handles for operations performed by the log.
   metrics: MessageLogMetrics,
 }
@@ -351,14 +363,11 @@ impl FileMessageLog {
   /// writes, the active `.idx` cannot be opened or memory-mapped). Callers
   /// should refuse to bring the affected channel online rather than continue
   /// with a half-initialized log that would silently drop index updates.
-  async fn open(channel_dir: PathBuf, max_payload_size: u32, metrics: MessageLogMetrics) -> anyhow::Result<Self> {
-    Self::open_with_segment_max(channel_dir, max_payload_size, SEGMENT_MAX_BYTES, metrics).await
-  }
-
   async fn open_with_segment_max(
     channel_dir: PathBuf,
     max_payload_size: u32,
     segment_max_bytes: u64,
+    fifo_mode: bool,
     metrics: MessageLogMetrics,
   ) -> anyhow::Result<Self> {
     let mut inner = Inner {
@@ -375,12 +384,21 @@ impl FileMessageLog {
       cached_last_seq: 0,
       write_buf: Vec::with_capacity(ENTRY_HEADER_SIZE + NID_MAX_LENGTH + max_payload_size as usize + CRC_SIZE),
       reader: EntryReader::new(max_payload_size, metrics.crc_failures.clone()),
+      cached_durable_seq: 0,
+      fifo_mode,
       metrics,
     };
     let start = Instant::now();
     let result = inner.recover().await;
     inner.metrics.recovery_duration_seconds.observe(start.elapsed().as_secs_f64());
     result?;
+    // Leave `cached_durable_seq` at 0 after recovery. Recovered entries
+    // are readable from the file but were not fsynced by *this* process,
+    // and the trait contract says "highest seq fsynced via flush".
+    // Sticking to the contract means the first FIFO POP after restart
+    // forces a flush before advancing the cursor, closing a window where
+    // a fresh power loss could lose data while the cursor sidecar said
+    // it had already been consumed.
     Ok(FileMessageLog { inner: RefCell::new(inner) })
   }
 
@@ -1098,8 +1116,11 @@ impl MessageLog for FileMessageLog {
       inner.roll_segment(seq + 1).await?;
     }
 
-    // Evict old segments if needed.
-    inner.evict_segments(max_messages).await;
+    // Evict old segments if needed. FIFO mode disables count-driven tail
+    // eviction; head-driven eviction runs from `evict_below` instead.
+    if !inner.fifo_mode {
+      inner.evict_segments(max_messages).await;
+    }
 
     Ok(())
   }
@@ -1150,6 +1171,9 @@ impl MessageLog for FileMessageLog {
       idx_file.sync_all().await?;
     }
 
+    // Both the data and index are durable past this point.
+    inner.cached_durable_seq = inner.cached_last_seq;
+
     Ok(())
   }
 
@@ -1159,6 +1183,46 @@ impl MessageLog for FileMessageLog {
 
   fn last_seq(&self) -> u64 {
     self.inner.borrow().cached_last_seq
+  }
+
+  fn last_durable_seq(&self) -> u64 {
+    self.inner.borrow().cached_durable_seq
+  }
+
+  fn switch_to_fifo_mode(&self) {
+    self.inner.borrow_mut().fifo_mode = true;
+  }
+
+  async fn evict_below(&self, seq: u64) -> anyhow::Result<()> {
+    let inner = &mut *self.inner.borrow_mut();
+    if !inner.fifo_mode || seq == 0 {
+      return Ok(());
+    }
+    // Drop sealed segments whose entire range sits below `seq`. Never
+    // evict the segment that contains `cached_last_seq` (the tail-segment
+    // retention invariant: there must always be a place to append into),
+    // so the eviction count is capped at `segments.len() - 1`.
+    //
+    // Compute the cutoff once and `drain(..cutoff)` so the remaining tail
+    // shifts a single time, instead of O(n) per removed segment with
+    // `Vec::remove(0)` in a loop.
+    let max_evict = inner.segments.len().saturating_sub(1);
+    let cutoff = inner.segments.iter().take(max_evict).position(|s| s.last_seq >= seq).unwrap_or(max_evict);
+
+    let removed: Vec<SegmentInfo> = inner.segments.drain(..cutoff).collect();
+    for r in removed {
+      let log_path = inner.segment_log_path(r.first_seq);
+      let idx_path = inner.segment_idx_path(r.first_seq);
+      let fallback_size = r.file_size;
+      let physical_size = compio::fs::metadata(&log_path).await.map(|m| m.len()).unwrap_or(fallback_size);
+      inner.metrics.segments_evicted.inc();
+      inner.metrics.evicted_bytes.inc_by(physical_size);
+      drop(r);
+      let _ = compio::fs::remove_file(log_path).await;
+      let _ = compio::fs::remove_file(idx_path).await;
+    }
+    inner.cached_first_seq = inner.segments.first().map_or(0, |s| s.first_seq);
+    Ok(())
   }
 
   async fn read(&self, from_seq: u64, limit: u32, visitor: &mut impl LogVisitor) -> anyhow::Result<u32>
@@ -1285,15 +1349,29 @@ impl FileMessageLogFactory {
 impl MessageLogFactory for FileMessageLogFactory {
   type Log = FileMessageLog;
 
-  async fn create(&self, handler: &StringAtom) -> anyhow::Result<FileMessageLog> {
+  async fn create(&self, handler: &StringAtom, mode: LogMode) -> anyhow::Result<FileMessageLog> {
+    let channel_dir = self.channel_dir_for(handler);
+    let fifo_mode = matches!(mode, LogMode::Fifo);
+    let segment_max = self.segment_max_bytes.unwrap_or(SEGMENT_MAX_BYTES);
+    FileMessageLog::open_with_segment_max(
+      channel_dir,
+      self.max_payload_size,
+      segment_max,
+      fifo_mode,
+      self.metrics.clone(),
+    )
+    .await
+  }
+
+  fn channel_dir(&self, handler: &StringAtom) -> Option<PathBuf> {
+    Some(self.channel_dir_for(handler))
+  }
+}
+
+impl FileMessageLogFactory {
+  fn channel_dir_for(&self, handler: &StringAtom) -> PathBuf {
     let hash = channel_hash(handler);
-    let channel_dir = self.data_dir.join(hash.as_ref());
-    match self.segment_max_bytes {
-      Some(max) => {
-        FileMessageLog::open_with_segment_max(channel_dir, self.max_payload_size, max, self.metrics.clone()).await
-      },
-      None => FileMessageLog::open(channel_dir, self.max_payload_size, self.metrics.clone()).await,
-    }
+    self.data_dir.join(hash.as_ref())
   }
 }
 
@@ -1362,7 +1440,7 @@ mod tests {
   /// Helper: create a FileMessageLog in a temp directory.
   async fn create_log(dir: &std::path::Path) -> FileMessageLog {
     let factory = FileMessageLogFactory::new(dir.to_path_buf(), TEST_MAX_PAYLOAD_SIZE, MessageLogMetrics::noop());
-    factory.create(&StringAtom::from("test_channel")).await.expect("recovery should succeed in tests")
+    factory.create(&StringAtom::from("test_channel"), LogMode::PubSub).await.expect("recovery should succeed in tests")
   }
 
   /// Helper: create a FileMessageLog with a custom segment size threshold.
@@ -1379,7 +1457,7 @@ mod tests {
   ) -> FileMessageLog {
     let hash = channel_hash(&StringAtom::from("test_channel"));
     let channel_dir = dir.join(hash.as_ref());
-    FileMessageLog::open_with_segment_max(channel_dir, TEST_MAX_PAYLOAD_SIZE, segment_max_bytes, metrics)
+    FileMessageLog::open_with_segment_max(channel_dir, TEST_MAX_PAYLOAD_SIZE, segment_max_bytes, false, metrics)
       .await
       .expect("recovery should succeed in tests")
   }
@@ -2498,8 +2576,8 @@ mod tests {
     let factory =
       FileMessageLogFactory::new(tmp.path().to_path_buf(), TEST_MAX_PAYLOAD_SIZE, MessageLogMetrics::noop());
 
-    let log_a = factory.create(&StringAtom::from("channel_a")).await.unwrap();
-    let log_b = factory.create(&StringAtom::from("channel_b")).await.unwrap();
+    let log_a = factory.create(&StringAtom::from("channel_a"), LogMode::PubSub).await.unwrap();
+    let log_b = factory.create(&StringAtom::from("channel_b"), LogMode::PubSub).await.unwrap();
 
     append_message(&log_a, 1, "alice@localhost", b"for_a", 100).await;
     append_message(&log_b, 1, "bob@localhost", b"for_b", 100).await;
@@ -2515,5 +2593,118 @@ mod tests {
     log_b.read(1, 10, &mut visitor_b).await.unwrap();
     assert_eq!(visitor_b.entries[0].from, "bob@localhost");
     assert_eq!(visitor_b.entries[0].payload, b"for_b");
+  }
+
+  // ===== FIFO mode + new MessageLog API =====
+
+  #[compio::test]
+  async fn test_last_durable_seq_lags_until_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = create_log(tmp.path()).await;
+
+    assert_eq!(log.last_durable_seq(), 0);
+
+    append_message(&log, 1, "alice@localhost", b"a", 0).await;
+    assert_eq!(log.last_seq(), 1);
+    assert_eq!(log.last_durable_seq(), 0, "appended but not yet flushed");
+
+    log.flush().await.unwrap();
+    assert_eq!(log.last_durable_seq(), 1, "flushed → durable matches last_seq");
+
+    append_message(&log, 2, "alice@localhost", b"b", 0).await;
+    assert_eq!(log.last_durable_seq(), 1, "second append, no flush yet");
+
+    log.flush().await.unwrap();
+    assert_eq!(log.last_durable_seq(), 2);
+  }
+
+  #[compio::test]
+  async fn test_last_durable_seq_resets_to_zero_after_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+      let log = create_log(tmp.path()).await;
+      append_message(&log, 1, "alice@localhost", b"a", 0).await;
+      log.flush().await.unwrap();
+      assert_eq!(log.last_durable_seq(), 1);
+    }
+
+    // Reopen on the same directory: the entry is recoverable, but
+    // durability hasn't been re-established by *this* process.
+    let log = create_log(tmp.path()).await;
+    assert_eq!(log.last_seq(), 1, "entry must survive recovery");
+    assert_eq!(log.last_durable_seq(), 0, "durable seq stays at 0 until first flush in this process");
+
+    log.flush().await.unwrap();
+    assert_eq!(log.last_durable_seq(), 1);
+  }
+
+  #[compio::test]
+  async fn test_switch_to_fifo_mode_disables_tail_eviction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = create_log(tmp.path()).await;
+
+    log.switch_to_fifo_mode();
+
+    // max_messages=1 in pub/sub mode would evict everything but the latest;
+    // in FIFO mode it must be a no-op. We verify by checking that all five
+    // entries are still readable.
+    for seq in 1..=5 {
+      append_message(&log, seq, "alice@localhost", b"x", 1).await;
+    }
+    log.flush().await.unwrap();
+
+    let mut visitor = CollectingVisitor::new();
+    log.read(1, 10, &mut visitor).await.unwrap();
+    let seqs: Vec<u64> = visitor.entries.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+  }
+
+  #[compio::test]
+  async fn test_evict_below_drops_sealed_segments_with_tail_retention() {
+    // Use a small segment threshold so each entry rolls a new segment.
+    let tmp = tempfile::tempdir().unwrap();
+    let log = create_log_with_segment_max(tmp.path(), 1).await;
+    log.switch_to_fifo_mode();
+
+    for seq in 1..=4 {
+      append_message(&log, seq, "alice@localhost", b"payload", 0).await;
+    }
+    log.flush().await.unwrap();
+
+    // Should now have multiple segments. evict_below(3) drops segments
+    // whose last_seq < 3. The active (last) segment is retained even if
+    // its last_seq < 3 (tail-segment retention).
+    log.evict_below(3).await.unwrap();
+    assert!(log.first_seq() <= 3, "first_seq after evict_below(3): {}", log.first_seq());
+    assert_eq!(log.last_seq(), 4, "tail segment must remain");
+  }
+
+  #[compio::test]
+  async fn test_evict_below_no_op_in_pubsub_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = create_log_with_segment_max(tmp.path(), 1).await;
+
+    for seq in 1..=4 {
+      append_message(&log, seq, "alice@localhost", b"payload", 0).await;
+    }
+    log.flush().await.unwrap();
+
+    let first_before = log.first_seq();
+    log.evict_below(3).await.unwrap();
+    assert_eq!(log.first_seq(), first_before, "evict_below must not affect pub/sub mode");
+  }
+
+  #[compio::test]
+  async fn test_evict_below_zero_is_no_op() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = create_log_with_segment_max(tmp.path(), 1).await;
+    log.switch_to_fifo_mode();
+    for seq in 1..=3 {
+      append_message(&log, seq, "alice@localhost", b"x", 0).await;
+    }
+    log.flush().await.unwrap();
+    let first_before = log.first_seq();
+    log.evict_below(0).await.unwrap();
+    assert_eq!(log.first_seq(), first_before);
   }
 }
