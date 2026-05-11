@@ -20,6 +20,7 @@
   - [`PUSH` / `PUSH_ACK`](#push--push_ack)
   - [`POP` / `POP_ACK`](#pop--pop_ack)
   - [`GET_CHAN_LEN` / `CHAN_LEN`](#get_chan_len--chan_len)
+  - [`CLEAR` / `CLEAR_ACK`](#clear--clear_ack)
   - [Event: `CHANNEL_RECONFIGURED`](#event-channel_reconfigured)
   - [New Error Reasons](#new-error-reasons)
 - [Authorization Matrix](#authorization-matrix)
@@ -248,6 +249,10 @@ While a channel is FIFO:
 - `HISTORY` and `CHAN_SEQ` are rejected (`WRONG_TYPE`); destructive consumption
   has no archive contract.
 - `PUSH` and `POP` are valid.
+- `CLEAR` is owner-only and discards all queued elements without destroying
+  the channel; ACLs, members, and configuration are preserved. It is also the
+  owner-side recovery path when the head cursor is unrecoverable (see
+  [`CLEAR` / `CLEAR_ACK`](#clear--clear_ack) and [Head Cursor](#head-cursor)).
 - `MEMBER_JOINED` fires on JOIN. `MEMBER_LEFT` fires on **non-owner** LEAVE.
   Owner LEAVE on a FIFO channel emits `CHANNEL_DELETED` instead of
   `MEMBER_LEFT` (see "Owner LEAVE auto-deletes" below).
@@ -398,6 +403,58 @@ Only the owner may query the length. Consumers do not need it; they discover
 emptiness via `QUEUE_EMPTY` on `POP`. The owner uses it to gauge backpressure
 before risking `QUEUE_FULL`.
 
+### `CLEAR` / `CLEAR_ACK`
+
+```
+CLEAR id=<corr> channel=<name>
+
+→ CLEAR_ACK id=<corr>
+```
+
+Discards every element currently between the head cursor and the tail of a
+FIFO channel. After `CLEAR_ACK`, `GET_CHAN_LEN` returns `0` and the next `POP`
+returns `QUEUE_EMPTY` until a fresh `PUSH` arrives. Channel membership, ACLs,
+and configuration are preserved. The seq counter is preserved as well: the
+next `PUSH` is assigned `log.last_seq() + 1`, so seq monotonicity holds across
+the operation (a CLEAR does **not** reset seq to 1).
+
+`CLEAR` is idempotent: clearing an already-empty queue succeeds with no
+externally visible effect. A producer retrying `CLEAR` on missing `CLEAR_ACK`
+cannot discard anything beyond what the original `CLEAR` would have.
+
+Errors:
+
+- `CHANNEL_NOT_FOUND` if the channel does not exist.
+- `USER_NOT_IN_CHANNEL` if the caller is not a member.
+- `FORBIDDEN` if the caller is not the owner.
+- `WRONG_TYPE` if the channel is pub/sub.
+- `NOT_IMPLEMENTED` if `channel_id.domain != local_domain`.
+
+`CLEAR` is **not** rejected with `CURSOR_RECOVERY_REQUIRED`. It is the
+owner-driven recovery path for that state: see
+[Head Cursor → Recovery](#head-cursor).
+
+**Crash-safe ordering** (mirrors the type-transition write order: log durable
+first, cursor second):
+
+1. Synchronously flush and fsync the message log so `log.last_seq()` reflects
+   on-disk state.
+2. Atomic write of `cursor.bin` with `next_seq = log.last_seq() + 1`
+   (tmp → fsync → rename → fsync parent).
+3. If the channel was in `NeedsRecovery`, transition it back to `Healthy`
+   with the freshly written cursor.
+4. Send `CLEAR_ACK`.
+5. Lazily head-evict segments below the new cursor; reuses the existing
+   head-eviction machinery and does not block the ACK.
+
+Crash semantics:
+
+- **Crash before (2):** queue intact. Client retries `CLEAR` on missing ACK.
+- **Crash between (2) and (4):** the cursor is durably reset, but the client
+  did not see `CLEAR_ACK`. On retry, `CLEAR` is a no-op (the queue is already
+  empty). Either way, the client never sees an element that survived a
+  `CLEAR` it believed had succeeded.
+
 ### Event: `CHANNEL_RECONFIGURED`
 
 A new `EventKind` variant fired to all JOINed members on any successful
@@ -421,7 +478,7 @@ Added to `narwhal-protocol`:
 | `QUEUE_EMPTY`       | `POP` against an empty FIFO channel.                              |
 | `QUEUE_FULL`        | `PUSH` against a full FIFO channel (at `max_persist_messages`).   |
 | `WRONG_TYPE`        | Operation incompatible with channel type (e.g. `BROADCAST` on FIFO, `PUSH` on pub/sub). |
-| `CURSOR_RECOVERY_REQUIRED` | `PUSH` / `POP` / `GET_CHAN_LEN` on a FIFO channel whose head cursor is missing or corrupt; awaiting operator action. |
+| `CURSOR_RECOVERY_REQUIRED` | `PUSH` / `POP` / `GET_CHAN_LEN` on a FIFO channel whose head cursor is missing or corrupt; awaiting `CLEAR` from the owner or operator action. `CLEAR` itself is exempt and serves as the recovery path. |
 
 `FORBIDDEN` (existing) covers non-owner `PUSH` / `DELETE` / `GET_CHAN_LEN` /
 `SET_CHAN_CONFIG`. No new reason needed for those.
@@ -438,6 +495,7 @@ Added to `narwhal-protocol`:
 | `PUSH`         | **Rejected (`WRONG_TYPE`)**    | Owner only                    |
 | `POP`          | **Rejected (`WRONG_TYPE`)**    | Members (subject to read ACL) |
 | `GET_CHAN_LEN` | **Rejected (`WRONG_TYPE`)**    | Owner only                    |
+| `CLEAR`        | **Rejected (`WRONG_TYPE`)**    | Owner only                    |
 | `GET_CHAN_CONFIG` | Any member                  | Any member                    |
 | `SET_CHAN_CONFIG` | Owner only (existing)       | Owner only (existing)         |
 | `DELETE`       | Owner only (existing)         | Owner only (existing)         |
@@ -552,13 +610,21 @@ lost. See [Cursor Durability → Producer-side ACK-loss
 ambiguity](#cursor-durability) and the [out-of-scope server-side PUSH
 idempotency item](#out-of-scope-v1).
 
-If recovery fails, **operator recovery** is one of:
+If recovery fails, the channel is **not** removed from the namespace; it
+remains in a `NeedsRecovery` state. All FIFO data-plane operations
+(`PUSH` / `POP` / `GET_CHAN_LEN`) reject with `CURSOR_RECOVERY_REQUIRED`
+until the channel is healed by one of:
 
-1. Restore the sidecar from a backup.
-2. Explicitly accept loss: write a fresh sidecar with
-   `next_seq = log.last_seq() + 1` (treats whatever is in the log as
-   already-consumed).
-3. `DELETE` the channel.
+1. **Owner-initiated `CLEAR`** (recommended; no operator file-system access
+   required). The owner sends `CLEAR`; the server flushes the log, writes a
+   fresh sidecar with `next_seq = log.last_seq() + 1` (logically consuming
+   whatever was in the log), and transitions the channel back to `Healthy`.
+   See [`CLEAR` / `CLEAR_ACK`](#clear--clear_ack).
+2. Operator restores the sidecar from a backup.
+3. Operator accepts loss directly on disk by writing a fresh sidecar with
+   `next_seq = log.last_seq() + 1` (equivalent to (1) without involving the
+   owner).
+4. Owner or operator `DELETE`s the channel.
 
 `length` reported by `GET_CHAN_LEN` is computed from the cursor and the log
 (the log is consulted only for `last_seq` and entry retrieval):
@@ -724,6 +790,7 @@ The following pub/sub paths must branch on channel type:
 | Message log eviction policy           | Tail-evict at cap                | Reject PUSH at cap (`QUEUE_FULL`)    |
 | `BROADCAST` handler                   | Append + fan out                 | `WRONG_TYPE`                         |
 | `HISTORY` / `CHAN_SEQ` handlers       | Read from log                    | `WRONG_TYPE`                         |
+| `CLEAR` handler                       | `WRONG_TYPE` (no head-cursor notion) | Owner-only; flush log → write cursor `next_seq = log.last_seq() + 1` → optional head-eviction; transitions `NeedsRecovery → Healthy` when applicable. |
 
 Pub/sub paths that **do not** need to branch:
 
@@ -768,6 +835,7 @@ New metrics under the `narwhal` channel prefix:
 | ----------------------------- | --------- | -------------------------------------- |
 | `fifo_pushes{result}`         | Counter   | One label per `PUSH` outcome; see below. |
 | `fifo_pops{result}`           | Counter   | One label per `POP` outcome; see below.  |
+| `fifo_clears{result}`         | Counter   | One label per `CLEAR` outcome; see below. |
 | `fifo_queue_depth`            | Gauge     | Per-channel? Or aggregate? (see implementation note) |
 | `fifo_cursor_fsync_seconds`   | Histogram | Wall time of cursor fsync.             |
 
@@ -794,6 +862,18 @@ outcome; see [POP errors](#pop--pop_ack)):
 - `wrong_type` (channel is pub/sub)
 - `queue_empty`
 - `cursor_recovery_required`
+- `not_implemented` (non-local domain)
+
+**`fifo_clears{result}` labels** (must cover every documented `CLEAR`
+outcome; see [CLEAR errors](#clear--clear_ack)). Note that
+`cursor_recovery_required` is **not** in this list: `CLEAR` is exempt from
+that error and is the recovery path for it.
+
+- `success`
+- `channel_not_found`
+- `user_not_in_channel`
+- `forbidden` (caller is not the owner)
+- `wrong_type` (channel is pub/sub)
 - `not_implemented` (non-local domain)
 
 Implementations must emit exactly one of these labels per call. If a
@@ -840,16 +920,18 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
      (mutating request, partial-update).
    - Add `type: StringAtom` to `ChannelConfigurationParameters` (read response
      to `GET_CHAN_CONFIG`).
-   - Add `Push`, `PushAck`, `Pop`, `PopAck`, `GetChannelLen`, `ChannelLen`
-     message variants. `Push` and `PopAck` carry `length` like `Broadcast` /
-     `Message` and a binary payload.
+   - Add `Push`, `PushAck`, `Pop`, `PopAck`, `GetChannelLen`, `ChannelLen`,
+     `Clear`, `ClearAck` message variants. `Push` and `PopAck` carry `length`
+     like `Broadcast` / `Message` and a binary payload; `Clear` and `ClearAck`
+     carry no payload.
    - Add `EventKind::ChannelReconfigured`.
    - Add error reasons: `QUEUE_EMPTY`, `QUEUE_FULL`, `WRONG_TYPE`,
      `CURSOR_RECOVERY_REQUIRED`.
    - Update serialize/deserialize/validate/test fixtures.
 2. **Channel manager (`crates/server/src/channel/manager.rs`):**
    - Add `Channel.channel_type: ChannelType` and `Channel.cursor` (head seq).
-   - Add `Command::Push`, `Command::Pop`, `Command::GetChannelLen`.
+   - Add `Command::Push`, `Command::Pop`, `Command::GetChannelLen`,
+     `Command::Clear`.
    - Implement transition validation in `set_channel_configuration`,
      including **seq-counter alignment**: when transitioning to
      `type=fifo`, set `channel.seq = log.last_seq() + 1` before writing
@@ -897,9 +979,19 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
    - **`PUSH` path** does **not** touch the cursor sidecar; it just
      appends to the log buffer and sends `PUSH_ACK` (durability via
      batched flush, like pub/sub `BROADCAST`).
+   - **`CLEAR` path** (only other steady-state writer of the sidecar):
+     1. Synchronous log flush+fsync so `log.last_seq()` is durable.
+     2. Atomic-write + fsync `cursor.bin` with
+        `next_seq = log.last_seq() + 1`.
+     3. If `FifoState::NeedsRecovery`, transition to
+        `FifoState::Healthy(cursor)`.
+     4. Send `CLEAR_ACK`.
+     5. Trigger head-eviction of now-unreachable segments (best-effort,
+        does not block the ACK; log warnings on eviction errors as today).
    - Recovery: validate `next_seq >= 1`, `next_seq <= log.last_seq() + 1`,
      and `log.first_seq() <= next_seq` when the queue is non-empty; on
-     any failure surface `CURSOR_RECOVERY_REQUIRED`.
+     any failure surface `CURSOR_RECOVERY_REQUIRED` and keep the channel in
+     `NeedsRecovery` until `CLEAR` (or operator action) heals it.
 5. **Channel store (`store.rs` for the schema; `file_store.rs` for
    on-disk I/O):**
    - Add `channel_type: ChannelType` (enum `{ PubSub, Fifo }`) to
@@ -967,6 +1059,20 @@ A non-binding outline of the work units. Order is suggestive, not prescriptive.
    - Cursor-corruption test: corrupt or delete `cursor.bin` between runs,
      verify the channel refuses `PUSH`/`POP`/`GET_CHAN_LEN` with
      `CURSOR_RECOVERY_REQUIRED` until an operator-supplied recovery action.
+   - **`CLEAR` semantics test:** PUSH N elements, `CLEAR`, expect
+     `CLEAR_ACK`; verify `GET_CHAN_LEN == 0`, the next `POP` returns
+     `QUEUE_EMPTY`, and a subsequent `PUSH` is assigned `seq = N + 1`
+     (seq monotonicity preserved across CLEAR).
+   - **`CLEAR` idempotence test:** `CLEAR` on an already-empty FIFO returns
+     `CLEAR_ACK`; second back-to-back `CLEAR` is a no-op and still acks.
+   - **`CLEAR` authorization tests:** non-owner member receives `FORBIDDEN`;
+     non-member receives `USER_NOT_IN_CHANNEL`; pub/sub channel receives
+     `WRONG_TYPE`.
+   - **`CLEAR`-as-recovery test:** corrupt `cursor.bin` between runs,
+     confirm the channel comes up in `NeedsRecovery` and rejects
+     `PUSH`/`POP`/`GET_CHAN_LEN` with `CURSOR_RECOVERY_REQUIRED`, then send
+     `CLEAR` from the owner and confirm (a) `CLEAR_ACK`, (b) a subsequent
+     `PUSH` succeeds, (c) `POP` returns that element.
 9. **Docs:**
    - Update `docs/PROTOCOL.md` to document the new messages, errors, and the
      `type` field. Add a 1.5 changelog entry.
