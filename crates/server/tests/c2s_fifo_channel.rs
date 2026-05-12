@@ -13,11 +13,14 @@ use narwhal_common::core_dispatcher::CoreDispatcher;
 use narwhal_modulator::create_s2m_listener;
 use narwhal_modulator::modulator::AuthResult;
 use narwhal_protocol::{
-  BroadcastParameters, ChannelSeqParameters, ErrorReason, EventKind, GetChannelConfigurationParameters,
-  HistoryParameters, LeaveChannelParameters, ListChannelsParameters, Message, SetChannelConfigurationParameters,
+  AclAction, AclType, BroadcastParameters, ChannelSeqParameters, ErrorReason, EventKind,
+  GetChannelConfigurationParameters, GetChannelLenParameters, HistoryParameters, LeaveChannelParameters,
+  ListChannelsParameters, Message, PopParameters, PushParameters, SetChannelAclParameters,
+  SetChannelConfigurationParameters,
 };
 use narwhal_server::channel::file_message_log::{FileMessageLogFactory, MessageLogMetrics};
 use narwhal_server::channel::file_store::FileChannelStore;
+use narwhal_server::channel::store::{ChannelStore, MessageLogFactory};
 use narwhal_test_util::{C2sSuite, TestModulator, default_c2s_config, default_s2m_config};
 use narwhal_util::string_atom::StringAtom;
 use prometheus_client::registry::Registry;
@@ -608,5 +611,661 @@ async fn test_channel_reconfigured_suppressed_on_no_op() -> anyhow::Result<()> {
   suite.teardown().await?;
   s2m_ln.shutdown().await?;
   s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+// ---------- PR 2 data-plane tests ----------
+
+/// Writes `PUSH id length` + payload + trailing newline. Caller awaits the
+/// `PUSH_ACK` separately (so test code can also assert errors).
+async fn write_push<CS: ChannelStore, MLF: MessageLogFactory>(
+  suite: &mut C2sSuite<CS, MLF>,
+  user: &str,
+  channel: &str,
+  id: u32,
+  payload: &[u8],
+) -> anyhow::Result<()> {
+  suite
+    .write_message(
+      user,
+      Message::Push(PushParameters { id, channel: StringAtom::from(channel), length: payload.len() as u32 }),
+    )
+    .await?;
+  suite.write_raw_bytes(user, payload).await?;
+  suite.write_raw_bytes(user, b"\n").await?;
+  Ok(())
+}
+
+/// Sends a PUSH and asserts a PUSH_ACK with the same correlation id.
+async fn push_ok<CS: ChannelStore, MLF: MessageLogFactory>(
+  suite: &mut C2sSuite<CS, MLF>,
+  user: &str,
+  channel: &str,
+  id: u32,
+  payload: &[u8],
+) -> anyhow::Result<()> {
+  write_push(suite, user, channel, id, payload).await?;
+  match suite.read_message(user).await? {
+    Message::PushAck(p) => {
+      assert_eq!(p.id, id);
+      Ok(())
+    },
+    other => panic!("expected PushAck, got: {:?}", other),
+  }
+}
+
+/// Sends a POP and reads back the POP_ACK + payload + trailing newline.
+/// Returns the payload and the entry's PUSH timestamp.
+async fn pop_ok<CS: ChannelStore, MLF: MessageLogFactory>(
+  suite: &mut C2sSuite<CS, MLF>,
+  user: &str,
+  channel: &str,
+  id: u32,
+) -> anyhow::Result<(Vec<u8>, u64)> {
+  suite.write_message(user, Message::Pop(PopParameters { id, channel: StringAtom::from(channel) })).await?;
+  match suite.read_message(user).await? {
+    Message::PopAck(p) => {
+      assert_eq!(p.id, id);
+      let mut buf = vec![0u8; p.length as usize];
+      suite.read_raw_bytes(user, &mut buf).await?;
+      let mut nl = [0u8; 1];
+      suite.read_raw_bytes(user, &mut nl).await?;
+      assert_eq!(nl[0], b'\n', "payload not followed by newline");
+      Ok((buf, p.timestamp))
+    },
+    other => panic!("expected PopAck, got: {:?}", other),
+  }
+}
+
+/// Sends a GET_CHAN_LEN and reads back the CHAN_LEN count.
+async fn get_chan_len_ok<CS: ChannelStore, MLF: MessageLogFactory>(
+  suite: &mut C2sSuite<CS, MLF>,
+  user: &str,
+  channel: &str,
+  id: u32,
+) -> anyhow::Result<u32> {
+  suite
+    .write_message(user, Message::GetChannelLen(GetChannelLenParameters { id, channel: StringAtom::from(channel) }))
+    .await?;
+  match suite.read_message(user).await? {
+    Message::ChannelLen(p) => {
+      assert_eq!(p.id, id);
+      assert_eq!(p.channel.as_ref(), channel);
+      Ok(p.count)
+    },
+    other => panic!("expected ChannelLen, got: {:?}", other),
+  }
+}
+
+/// Auths user_1, JOINs `CHANNEL`, transitions to FIFO with the given
+/// `max_persist_messages` and optional `message_flush_interval`. Drains
+/// the SetChannelConfigurationAck.
+async fn bootstrap_fifo<CS: ChannelStore, MLF: MessageLogFactory>(
+  suite: &mut C2sSuite<CS, MLF>,
+  max_persist_messages: u32,
+  flush_interval: Option<u32>,
+) -> anyhow::Result<()> {
+  suite.auth(TEST_USER_1, TEST_USER_1).await?;
+  suite.join_channel(TEST_USER_1, CHANNEL, None).await?;
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::SetChannelConfiguration(SetChannelConfigurationParameters {
+        id: 555,
+        channel: StringAtom::from(CHANNEL),
+        persist: Some(true),
+        max_persist_messages: Some(max_persist_messages),
+        message_flush_interval: flush_interval,
+        r#type: Some(StringAtom::from("fifo")),
+        ..Default::default()
+      }),
+    )
+    .await?;
+  match suite.read_message(TEST_USER_1).await? {
+    Message::SetChannelConfigurationAck(p) => assert_eq!(p.id, 555),
+    other => panic!("expected SetChannelConfigurationAck, got: {:?}", other),
+  }
+  Ok(())
+}
+
+/// PUSH then POP roundtrip: payload and timestamp survive intact.
+#[compio::test]
+async fn test_push_pop_roundtrip() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+
+  let before_push = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 1, b"hello fifo").await?;
+  let (payload, timestamp) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 2).await?;
+  assert_eq!(payload, b"hello fifo");
+  assert!(timestamp >= before_push, "POP timestamp ({}) must be >= pre-push wall time ({})", timestamp, before_push);
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// POP against an empty FIFO returns `QUEUE_EMPTY`.
+#[compio::test]
+async fn test_pop_empty_queue_returns_queue_empty() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+
+  suite.write_message(TEST_USER_1, Message::Pop(PopParameters { id: 7, channel: StringAtom::from(CHANNEL) })).await?;
+  match suite.read_message(TEST_USER_1).await? {
+    Message::Error(p) => {
+      assert_eq!(p.id, Some(7));
+      assert_eq!(p.reason, StringAtom::from(ErrorReason::QueueEmpty));
+    },
+    other => panic!("expected Error(QUEUE_EMPTY), got: {:?}", other),
+  }
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// Queue depth is computed from the cursor and the log's tail, not from the
+/// physical entry count. PUSH N up to the cap, POP one, PUSH one more must
+/// succeed; PUSH again must fail with `QUEUE_FULL`. This locks the
+/// logical-depth contract that survives once head-eviction kicks in.
+#[compio::test]
+async fn test_push_queue_full_logical_depth() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 3, None).await?;
+
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 1, b"a").await?;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 2, b"b").await?;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 3, b"c").await?;
+
+  // Fourth push must be QUEUE_FULL.
+  write_push(&mut suite, TEST_USER_1, CHANNEL, 4, b"d").await?;
+  match suite.read_message(TEST_USER_1).await? {
+    Message::Error(p) => {
+      assert_eq!(p.id, Some(4));
+      assert_eq!(p.reason, StringAtom::from(ErrorReason::QueueFull));
+    },
+    other => panic!("expected Error(QUEUE_FULL), got: {:?}", other),
+  }
+
+  // Drain one and verify PUSH succeeds again under the cap. depth=2 < 3.
+  let (got, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 5).await?;
+  assert_eq!(got, b"a");
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 6, b"d").await?;
+
+  // depth back to 3 (b, c, d); another push must again be QUEUE_FULL.
+  write_push(&mut suite, TEST_USER_1, CHANNEL, 7, b"e").await?;
+  match suite.read_message(TEST_USER_1).await? {
+    Message::Error(p) => {
+      assert_eq!(p.id, Some(7));
+      assert_eq!(p.reason, StringAtom::from(ErrorReason::QueueFull));
+    },
+    other => panic!("expected Error(QUEUE_FULL), got: {:?}", other),
+  }
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// PUSH from a non-owner member returns `FORBIDDEN`.
+#[compio::test]
+async fn test_push_non_owner_returns_forbidden() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+  suite.auth(TEST_USER_2, TEST_USER_2).await?;
+  suite.join_channel(TEST_USER_2, CHANNEL, None).await?;
+  // owner drains MEMBER_JOINED.
+  suite.ignore_reply(TEST_USER_1).await?;
+
+  write_push(&mut suite, TEST_USER_2, CHANNEL, 1, b"unauthorized").await?;
+  match suite.read_message(TEST_USER_2).await? {
+    Message::Error(p) => {
+      assert_eq!(p.id, Some(1));
+      assert_eq!(p.reason, StringAtom::from(ErrorReason::Forbidden));
+    },
+    other => panic!("expected Error(FORBIDDEN), got: {:?}", other),
+  }
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// POP from an authenticated user that has not JOINed the channel returns
+/// `USER_NOT_IN_CHANNEL`.
+#[compio::test]
+async fn test_pop_non_member_returns_user_not_in_channel() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 1, b"data").await?;
+
+  // user_2 auths but never JOINs.
+  suite.auth(TEST_USER_2, TEST_USER_2).await?;
+  suite.write_message(TEST_USER_2, Message::Pop(PopParameters { id: 9, channel: StringAtom::from(CHANNEL) })).await?;
+  match suite.read_message(TEST_USER_2).await? {
+    Message::Error(p) => {
+      assert_eq!(p.id, Some(9));
+      assert_eq!(p.reason, StringAtom::from(ErrorReason::UserNotInChannel));
+    },
+    other => panic!("expected Error(USER_NOT_IN_CHANNEL), got: {:?}", other),
+  }
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// POP from a JOINed member that the read ACL excludes returns `NOT_ALLOWED`.
+#[compio::test]
+async fn test_pop_read_acl_denied_returns_not_allowed() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+  suite.auth(TEST_USER_2, TEST_USER_2).await?;
+  suite.join_channel(TEST_USER_2, CHANNEL, None).await?;
+  // owner drains MEMBER_JOINED.
+  suite.ignore_reply(TEST_USER_1).await?;
+
+  // Owner sets the read ACL to allow only itself.
+  suite
+    .write_message(
+      TEST_USER_1,
+      Message::SetChannelAcl(SetChannelAclParameters {
+        id: 100,
+        channel: StringAtom::from(CHANNEL),
+        r#type: StringAtom::from(AclType::Read.as_str()),
+        action: StringAtom::from(AclAction::Add.as_str()),
+        nids: vec![StringAtom::from(format!("{}@localhost", TEST_USER_1))],
+      }),
+    )
+    .await?;
+  match suite.read_message(TEST_USER_1).await? {
+    Message::SetChannelAclAck(p) => assert_eq!(p.id, 100),
+    other => panic!("expected SetChannelAclAck, got: {:?}", other),
+  }
+
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 1, b"secret").await?;
+
+  // user_2 attempts POP and gets denied.
+  suite.write_message(TEST_USER_2, Message::Pop(PopParameters { id: 9, channel: StringAtom::from(CHANNEL) })).await?;
+  match suite.read_message(TEST_USER_2).await? {
+    Message::Error(p) => {
+      assert_eq!(p.id, Some(9));
+      assert_eq!(p.reason, StringAtom::from(ErrorReason::NotAllowed));
+    },
+    other => panic!("expected Error(NOT_ALLOWED), got: {:?}", other),
+  }
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// GET_CHAN_LEN reflects PUSH/POP activity: starts at 0, grows with PUSH,
+/// shrinks with POP.
+#[compio::test]
+async fn test_get_chan_len_returns_queue_depth() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+  assert_eq!(get_chan_len_ok(&mut suite, TEST_USER_1, CHANNEL, 10).await?, 0);
+
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 11, b"x").await?;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 12, b"y").await?;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 13, b"z").await?;
+  assert_eq!(get_chan_len_ok(&mut suite, TEST_USER_1, CHANNEL, 14).await?, 3);
+
+  let (_, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 15).await?;
+  assert_eq!(get_chan_len_ok(&mut suite, TEST_USER_1, CHANNEL, 16).await?, 2);
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// GET_CHAN_LEN from a non-owner member returns `FORBIDDEN`.
+#[compio::test]
+async fn test_get_chan_len_non_owner_returns_forbidden() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+  suite.auth(TEST_USER_2, TEST_USER_2).await?;
+  suite.join_channel(TEST_USER_2, CHANNEL, None).await?;
+  // owner drains MEMBER_JOINED.
+  suite.ignore_reply(TEST_USER_1).await?;
+
+  suite
+    .write_message(
+      TEST_USER_2,
+      Message::GetChannelLen(GetChannelLenParameters { id: 9, channel: StringAtom::from(CHANNEL) }),
+    )
+    .await?;
+  match suite.read_message(TEST_USER_2).await? {
+    Message::Error(p) => {
+      assert_eq!(p.id, Some(9));
+      assert_eq!(p.reason, StringAtom::from(ErrorReason::Forbidden));
+    },
+    other => panic!("expected Error(FORBIDDEN), got: {:?}", other),
+  }
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// Competing consumers: two clients POPing the same FIFO each receive a
+/// distinct element. The per-channel actor serializes POPs and the cursor
+/// advances exactly once per success, so no element is delivered twice.
+#[compio::test]
+async fn test_competing_consumers_each_get_unique_element() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+  suite.auth(TEST_USER_2, TEST_USER_2).await?;
+  suite.join_channel(TEST_USER_2, CHANNEL, None).await?;
+  suite.ignore_reply(TEST_USER_1).await?;
+
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 1, b"alpha").await?;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 2, b"beta").await?;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 3, b"gamma").await?;
+
+  // Each consumer pops once; collect what they got.
+  let (a, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 10).await?;
+  let (b, _) = pop_ok(&mut suite, TEST_USER_2, CHANNEL, 20).await?;
+  let (c, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 11).await?;
+
+  let mut seen = vec![a, b, c];
+  seen.sort();
+  assert_eq!(seen, vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]);
+
+  // No element remains; both consumers see QUEUE_EMPTY now.
+  for user in [TEST_USER_1, TEST_USER_2] {
+    suite.write_message(user, Message::Pop(PopParameters { id: 99, channel: StringAtom::from(CHANNEL) })).await?;
+    match suite.read_message(user).await? {
+      Message::Error(p) => {
+        assert_eq!(p.reason, StringAtom::from(ErrorReason::QueueEmpty));
+      },
+      other => panic!("expected Error(QUEUE_EMPTY), got: {:?}", other),
+    }
+  }
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// Cursor advance survives restart: after PUSH N and POP K, restart and verify
+/// POPs deliver the remaining N - K entries in order. Combined with the
+/// per-POP cursor fsync, this exercises the no-duplication contract: an
+/// already-consumed entry must not surface again.
+#[compio::test]
+async fn test_pop_durable_across_restart() -> anyhow::Result<()> {
+  let tmp = tempfile::tempdir()?;
+  let data_dir = tmp.path().to_path_buf();
+
+  // First boot: PUSH 3, POP 1.
+  {
+    let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+    let store = FileChannelStore::new(data_dir.clone()).await?;
+    let mlf = FileMessageLogFactory::new(
+      data_dir.clone(),
+      default_c2s_config().limits.max_payload_size,
+      MessageLogMetrics::noop(),
+    );
+
+    let mut suite =
+      C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+    suite.setup().await?;
+
+    bootstrap_fifo(&mut suite, 10, None).await?;
+    push_ok(&mut suite, TEST_USER_1, CHANNEL, 1, b"one").await?;
+    push_ok(&mut suite, TEST_USER_1, CHANNEL, 2, b"two").await?;
+    push_ok(&mut suite, TEST_USER_1, CHANNEL, 3, b"three").await?;
+
+    let (first, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 10).await?;
+    assert_eq!(first, b"one");
+
+    suite.teardown().await?;
+    s2m_ln.shutdown().await?;
+    s2m_dispatcher.shutdown().await?;
+  }
+
+  // Second boot: re-auth and POP twice. The consumed "one" must NOT
+  // resurface; we must receive "two" and "three" in order.
+  {
+    let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+    let store = FileChannelStore::new(data_dir.clone()).await?;
+    let mlf = FileMessageLogFactory::new(
+      data_dir.clone(),
+      default_c2s_config().limits.max_payload_size,
+      MessageLogMetrics::noop(),
+    );
+
+    let mut suite =
+      C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+    suite.setup().await?;
+
+    suite.auth(TEST_USER_1, TEST_USER_1).await?;
+
+    let (second, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 20).await?;
+    assert_eq!(second, b"two", "restart must skip consumed entry; cursor advance was not durable");
+    let (third, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 21).await?;
+    assert_eq!(third, b"three");
+
+    // Queue is drained.
+    suite
+      .write_message(TEST_USER_1, Message::Pop(PopParameters { id: 22, channel: StringAtom::from(CHANNEL) }))
+      .await?;
+    match suite.read_message(TEST_USER_1).await? {
+      Message::Error(p) => assert_eq!(p.reason, StringAtom::from(ErrorReason::QueueEmpty)),
+      other => panic!("expected Error(QUEUE_EMPTY), got: {:?}", other),
+    }
+
+    suite.teardown().await?;
+    s2m_ln.shutdown().await?;
+    s2m_dispatcher.shutdown().await?;
+  }
+
+  Ok(())
+}
+
+/// POP forces a synchronous log flush when the entry is not yet durable.
+/// With a long `message_flush_interval` (60s), a PUSH followed by an
+/// immediate POP must complete well below the flush interval, proving that
+/// POP triggered the flush rather than waiting on the periodic flusher.
+#[compio::test]
+async fn test_pop_force_flushes_log_when_not_durable() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  // 60s flush interval: only a force-flush on POP will land the entry.
+  bootstrap_fifo(&mut suite, 10, Some(60_000)).await?;
+
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 1, b"durable-on-pop").await?;
+
+  let start = std::time::Instant::now();
+  let (payload, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 2).await?;
+  let elapsed = start.elapsed();
+
+  assert_eq!(payload, b"durable-on-pop");
+  assert!(
+    elapsed < std::time::Duration::from_secs(5),
+    "POP did not force-flush; took {:?} with a 60s flush interval",
+    elapsed
+  );
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// With the default `message_flush_interval=0`, PUSH is durable before
+/// PUSH_ACK is sent. Verify by PUSHing on the first boot and POPing on the
+/// second boot without any explicit flush between them.
+#[compio::test]
+async fn test_push_durable_with_zero_flush_interval() -> anyhow::Result<()> {
+  let tmp = tempfile::tempdir()?;
+  let data_dir = tmp.path().to_path_buf();
+
+  // First boot: PUSH only.
+  {
+    let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+    let store = FileChannelStore::new(data_dir.clone()).await?;
+    let mlf = FileMessageLogFactory::new(
+      data_dir.clone(),
+      default_c2s_config().limits.max_payload_size,
+      MessageLogMetrics::noop(),
+    );
+
+    let mut suite =
+      C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+    suite.setup().await?;
+
+    bootstrap_fifo(&mut suite, 10, Some(0)).await?;
+    push_ok(&mut suite, TEST_USER_1, CHANNEL, 1, b"pre-restart").await?;
+
+    suite.teardown().await?;
+    s2m_ln.shutdown().await?;
+    s2m_dispatcher.shutdown().await?;
+  }
+
+  // Second boot: POP must return the pre-restart payload.
+  {
+    let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+    let store = FileChannelStore::new(data_dir.clone()).await?;
+    let mlf = FileMessageLogFactory::new(
+      data_dir.clone(),
+      default_c2s_config().limits.max_payload_size,
+      MessageLogMetrics::noop(),
+    );
+
+    let mut suite =
+      C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+    suite.setup().await?;
+
+    suite.auth(TEST_USER_1, TEST_USER_1).await?;
+    let (payload, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 10).await?;
+    assert_eq!(payload, b"pre-restart");
+
+    suite.teardown().await?;
+    s2m_ln.shutdown().await?;
+    s2m_dispatcher.shutdown().await?;
+  }
+
   Ok(())
 }

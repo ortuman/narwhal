@@ -50,6 +50,8 @@ pub enum Message {
   Event(EventParameters),
   GetChannelAcl(GetChannelAclParameters),
   GetChannelConfiguration(GetChannelConfigurationParameters),
+  GetChannelLen(GetChannelLenParameters),
+  ChannelLen(ChannelLenParameters),
   History(HistoryParameters),
   HistoryAck(HistoryAckParameters),
   ChannelSeq(ChannelSeqParameters),
@@ -73,6 +75,10 @@ pub enum Message {
   ModDirectAck(ModDirectAckParameters),
   Ping(PingParameters),
   Pong(PongParameters),
+  Pop(PopParameters),
+  PopAck(PopAckParameters),
+  Push(PushParameters),
+  PushAck(PushAckParameters),
   S2mAuth(S2mAuthParameters),
   S2mAuthAck(S2mAuthAckParameters),
   S2mConnect(S2mConnectParameters),
@@ -269,6 +275,26 @@ pub struct HistoryAckParameters {
 
   #[param(validate = "non_empty")]
   pub history_id: StringAtom,
+
+  #[param(validate = "non_empty")]
+  pub channel: StringAtom,
+
+  pub count: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
+pub struct GetChannelLenParameters {
+  #[param(validate = "non_zero")]
+  pub id: u32,
+
+  #[param(validate = "non_empty")]
+  pub channel: StringAtom,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
+pub struct ChannelLenParameters {
+  #[param(validate = "non_zero")]
+  pub id: u32,
 
   #[param(validate = "non_empty")]
   pub channel: StringAtom,
@@ -495,6 +521,45 @@ pub struct PongParameters {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
+pub struct PopParameters {
+  #[param(validate = "non_zero")]
+  pub id: u32,
+
+  #[param(validate = "non_empty")]
+  pub channel: StringAtom,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
+pub struct PopAckParameters {
+  #[param(validate = "non_zero")]
+  pub id: u32,
+
+  #[param(validate = "non_zero")]
+  pub length: u32,
+
+  #[param(validate = "non_zero")]
+  pub timestamp: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
+pub struct PushParameters {
+  #[param(validate = "non_zero")]
+  pub id: u32,
+
+  #[param(validate = "non_empty")]
+  pub channel: StringAtom,
+
+  #[param(validate = "non_zero")]
+  pub length: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
+pub struct PushAckParameters {
+  #[param(validate = "non_zero")]
+  pub id: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
 pub struct S2mAuthParameters {
   #[param(validate = "non_zero")]
   pub id: u32,
@@ -679,6 +744,8 @@ impl Message {
       b"EVENT" => Ok(Message::Event(EventParameters::default())),
       b"GET_CHAN_ACL" => Ok(Message::GetChannelAcl(GetChannelAclParameters::default())),
       b"GET_CHAN_CONFIG" => Ok(Message::GetChannelConfiguration(GetChannelConfigurationParameters::default())),
+      b"GET_CHAN_LEN" => Ok(Message::GetChannelLen(GetChannelLenParameters::default())),
+      b"CHAN_LEN" => Ok(Message::ChannelLen(ChannelLenParameters::default())),
       b"HISTORY" => Ok(Message::History(HistoryParameters::default())),
       b"HISTORY_ACK" => Ok(Message::HistoryAck(HistoryAckParameters::default())),
       b"CHAN_SEQ" => Ok(Message::ChannelSeq(ChannelSeqParameters::default())),
@@ -702,6 +769,10 @@ impl Message {
       b"MOD_DIRECT_ACK" => Ok(Message::ModDirectAck(ModDirectAckParameters::default())),
       b"PING" => Ok(Message::Ping(PingParameters::default())),
       b"PONG" => Ok(Message::Pong(PongParameters::default())),
+      b"POP" => Ok(Message::Pop(PopParameters::default())),
+      b"POP_ACK" => Ok(Message::PopAck(PopAckParameters::default())),
+      b"PUSH" => Ok(Message::Push(PushParameters::default())),
+      b"PUSH_ACK" => Ok(Message::PushAck(PushAckParameters::default())),
       b"S2M_AUTH" => Ok(Message::S2mAuth(S2mAuthParameters::default())),
       b"S2M_AUTH_ACK" => Ok(Message::S2mAuthAck(S2mAuthAckParameters::default())),
       b"S2M_CONNECT" => Ok(Message::S2mConnect(S2mConnectParameters::default())),
@@ -742,6 +813,8 @@ impl Message {
       Message::Event { .. } => "EVENT",
       Message::GetChannelAcl { .. } => "GET_CHAN_ACL",
       Message::GetChannelConfiguration { .. } => "GET_CHAN_CONFIG",
+      Message::GetChannelLen { .. } => "GET_CHAN_LEN",
+      Message::ChannelLen { .. } => "CHAN_LEN",
       Message::History { .. } => "HISTORY",
       Message::HistoryAck { .. } => "HISTORY_ACK",
       Message::ChannelSeq { .. } => "CHAN_SEQ",
@@ -765,6 +838,10 @@ impl Message {
       Message::ModDirectAck { .. } => "MOD_DIRECT_ACK",
       Message::Ping { .. } => "PING",
       Message::Pong { .. } => "PONG",
+      Message::Pop { .. } => "POP",
+      Message::PopAck { .. } => "POP_ACK",
+      Message::Push { .. } => "PUSH",
+      Message::PushAck { .. } => "PUSH_ACK",
       Message::S2mAuth { .. } => "S2M_AUTH",
       Message::S2mAuthAck { .. } => "S2M_AUTH_ACK",
       Message::S2mConnect { .. } => "S2M_CONNECT",
@@ -802,6 +879,8 @@ impl Message {
       Event(params) => params.encode(parameter_writer),
       GetChannelAcl(params) => params.encode(parameter_writer),
       GetChannelConfiguration(params) => params.encode(parameter_writer),
+      GetChannelLen(params) => params.encode(parameter_writer),
+      ChannelLen(params) => params.encode(parameter_writer),
       History(params) => params.encode(parameter_writer),
       HistoryAck(params) => params.encode(parameter_writer),
       ChannelSeq(params) => params.encode(parameter_writer),
@@ -825,6 +904,10 @@ impl Message {
       ModDirectAck(params) => params.encode(parameter_writer),
       Ping(params) => params.encode(parameter_writer),
       Pong(params) => params.encode(parameter_writer),
+      Pop(params) => params.encode(parameter_writer),
+      PopAck(params) => params.encode(parameter_writer),
+      Push(params) => params.encode(parameter_writer),
+      PushAck(params) => params.encode(parameter_writer),
       S2mAuth(params) => params.encode(parameter_writer),
       S2mAuthAck(params) => params.encode(parameter_writer),
       S2mConnect(params) => params.encode(parameter_writer),
@@ -861,6 +944,8 @@ impl Message {
       Event(params) => params.decode(parameter_reader),
       GetChannelAcl(params) => params.decode(parameter_reader),
       GetChannelConfiguration(params) => params.decode(parameter_reader),
+      GetChannelLen(params) => params.decode(parameter_reader),
+      ChannelLen(params) => params.decode(parameter_reader),
       History(params) => params.decode(parameter_reader),
       HistoryAck(params) => params.decode(parameter_reader),
       ChannelSeq(params) => params.decode(parameter_reader),
@@ -884,6 +969,10 @@ impl Message {
       ModDirectAck(params) => params.decode(parameter_reader),
       Ping(params) => params.decode(parameter_reader),
       Pong(params) => params.decode(parameter_reader),
+      Pop(params) => params.decode(parameter_reader),
+      PopAck(params) => params.decode(parameter_reader),
+      Push(params) => params.decode(parameter_reader),
+      PushAck(params) => params.decode(parameter_reader),
       S2mAuth(params) => params.decode(parameter_reader),
       S2mAuthAck(params) => params.decode(parameter_reader),
       S2mConnect(params) => params.decode(parameter_reader),
@@ -954,6 +1043,8 @@ impl Message {
         Ok(())
       },
       GetChannelConfiguration(params) => params.validate(),
+      GetChannelLen(params) => params.validate(),
+      ChannelLen(params) => params.validate(),
       History(params) => params.validate(),
       HistoryAck(params) => params.validate(),
       ChannelSeq(params) => params.validate(),
@@ -977,6 +1068,10 @@ impl Message {
       ModDirectAck(params) => params.validate(),
       Ping(params) => params.validate(),
       Pong(params) => params.validate(),
+      Pop(params) => params.validate(),
+      PopAck(params) => params.validate(),
+      Push(params) => params.validate(),
+      PushAck(params) => params.validate(),
       S2mAuth(params) => params.validate(),
       S2mAuthAck(params) => params.validate(),
       S2mConnect(params) => params.validate(),
@@ -1020,6 +1115,8 @@ impl Message {
         None
       },
       Message(params) => Some(PayloadInfo { id: None, length: params.length as usize }),
+      Push(params) => Some(PayloadInfo { id: Some(params.id), length: params.length as usize }),
+      PopAck(params) => Some(PayloadInfo { id: Some(params.id), length: params.length as usize }),
       _ => None, // Other messages do not have an associated payload.
     }
   }
@@ -1036,6 +1133,8 @@ impl Message {
       Message::DeleteChannelAck(params) => Some(params.id),
       Message::GetChannelAcl(params) => Some(params.id),
       Message::GetChannelConfiguration(params) => Some(params.id),
+      Message::GetChannelLen(params) => Some(params.id),
+      Message::ChannelLen(params) => Some(params.id),
       Message::History(params) => Some(params.id),
       Message::HistoryAck(params) => Some(params.id),
       Message::ChannelSeq(params) => Some(params.id),
@@ -1053,6 +1152,10 @@ impl Message {
       Message::ModDirectAck(params) => Some(params.id),
       Message::Ping(params) => Some(params.id),
       Message::Pong(params) => Some(params.id),
+      Message::Pop(params) => Some(params.id),
+      Message::PopAck(params) => Some(params.id),
+      Message::Push(params) => Some(params.id),
+      Message::PushAck(params) => Some(params.id),
       Message::SetChannelAcl(params) => Some(params.id),
       Message::SetChannelAclAck(params) => Some(params.id),
       Message::SetChannelConfiguration(params) => Some(params.id),
@@ -1111,6 +1214,48 @@ mod tests {
       r#type: None,
       ..Default::default()
     });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn push_round_trip() {
+    let original = Message::Push(PushParameters { id: 7, channel: "!c@localhost".into(), length: 12 });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn push_ack_round_trip() {
+    let original = Message::PushAck(PushAckParameters { id: 7 });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn pop_round_trip() {
+    let original = Message::Pop(PopParameters { id: 8, channel: "!c@localhost".into() });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn pop_ack_round_trip() {
+    let original = Message::PopAck(PopAckParameters { id: 8, length: 12, timestamp: 1_700_000_000_000 });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn get_channel_len_round_trip() {
+    let original = Message::GetChannelLen(GetChannelLenParameters { id: 9, channel: "!c@localhost".into() });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn channel_len_round_trip() {
+    let original = Message::ChannelLen(ChannelLenParameters { id: 9, channel: "!c@localhost".into(), count: 42 });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn channel_len_zero_count_round_trip() {
+    let original = Message::ChannelLen(ChannelLenParameters { id: 9, channel: "!c@localhost".into(), count: 0 });
     assert_eq!(roundtrip(original.clone()), original);
   }
 
