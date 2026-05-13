@@ -1952,8 +1952,8 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     // counter must stay put: otherwise the next successful PUSH leaves a gap
     // in the log between the previous tail and the new tail, and POP would
     // read past the gap and double-deliver the later entry (cursor advances
-    // by one, but `read(from_seq=N, 1, ...)` returns the entry at the next
-    // seq >= N, not strictly at N).
+    // by one, but `MessageLog::read(from_seq, limit, visitor)` returns the
+    // first entry with `seq >= from_seq`, not strictly at `from_seq`).
     let seq = channel.seq;
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
     let msg = Message::Message(MessageParameters {
@@ -2058,14 +2058,15 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       (cursor_next_seq, entry)
     };
 
-    // `MessageLog::read(from_seq, ...)` returns the first entry with
-    // `seq >= from_seq`, NOT strictly at `from_seq`. If the log has a gap at
-    // the cursor (e.g. a prior failed append left `channel.seq` ahead of the
-    // log tail before that path was fixed, or external corruption), the read
-    // would silently return a later entry. Advancing the cursor by one in
-    // that case would re-read the same later entry on the next POP, causing
-    // duplicate delivery. Refuse to advance and bubble up an internal error
-    // instead; an operator-driven path (DELETE / CLEAR in PR 3) can heal it.
+    // `MessageLog::read(from_seq, limit, visitor)` returns the first entry
+    // with `seq >= from_seq`, NOT strictly at `from_seq`. If the log has a
+    // gap at the cursor (e.g. a prior failed append left `channel.seq` ahead
+    // of the log tail before that path was fixed, or external corruption),
+    // the read would silently return a later entry. Advancing the cursor by
+    // one in that case would re-read the same later entry on the next POP,
+    // causing duplicate delivery. Refuse to advance and bubble up an
+    // internal error instead; an operator-driven path (DELETE / CLEAR in
+    // PR 3) can heal it.
     if captured.seq != cursor_next_seq {
       let entry_seq = captured.seq;
       tracing::error!(
