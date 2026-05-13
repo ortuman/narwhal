@@ -501,6 +501,30 @@ impl C2sClient {
     }
   }
 
+  /// Discards every element currently queued on a FIFO channel without
+  /// destroying it. Owner-only, idempotent, and the recovery path out of a
+  /// `CURSOR_RECOVERY_REQUIRED` state.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if the channel is not FIFO, the caller is not a
+  /// member, or the caller is not the owner.
+  pub async fn clear(&self, channel: StringAtom) -> crate::Result<()> {
+    use narwhal_protocol::ClearParameters;
+
+    let id = self.client.next_id().await;
+    let message = Message::Clear(ClearParameters { id, channel });
+
+    let handle = self.client.send_message(message, None).await?;
+    let (response, _) = handle.response().await?;
+
+    match response {
+      Message::ClearAck(_) => Ok(()),
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to clear request").into()),
+    }
+  }
+
   /// Shuts down the client and closes all connections.
   ///
   /// This method gracefully shuts down the client, signalling cancellation to

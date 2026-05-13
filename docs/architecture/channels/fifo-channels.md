@@ -1,6 +1,6 @@
 # FIFO Channels: Architecture Specification
 
-> **Status:** Partially implemented (PUSH / POP / GET_CHAN_LEN; CLEAR pending PR 3).
+> **Status:** Implemented.
 > **Related design:** [Message Log](./message-log.md), [Channel Store](./channel-store.md)
 
 ## Table of Contents

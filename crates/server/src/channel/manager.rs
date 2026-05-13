@@ -18,7 +18,7 @@ use narwhal_protocol::ErrorReason::{
 };
 use narwhal_protocol::{
   AclAction, AclType, BroadcastAckParameters, ChannelAclParameters, ChannelConfigurationParameters,
-  ChannelLenParameters, ChannelSeqAckParameters, DeleteChannelAckParameters, HistoryAckParameters,
+  ChannelLenParameters, ChannelSeqAckParameters, ClearAckParameters, DeleteChannelAckParameters, HistoryAckParameters,
   JoinChannelAckParameters, LeaveChannelAckParameters, ListChannelsAckParameters, ListMembersAckParameters, Message,
   MessageParameters, PopAckParameters, PushAckParameters, QoS, SetChannelAclAckParameters,
   SetChannelConfigurationAckParameters,
@@ -99,6 +99,7 @@ struct ChannelManagerMetrics {
   message_log_deletes: Family<ResultLabel, Counter>,
   fifo_pushes: Family<ResultLabel, Counter>,
   fifo_pops: Family<ResultLabel, Counter>,
+  fifo_clears: Family<ResultLabel, Counter>,
   fifo_cursor_fsync_seconds: Histogram,
 }
 
@@ -171,6 +172,8 @@ impl ChannelManagerMetrics {
     registry.register("fifo_pushes", "FIFO PUSH outcomes", fifo_pushes.clone());
     let fifo_pops = Family::default();
     registry.register("fifo_pops", "FIFO POP outcomes", fifo_pops.clone());
+    let fifo_clears = Family::default();
+    registry.register("fifo_clears", "FIFO CLEAR outcomes", fifo_clears.clone());
     let fifo_cursor_fsync_seconds =
       Histogram::new(prometheus_client::metrics::histogram::exponential_buckets(0.0001, 2.0, 16));
     registry.register(
@@ -197,6 +200,7 @@ impl ChannelManagerMetrics {
       message_log_deletes,
       fifo_pushes,
       fifo_pops,
+      fifo_clears,
       fifo_cursor_fsync_seconds,
     }
   }
@@ -373,6 +377,13 @@ enum Command {
     reply_tx: Sender<anyhow::Result<()>>,
   },
   GetChannelLen {
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+    reply_tx: Sender<anyhow::Result<()>>,
+  },
+  Clear {
     channel_id: ChannelId,
     nid: Nid,
     transmitter: Arc<dyn Transmitter>,
@@ -789,6 +800,10 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       },
       Command::GetChannelLen { channel_id, nid, transmitter, correlation_id, reply_tx } => {
         let result = self.get_channel_len(channel_id, nid, transmitter, correlation_id);
+        let _ = reply_tx.send(result).await;
+      },
+      Command::Clear { channel_id, nid, transmitter, correlation_id, reply_tx } => {
+        let result = self.clear(channel_id, nid, transmitter, correlation_id).await;
         let _ = reply_tx.send(result).await;
       },
     }
@@ -2167,6 +2182,92 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     Ok(())
   }
 
+  /// CLEAR handler. Owner-only, idempotent, and the recovery path out of
+  /// `NeedsRecovery`. Discards every queued element by flushing the log and
+  /// writing a fresh `cursor.bin` whose `next_seq = log.last_seq() + 1`.
+  /// Membership, ACLs, configuration, and seq monotonicity are preserved
+  /// (no reset to 1). Exempt from `CURSOR_RECOVERY_REQUIRED` since this is
+  /// the operator-less heal for that state.
+  async fn clear(
+    &mut self,
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+  ) -> anyhow::Result<()> {
+    if channel_id.domain != self.local_domain {
+      self.metrics.fifo_clears.get_or_create(&FIFO_NOT_IMPLEMENTED).inc();
+      return Err(narwhal_protocol::Error::new(NotImplemented).with_id(correlation_id).into());
+    }
+
+    let Some(channel) = self.channels.get_mut(&channel_id.handler) else {
+      self.metrics.fifo_clears.get_or_create(&FIFO_CHANNEL_NOT_FOUND).inc();
+      return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
+    };
+
+    if matches!(&channel.kind, ChannelKind::PubSub) {
+      self.metrics.fifo_clears.get_or_create(&FIFO_WRONG_TYPE).inc();
+      return Err(narwhal_protocol::Error::new(WrongType).with_id(correlation_id).into());
+    }
+
+    if !channel.is_member(&nid) {
+      self.metrics.fifo_clears.get_or_create(&FIFO_USER_NOT_IN_CHANNEL).inc();
+      return Err(narwhal_protocol::Error::new(UserNotInChannel).with_id(correlation_id).into());
+    }
+
+    if !channel.is_owner(&nid) {
+      self.metrics.fifo_clears.get_or_create(&FIFO_FORBIDDEN).inc();
+      return Err(narwhal_protocol::Error::new(Forbidden).with_id(correlation_id).into());
+    }
+
+    // Step 1: synchronously flush + fsync the log so `log.last_seq()` is
+    // anchored on disk. The cursor we are about to write must point past
+    // a durable tail; otherwise a crash between cursor.bin fsync and the
+    // next log flush would leave `cursor.next_seq > log.last_seq() + 1`,
+    // which the recovery model treats as corruption.
+    let start = Instant::now();
+    let result = channel.message_log.flush().await;
+    self.metrics.record_flush(start, &result);
+    result?;
+
+    // Step 2: atomic-write `cursor.bin` with the new head. Uses the same
+    // crash-safe path as the type-transition write (tmp -> fsync -> rename
+    // -> fsync parent).
+    let new_next_seq = channel.message_log.last_seq().saturating_add(1);
+    let Some(channel_dir) = self.message_log_factory.channel_dir(&channel_id.handler) else {
+      // FIFO requires a persistent message log factory; the absence of a
+      // channel_dir is a configuration error.
+      return Err(narwhal_protocol::Error::new(InternalServerError).with_id(correlation_id).into());
+    };
+    let start = Instant::now();
+    let new_cursor = FifoCursor::write_initial(channel_dir, new_next_seq).await;
+    self.metrics.fifo_cursor_fsync_seconds.observe(start.elapsed().as_secs_f64());
+    let new_cursor = new_cursor?;
+
+    // Step 3: install the fresh cursor and align channel.seq. `NeedsRecovery`
+    // transitions back to `Healthy` here; an already-`Healthy` channel
+    // replaces its in-memory cursor handle with the freshly written one.
+    channel.kind = ChannelKind::Fifo(FifoState::Healthy(new_cursor));
+    channel.seq = new_next_seq;
+
+    // Step 4: ACK. The client can now resume PUSH/POP on the cleared queue.
+    transmitter.send_message(Message::ClearAck(ClearAckParameters { id: correlation_id }));
+    self.metrics.fifo_clears.get_or_create(&SUCCESS).inc();
+
+    // Step 5: best-effort lazy head-eviction. The cursor now sits past every
+    // sealed segment, so head-eviction can reclaim them all (the tail-segment
+    // retention invariant keeps the active segment around so `log.last_seq()`
+    // stays recoverable). Failures must not propagate: CLEAR already
+    // committed (cursor durable, ACK sent).
+    let log = channel.message_log.clone();
+    let handler = channel_id.handler.clone();
+    if let Err(e) = log.evict_below(new_next_seq).await {
+      warn!(channel = %handler, error = %e, "FIFO head-eviction after CLEAR failed (best-effort)");
+    }
+
+    Ok(())
+  }
+
   /// Best-effort cleanup of persistent storage for a channel (message log + store record).
   /// Errors are logged but never propagated. Callers must not depend on storage cleanup
   /// succeeding for in-memory consistency.
@@ -2912,6 +3013,27 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelManager<CS, MLF> {
     self.mailboxes[shard]
       .send(Command::GetChannelLen { channel_id, nid, transmitter, correlation_id, reply_tx })
       .await?;
+
+    reply_rx.recv().await?
+  }
+
+  /// CLEAR a FIFO channel. Owner-only, idempotent. Discards every queued
+  /// element without destroying the channel, preserving membership, ACLs,
+  /// configuration, and seq monotonicity. Also the recovery path for a
+  /// channel in `NeedsRecovery` state (exempt from `CURSOR_RECOVERY_REQUIRED`).
+  pub async fn clear(
+    &self,
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+  ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
+    let shard = shard_for(&channel_id.handler, self.mailboxes.len());
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+
+    self.mailboxes[shard].send(Command::Clear { channel_id, nid, transmitter, correlation_id, reply_tx }).await?;
 
     reply_rx.recv().await?
   }

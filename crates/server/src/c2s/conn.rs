@@ -562,6 +562,9 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
       Message::GetChannelLen { .. } => {
         self.dispatch_get_channel_len_message(msg).await?;
       },
+      Message::Clear { .. } => {
+        self.dispatch_clear_message(msg).await?;
+      },
       _ => {
         return Err(narwhal_protocol::Error::new(UnexpectedMessage).into());
       },
@@ -1280,6 +1283,27 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
       nid = nid.to_string(),
       channel = channel_id.to_string(),
       "channel len requested"
+    );
+
+    Ok(())
+  }
+
+  async fn dispatch_clear_message(&mut self, msg: Message) -> anyhow::Result<()> {
+    let Message::Clear(params) = msg else { unreachable!() };
+
+    let correlation_id = params.id;
+    let channel_id = Self::parse_channel_id(&params.channel)?;
+
+    let nid = self.nid.as_ref().unwrap().clone();
+    let transmitter = self.transmitter.clone();
+
+    self.channel_manager.clear(channel_id.clone(), nid.clone(), transmitter, correlation_id).await?;
+
+    trace!(
+      handler = self.transmitter.handler,
+      nid = nid.to_string(),
+      channel = channel_id.to_string(),
+      "fifo channel cleared"
     );
 
     Ok(())
