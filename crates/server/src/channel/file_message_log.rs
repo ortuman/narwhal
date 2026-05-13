@@ -919,7 +919,17 @@ impl Inner {
   }
 
   async fn roll_segment(&mut self, next_seq: u64) -> anyhow::Result<()> {
-    // Close the log file handle.
+    // Sync the active log to disk BEFORE dropping the handle. Otherwise any
+    // appends since the last `flush()` (including the entry that triggered the
+    // roll) sit in the page cache while we seal the segment, and the
+    // subsequent `flush()` only fsyncs the *new* active segment. That would
+    // let `cached_durable_seq` advance past entries that have not actually
+    // reached disk, breaking the durability claim made by `PUSH_ACK` /
+    // `BROADCAST_ACK` and the `cursor.next_seq <= log.last_seq() + 1`
+    // invariant FIFO recovery relies on.
+    if let Some(ref log_file) = self.active_log {
+      log_file.sync_all().await?;
+    }
     self.active_log = None;
 
     // Sync the active index file, drop the writable mapping, truncate the file

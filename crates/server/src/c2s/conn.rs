@@ -553,6 +553,15 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
       Message::ChannelSeq { .. } => {
         self.dispatch_channel_seq_message(msg).await?;
       },
+      Message::Push { .. } => {
+        self.dispatch_push_message(msg, payload.unwrap()).await?;
+      },
+      Message::Pop { .. } => {
+        self.dispatch_pop_message(msg).await?;
+      },
+      Message::GetChannelLen { .. } => {
+        self.dispatch_get_channel_len_message(msg).await?;
+      },
       _ => {
         return Err(narwhal_protocol::Error::new(UnexpectedMessage).into());
       },
@@ -1211,6 +1220,66 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sDispatcherInner<CS, MLF> {
       nid = nid.to_string(),
       channel = channel_id.to_string(),
       "channel seq requested"
+    );
+
+    Ok(())
+  }
+
+  async fn dispatch_push_message(&mut self, msg: Message, payload: PoolBuffer) -> anyhow::Result<()> {
+    let Message::Push(params) = msg else { unreachable!() };
+
+    let correlation_id = params.id;
+    let channel_id = Self::parse_channel_id(&params.channel)?;
+
+    let nid = self.nid.as_ref().unwrap().clone();
+    let transmitter = self.transmitter.clone();
+
+    let payload_length = payload.as_slice().len() as u32;
+    self.channel_manager.push_payload(payload, channel_id.clone(), nid.clone(), transmitter, correlation_id).await?;
+
+    trace!(
+      handler = self.transmitter.handler,
+      nid = nid.to_string(),
+      channel = channel_id.to_string(),
+      content_length = payload_length,
+      "pushed payload"
+    );
+
+    Ok(())
+  }
+
+  async fn dispatch_pop_message(&mut self, msg: Message) -> anyhow::Result<()> {
+    let Message::Pop(params) = msg else { unreachable!() };
+
+    let correlation_id = params.id;
+    let channel_id = Self::parse_channel_id(&params.channel)?;
+
+    let nid = self.nid.as_ref().unwrap().clone();
+    let transmitter = self.transmitter.clone();
+
+    self.channel_manager.pop_payload(channel_id.clone(), nid.clone(), transmitter, correlation_id).await?;
+
+    trace!(handler = self.transmitter.handler, nid = nid.to_string(), channel = channel_id.to_string(), "popped");
+
+    Ok(())
+  }
+
+  async fn dispatch_get_channel_len_message(&mut self, msg: Message) -> anyhow::Result<()> {
+    let Message::GetChannelLen(params) = msg else { unreachable!() };
+
+    let correlation_id = params.id;
+    let channel_id = Self::parse_channel_id(&params.channel)?;
+
+    let nid = self.nid.as_ref().unwrap().clone();
+    let transmitter = self.transmitter.clone();
+
+    self.channel_manager.get_channel_len(channel_id.clone(), nid.clone(), transmitter, correlation_id).await?;
+
+    trace!(
+      handler = self.transmitter.handler,
+      nid = nid.to_string(),
+      channel = channel_id.to_string(),
+      "channel len requested"
     );
 
     Ok(())

@@ -31,6 +31,12 @@
   - [BROADCAST](#broadcast)
   - [BROADCAST_ACK](#broadcast_ack)
   - [MESSAGE](#message)
+  - [PUSH](#push)
+  - [PUSH_ACK](#push_ack)
+  - [POP](#pop)
+  - [POP_ACK](#pop_ack)
+  - [GET_CHAN_LEN](#get_chan_len)
+  - [CHAN_LEN](#chan_len)
   - [MOD_DIRECT](#mod_direct)
   - [MOD_DIRECT_ACK](#mod_direct_ack)
   - [CHANNELS](#channels)
@@ -626,6 +632,134 @@ MESSAGE channel=!42@example.com from=bob@example.com length=512 seq=42 timestamp
 ```
 MESSAGE channel=!42@example.com from=bob@example.com history_id=h1 length=512 seq=42 timestamp=1740643200000
 [512 bytes of binary payload follow]
+```
+
+---
+
+### PUSH
+
+Appends an element to a `fifo` channel's queue. Owner-only. This message includes a payload.
+
+**Direction**: Client → Server
+
+**Parameters**:
+- `id` (u32, required): Request identifier (must be non-zero)
+- `channel` (string, required): Target channel ID (must be non-empty)
+- `length` (u32, required): Payload size in bytes (must be non-zero)
+
+**Example**:
+```
+PUSH id=7 channel=!queue@example.com length=128
+[128 bytes of binary payload follow]
+```
+
+**Notes**:
+- Only valid on `fifo` channels. Returns `WRONG_TYPE` on a `pubsub` channel.
+- Caller must be the channel owner; non-owner members receive `FORBIDDEN`.
+- Returns `QUEUE_FULL` if the logical queue depth (the cursor-to-tail span, not the physical entry count) is at `max_persist_messages`.
+- Returns `POLICY_VIOLATION` if the payload exceeds `max_payload_size`.
+- Returns `CURSOR_RECOVERY_REQUIRED` if the channel's head cursor failed recovery; see [fifo-channels.md](architecture/channels/fifo-channels.md#head-cursor).
+
+---
+
+### PUSH_ACK
+
+Acknowledges a successful PUSH. No sequence number is exposed on the wire (FIFO ordering is internal to the channel actor).
+
+**Direction**: Server → Client
+
+**Parameters**:
+- `id` (u32, required): Request identifier matching the PUSH message (must be non-zero)
+
+**Example**:
+```
+PUSH_ACK id=7
+```
+
+---
+
+### POP
+
+Atomically removes and returns the head element of a `fifo` channel's queue. Single-element only; no batching. Members subject to the channel's read ACL.
+
+**Direction**: Client → Server
+
+**Parameters**:
+- `id` (u32, required): Request identifier (must be non-zero)
+- `channel` (string, required): Target channel ID (must be non-empty)
+
+**Example**:
+```
+POP id=8 channel=!queue@example.com
+```
+
+**Notes**:
+- Only valid on `fifo` channels. Returns `WRONG_TYPE` on a `pubsub` channel.
+- Caller must be a JOINed member (`USER_NOT_IN_CHANNEL` otherwise) and must satisfy the channel's read ACL (`NOT_ALLOWED` otherwise).
+- Returns `QUEUE_EMPTY` if the head cursor is at the log tail.
+- Returns `CURSOR_RECOVERY_REQUIRED` if the channel's head cursor failed recovery.
+- Each successful POP advances and fsyncs the head cursor before the `POP_ACK` is written to the socket. Delivery is at-most-once: a crash between the cursor fsync and the socket write loses the element on the consumer side, but no element is ever returned by two `POP_ACK`s.
+
+---
+
+### POP_ACK
+
+Returns the head element of a `fifo` channel's queue. This message includes a payload.
+
+**Direction**: Server → Client
+
+**Parameters**:
+- `id` (u32, required): Request identifier matching the POP message (must be non-zero)
+- `length` (u32, required): Payload size in bytes (must be non-zero)
+- `timestamp` (u64, required): UTC timestamp in milliseconds at which the element was originally PUSHed (must be non-zero). Lets the consumer reason about queue-induced latency.
+
+**Example**:
+```
+POP_ACK id=8 length=128 timestamp=1740643200000
+[128 bytes of binary payload follow]
+```
+
+**Notes**:
+- `POP_ACK` carries no `from` (always the channel owner; redundant) and no `seq` (FIFO does not expose log positions on the wire).
+
+---
+
+### GET_CHAN_LEN
+
+Queries the logical queue depth of a `fifo` channel. Owner-only.
+
+**Direction**: Client → Server
+
+**Parameters**:
+- `id` (u32, required): Request identifier (must be non-zero)
+- `channel` (string, required): Target channel ID (must be non-empty)
+
+**Example**:
+```
+GET_CHAN_LEN id=9 channel=!queue@example.com
+```
+
+**Notes**:
+- Only valid on `fifo` channels. Returns `WRONG_TYPE` on a `pubsub` channel.
+- Caller must be the channel owner; non-owner members receive `FORBIDDEN`.
+- Returns `CURSOR_RECOVERY_REQUIRED` if the channel's head cursor failed recovery.
+
+---
+
+### CHAN_LEN
+
+Returns the logical queue depth of a `fifo` channel.
+
+**Direction**: Server → Client
+
+**Parameters**:
+- `id` (u32, required): Request identifier matching the GET_CHAN_LEN message (must be non-zero)
+- `channel` (string, required): Target channel ID (must be non-empty)
+- `count` (u32, required): Number of elements currently between the head cursor and the log tail. May be 0 for an empty queue. The field is named `count`, not `length`, because by protocol convention `length` denotes a payload byte count and `CHAN_LEN` carries no payload.
+
+**Example**:
+```
+CHAN_LEN id=9 channel=!queue@example.com count=42
 ```
 
 ---

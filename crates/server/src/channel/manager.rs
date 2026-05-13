@@ -12,15 +12,16 @@ use async_trait::async_trait;
 
 use narwhal_common::core_dispatcher::CoreDispatcher;
 use narwhal_protocol::ErrorReason::{
-  BadRequest, ChannelIsFull, ChannelNotFound, Forbidden, InternalServerError, NotAllowed, NotImplemented,
-  PersistenceNotEnabled, PolicyViolation, ResourceLimitReached, UserInChannel, UserNotInChannel, UserNotRegistered,
-  WrongType,
+  BadRequest, ChannelIsFull, ChannelNotFound, CursorRecoveryRequired, Forbidden, InternalServerError, NotAllowed,
+  NotImplemented, PersistenceNotEnabled, PolicyViolation, QueueEmpty, QueueFull, ResourceLimitReached, UserInChannel,
+  UserNotInChannel, UserNotRegistered, WrongType,
 };
 use narwhal_protocol::{
   AclAction, AclType, BroadcastAckParameters, ChannelAclParameters, ChannelConfigurationParameters,
-  ChannelSeqAckParameters, DeleteChannelAckParameters, HistoryAckParameters, JoinChannelAckParameters,
-  LeaveChannelAckParameters, ListChannelsAckParameters, ListMembersAckParameters, Message, MessageParameters, QoS,
-  SetChannelAclAckParameters, SetChannelConfigurationAckParameters,
+  ChannelLenParameters, ChannelSeqAckParameters, DeleteChannelAckParameters, HistoryAckParameters,
+  JoinChannelAckParameters, LeaveChannelAckParameters, ListChannelsAckParameters, ListMembersAckParameters, Message,
+  MessageParameters, PopAckParameters, PushAckParameters, QoS, SetChannelAclAckParameters,
+  SetChannelConfigurationAckParameters,
 };
 use narwhal_protocol::{ChannelId, Nid};
 use narwhal_protocol::{Event, EventKind};
@@ -67,6 +68,17 @@ struct ResultLabel {
 const SUCCESS: ResultLabel = ResultLabel { result: "success" };
 const FAILURE: ResultLabel = ResultLabel { result: "failure" };
 
+const FIFO_CHANNEL_NOT_FOUND: ResultLabel = ResultLabel { result: "channel_not_found" };
+const FIFO_USER_NOT_IN_CHANNEL: ResultLabel = ResultLabel { result: "user_not_in_channel" };
+const FIFO_FORBIDDEN: ResultLabel = ResultLabel { result: "forbidden" };
+const FIFO_NOT_ALLOWED: ResultLabel = ResultLabel { result: "not_allowed" };
+const FIFO_WRONG_TYPE: ResultLabel = ResultLabel { result: "wrong_type" };
+const FIFO_QUEUE_EMPTY: ResultLabel = ResultLabel { result: "queue_empty" };
+const FIFO_QUEUE_FULL: ResultLabel = ResultLabel { result: "queue_full" };
+const FIFO_POLICY_VIOLATION: ResultLabel = ResultLabel { result: "policy_violation" };
+const FIFO_CURSOR_RECOVERY: ResultLabel = ResultLabel { result: "cursor_recovery_required" };
+const FIFO_NOT_IMPLEMENTED: ResultLabel = ResultLabel { result: "not_implemented" };
+
 /// Metric handles for `ChannelManager`.
 #[derive(Clone)]
 struct ChannelManagerMetrics {
@@ -85,6 +97,9 @@ struct ChannelManagerMetrics {
   message_log_read_duration_seconds: Histogram,
   message_log_entries_returned: Histogram,
   message_log_deletes: Family<ResultLabel, Counter>,
+  fifo_pushes: Family<ResultLabel, Counter>,
+  fifo_pops: Family<ResultLabel, Counter>,
+  fifo_cursor_fsync_seconds: Histogram,
 }
 
 impl std::fmt::Debug for ChannelManagerMetrics {
@@ -152,6 +167,18 @@ impl ChannelManagerMetrics {
     let message_log_deletes = Family::default();
     registry.register("message_log_deletes", "Message log delete operations", message_log_deletes.clone());
 
+    let fifo_pushes = Family::default();
+    registry.register("fifo_pushes", "FIFO PUSH outcomes", fifo_pushes.clone());
+    let fifo_pops = Family::default();
+    registry.register("fifo_pops", "FIFO POP outcomes", fifo_pops.clone());
+    let fifo_cursor_fsync_seconds =
+      Histogram::new(prometheus_client::metrics::histogram::exponential_buckets(0.0001, 2.0, 16));
+    registry.register(
+      "fifo_cursor_fsync_seconds",
+      "Duration of FIFO head-cursor fsync operations in seconds",
+      fifo_cursor_fsync_seconds.clone(),
+    );
+
     Self {
       channels_active,
       channel_joins,
@@ -168,6 +195,9 @@ impl ChannelManagerMetrics {
       message_log_read_duration_seconds,
       message_log_entries_returned,
       message_log_deletes,
+      fifo_pushes,
+      fifo_pops,
+      fifo_cursor_fsync_seconds,
     }
   }
 
@@ -325,6 +355,28 @@ enum Command {
   /// `FileMessageLog::inner` (which uses `RefCell` under the single-threaded actor invariant).
   FlushChannel {
     handler: StringAtom,
+    reply_tx: Sender<anyhow::Result<()>>,
+  },
+  Push {
+    payload: PoolBuffer,
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+    reply_tx: Sender<anyhow::Result<()>>,
+  },
+  Pop {
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+    reply_tx: Sender<anyhow::Result<()>>,
+  },
+  GetChannelLen {
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
     reply_tx: Sender<anyhow::Result<()>>,
   },
 }
@@ -725,6 +777,18 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       },
       Command::FlushChannel { handler, reply_tx } => {
         let result = self.flush_channel(handler).await;
+        let _ = reply_tx.send(result).await;
+      },
+      Command::Push { payload, channel_id, nid, transmitter, correlation_id, reply_tx } => {
+        let result = self.push_payload(payload, channel_id, nid, transmitter, correlation_id).await;
+        let _ = reply_tx.send(result).await;
+      },
+      Command::Pop { channel_id, nid, transmitter, correlation_id, reply_tx } => {
+        let result = self.pop_payload(channel_id, nid, transmitter, correlation_id).await;
+        let _ = reply_tx.send(result).await;
+      },
+      Command::GetChannelLen { channel_id, nid, transmitter, correlation_id, reply_tx } => {
+        let result = self.get_channel_len(channel_id, nid, transmitter, correlation_id);
         let _ = reply_tx.send(result).await;
       },
     }
@@ -1810,6 +1874,299 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     Ok(())
   }
 
+  /// PUSH handler for FIFO channels. Owner-only append. Returns:
+  /// `CHANNEL_NOT_FOUND`, `USER_NOT_IN_CHANNEL`, `FORBIDDEN`, `WRONG_TYPE`,
+  /// `CURSOR_RECOVERY_REQUIRED`, `POLICY_VIOLATION`, or `QUEUE_FULL`.
+  async fn push_payload(
+    &mut self,
+    payload: PoolBuffer,
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+  ) -> anyhow::Result<()> {
+    if channel_id.domain != self.local_domain {
+      self.metrics.fifo_pushes.get_or_create(&FIFO_NOT_IMPLEMENTED).inc();
+      return Err(narwhal_protocol::Error::new(NotImplemented).with_id(correlation_id).into());
+    }
+
+    let Some(channel) = self.channels.get_mut(&channel_id.handler) else {
+      self.metrics.fifo_pushes.get_or_create(&FIFO_CHANNEL_NOT_FOUND).inc();
+      return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
+    };
+
+    match &channel.kind {
+      ChannelKind::PubSub => {
+        self.metrics.fifo_pushes.get_or_create(&FIFO_WRONG_TYPE).inc();
+        return Err(narwhal_protocol::Error::new(WrongType).with_id(correlation_id).into());
+      },
+      ChannelKind::Fifo(FifoState::NeedsRecovery) => {
+        self.metrics.fifo_pushes.get_or_create(&FIFO_CURSOR_RECOVERY).inc();
+        return Err(narwhal_protocol::Error::new(CursorRecoveryRequired).with_id(correlation_id).into());
+      },
+      ChannelKind::Fifo(FifoState::Healthy(_)) => {},
+    }
+
+    if !channel.is_member(&nid) {
+      self.metrics.fifo_pushes.get_or_create(&FIFO_USER_NOT_IN_CHANNEL).inc();
+      return Err(narwhal_protocol::Error::new(UserNotInChannel).with_id(correlation_id).into());
+    }
+
+    if !channel.is_owner(&nid) {
+      self.metrics.fifo_pushes.get_or_create(&FIFO_FORBIDDEN).inc();
+      return Err(narwhal_protocol::Error::new(Forbidden).with_id(correlation_id).into());
+    }
+
+    let max_payload_size = channel.config.max_payload_size.unwrap_or(0);
+    // FIFO transition validation guarantees `max_persist_messages > 0`. Coerce
+    // 0 to the server limit defensively (matches the broadcast path).
+    let max_persist_messages = match channel.config.max_persist_messages.unwrap_or(0) {
+      0 => self.limits.max_persist_messages,
+      v => v,
+    };
+    let payload_length = payload.as_slice().len() as u32;
+
+    if payload_length > max_payload_size {
+      self.metrics.fifo_pushes.get_or_create(&FIFO_POLICY_VIOLATION).inc();
+      return Err(
+        narwhal_protocol::Error::new(PolicyViolation)
+          .with_id(correlation_id)
+          .with_detail("payload size exceeds channel limit")
+          .into(),
+      );
+    }
+
+    // Logical queue depth using the healthy cursor and the log's last_seq.
+    let cursor_next_seq = match &channel.kind {
+      ChannelKind::Fifo(FifoState::Healthy(c)) => c.next_seq(),
+      _ => unreachable!("kind already validated as Fifo(Healthy)"),
+    };
+    let log_last_seq = channel.message_log.last_seq();
+    let depth = if cursor_next_seq > log_last_seq { 0 } else { log_last_seq - cursor_next_seq + 1 };
+    if depth >= max_persist_messages as u64 {
+      self.metrics.fifo_pushes.get_or_create(&FIFO_QUEUE_FULL).inc();
+      return Err(narwhal_protocol::Error::new(QueueFull).with_id(correlation_id).into());
+    }
+
+    // Peek the next seq WITHOUT bumping the counter. If append fails the
+    // counter must stay put: otherwise the next successful PUSH leaves a gap
+    // in the log between the previous tail and the new tail, and POP would
+    // read past the gap and double-deliver the later entry (cursor advances
+    // by one, but `MessageLog::read(from_seq, limit, visitor)` returns the
+    // first entry with `seq >= from_seq`, not strictly at `from_seq`).
+    let seq = channel.seq;
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let msg = Message::Message(MessageParameters {
+      from: (&nid).into(),
+      channel: (&channel_id).into(),
+      length: payload_length,
+      seq,
+      timestamp,
+      history_id: None,
+    });
+
+    // FIFO mode disables tail-eviction inside the log; pass 0 to make the
+    // intent explicit (no `max_messages`-driven eviction on PUSH).
+    channel.message_log.append(&msg, &payload, 0).await?;
+    // Append committed: claim the seq by bumping the channel counter.
+    channel.seq = seq + 1;
+
+    let flush_interval = channel.config.message_flush_interval.unwrap_or(0);
+    if flush_interval == 0 {
+      let start = Instant::now();
+      let result = channel.message_log.flush().await;
+      self.metrics.record_flush(start, &result);
+      result?;
+    } else {
+      channel.ensure_flush_task(flush_interval, self.mailbox_tx.clone());
+    }
+
+    transmitter.send_message(Message::PushAck(PushAckParameters { id: correlation_id }));
+    self.metrics.fifo_pushes.get_or_create(&SUCCESS).inc();
+    Ok(())
+  }
+
+  /// POP handler for FIFO channels. Reads the entry at the head cursor, forces
+  /// a synchronous log flush when the entry is not yet durable, advances and
+  /// fsyncs the cursor sidecar, and then sends `POP_ACK` with the entry's
+  /// PUSH timestamp. A crash between cursor fsync and `POP_ACK` socket write
+  /// loses the entry consumer-side (no duplication).
+  async fn pop_payload(
+    &mut self,
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+  ) -> anyhow::Result<()> {
+    if channel_id.domain != self.local_domain {
+      self.metrics.fifo_pops.get_or_create(&FIFO_NOT_IMPLEMENTED).inc();
+      return Err(narwhal_protocol::Error::new(NotImplemented).with_id(correlation_id).into());
+    }
+
+    let handler = channel_id.handler.clone();
+
+    let (cursor_next_seq, captured) = {
+      let Some(channel) = self.channels.get(&handler) else {
+        self.metrics.fifo_pops.get_or_create(&FIFO_CHANNEL_NOT_FOUND).inc();
+        return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
+      };
+
+      let cursor_next_seq = match &channel.kind {
+        ChannelKind::PubSub => {
+          self.metrics.fifo_pops.get_or_create(&FIFO_WRONG_TYPE).inc();
+          return Err(narwhal_protocol::Error::new(WrongType).with_id(correlation_id).into());
+        },
+        ChannelKind::Fifo(FifoState::NeedsRecovery) => {
+          self.metrics.fifo_pops.get_or_create(&FIFO_CURSOR_RECOVERY).inc();
+          return Err(narwhal_protocol::Error::new(CursorRecoveryRequired).with_id(correlation_id).into());
+        },
+        ChannelKind::Fifo(FifoState::Healthy(c)) => c.next_seq(),
+      };
+
+      if !channel.is_member(&nid) {
+        self.metrics.fifo_pops.get_or_create(&FIFO_USER_NOT_IN_CHANNEL).inc();
+        return Err(narwhal_protocol::Error::new(UserNotInChannel).with_id(correlation_id).into());
+      }
+
+      if !channel.acl.is_read_allowed(&nid) {
+        self.metrics.fifo_pops.get_or_create(&FIFO_NOT_ALLOWED).inc();
+        return Err(narwhal_protocol::Error::new(NotAllowed).with_id(correlation_id).into());
+      }
+
+      let log_last_seq = channel.message_log.last_seq();
+      if cursor_next_seq > log_last_seq {
+        self.metrics.fifo_pops.get_or_create(&FIFO_QUEUE_EMPTY).inc();
+        return Err(narwhal_protocol::Error::new(QueueEmpty).with_id(correlation_id).into());
+      }
+
+      if cursor_next_seq > channel.message_log.last_durable_seq() {
+        // Entry is buffered but not yet fsynced. Force a sync flush before
+        // we commit the consumption via the cursor advance; otherwise a
+        // crash between the cursor fsync and the next log flush would leave
+        // `cursor.next_seq > log.last_seq() + 1` on disk (corruption).
+        let start = Instant::now();
+        let result = channel.message_log.flush().await;
+        self.metrics.record_flush(start, &result);
+        result?;
+      }
+
+      let mut visitor = PopVisitor { pool: &self.history_pool, captured: None };
+      channel.message_log.read(cursor_next_seq, 1, &mut visitor).await?;
+      let entry = visitor
+        .captured
+        .ok_or_else(|| anyhow::anyhow!("fifo pop: log.read returned no entry at seq {cursor_next_seq}"))?;
+      (cursor_next_seq, entry)
+    };
+
+    // `MessageLog::read(from_seq, limit, visitor)` returns the first entry
+    // with `seq >= from_seq`, NOT strictly at `from_seq`. If the log has a
+    // gap at the cursor (e.g. a prior failed append left `channel.seq` ahead
+    // of the log tail before that path was fixed, or external corruption),
+    // the read would silently return a later entry. Advancing the cursor by
+    // one in that case would re-read the same later entry on the next POP,
+    // causing duplicate delivery. Refuse to advance and bubble up an
+    // internal error instead; an operator-driven path (DELETE / CLEAR in
+    // PR 3) can heal it.
+    if captured.seq != cursor_next_seq {
+      let entry_seq = captured.seq;
+      tracing::error!(
+        channel = %handler,
+        cursor_next_seq,
+        entry_seq,
+        "fifo pop: log returned an entry at a higher seq than the cursor; refusing to advance to avoid duplicate delivery"
+      );
+      return Err(
+        narwhal_protocol::Error::new(InternalServerError)
+          .with_id(correlation_id)
+          .with_detail("fifo log has a gap at the head cursor")
+          .into(),
+      );
+    }
+
+    let PopEntry { payload, length, timestamp, .. } = captured;
+
+    let new_next_seq = {
+      let channel = self.channels.get_mut(&handler).expect("channel disappeared between pop phases");
+      let cursor = match &mut channel.kind {
+        ChannelKind::Fifo(FifoState::Healthy(c)) => c,
+        _ => unreachable!("channel kind mutated between pop phases"),
+      };
+      let start = Instant::now();
+      let advance_result = cursor.advance().await;
+      self.metrics.fifo_cursor_fsync_seconds.observe(start.elapsed().as_secs_f64());
+      advance_result?;
+      cursor.next_seq()
+    };
+
+    transmitter.send_message_with_payload(
+      Message::PopAck(PopAckParameters { id: correlation_id, length, timestamp }),
+      Some(payload),
+    );
+    self.metrics.fifo_pops.get_or_create(&SUCCESS).inc();
+
+    // Best-effort lazy head-eviction. Failures must not propagate: the POP
+    // already committed (cursor fsynced, ACK sent). Cheap when no segment
+    // qualifies.
+    let log = {
+      let channel = self.channels.get(&handler).expect("channel disappeared after pop");
+      channel.message_log.clone()
+    };
+    if let Err(e) = log.evict_below(new_next_seq).await {
+      warn!(channel = %handler, error = %e, "FIFO head-eviction failed (best-effort)");
+    }
+
+    Ok(())
+  }
+
+  /// GET_CHAN_LEN handler. Owner-only queue depth query.
+  fn get_channel_len(
+    &self,
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+  ) -> anyhow::Result<()> {
+    if channel_id.domain != self.local_domain {
+      return Err(narwhal_protocol::Error::new(NotImplemented).with_id(correlation_id).into());
+    }
+
+    let Some(channel) = self.channels.get(&channel_id.handler) else {
+      return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
+    };
+
+    let cursor_next_seq = match &channel.kind {
+      ChannelKind::PubSub => {
+        return Err(narwhal_protocol::Error::new(WrongType).with_id(correlation_id).into());
+      },
+      ChannelKind::Fifo(FifoState::NeedsRecovery) => {
+        return Err(narwhal_protocol::Error::new(CursorRecoveryRequired).with_id(correlation_id).into());
+      },
+      ChannelKind::Fifo(FifoState::Healthy(c)) => c.next_seq(),
+    };
+
+    if !channel.is_member(&nid) {
+      return Err(narwhal_protocol::Error::new(UserNotInChannel).with_id(correlation_id).into());
+    }
+
+    if !channel.is_owner(&nid) {
+      return Err(narwhal_protocol::Error::new(Forbidden).with_id(correlation_id).into());
+    }
+
+    let log_last_seq = channel.message_log.last_seq();
+    let depth = if cursor_next_seq > log_last_seq { 0 } else { log_last_seq - cursor_next_seq + 1 };
+    // Logical queue depth is bounded by `max_persist_messages` (u32) by the
+    // QUEUE_FULL gate on PUSH; saturate to u32::MAX for theoretical safety.
+    let count = depth.min(u32::MAX as u64) as u32;
+
+    transmitter.send_message(Message::ChannelLen(ChannelLenParameters {
+      id: correlation_id,
+      channel: channel_id.into(),
+      count,
+    }));
+
+    Ok(())
+  }
+
   /// Best-effort cleanup of persistent storage for a channel (message log + store record).
   /// Errors are logged but never propagated. Callers must not depend on storage cleanup
   /// succeeding for in-memory consistency.
@@ -2496,6 +2853,69 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelManager<CS, MLF> {
     reply_rx.recv().await?
   }
 
+  /// PUSH an element onto a FIFO channel. Owner-only. The payload's size is
+  /// gated by `max_payload_size`; the logical queue depth is gated by
+  /// `max_persist_messages` (`QUEUE_FULL`).
+  pub async fn push_payload(
+    &self,
+    payload: PoolBuffer,
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+  ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
+    let shard = shard_for(&channel_id.handler, self.mailboxes.len());
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+
+    self.mailboxes[shard]
+      .send(Command::Push { payload, channel_id, nid, transmitter, correlation_id, reply_tx })
+      .await?;
+
+    reply_rx.recv().await?
+  }
+
+  /// POP an element from a FIFO channel. Members subject to the read ACL.
+  /// Advances the head cursor durably before replying so a crash mid-POP
+  /// cannot deliver the element twice.
+  pub async fn pop_payload(
+    &self,
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+  ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
+    let shard = shard_for(&channel_id.handler, self.mailboxes.len());
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+
+    self.mailboxes[shard].send(Command::Pop { channel_id, nid, transmitter, correlation_id, reply_tx }).await?;
+
+    reply_rx.recv().await?
+  }
+
+  /// Queries the logical queue depth of a FIFO channel. Owner-only.
+  pub async fn get_channel_len(
+    &self,
+    channel_id: ChannelId,
+    nid: Nid,
+    transmitter: Arc<dyn Transmitter>,
+    correlation_id: u32,
+  ) -> anyhow::Result<()> {
+    self.assert_bootstrapped();
+
+    let shard = shard_for(&channel_id.handler, self.mailboxes.len());
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+
+    self.mailboxes[shard]
+      .send(Command::GetChannelLen { channel_id, nid, transmitter, correlation_id, reply_tx })
+      .await?;
+
+    reply_rx.recv().await?
+  }
+
   /// Asserts that `bootstrap()` has been called.
   fn assert_bootstrapped(&self) {
     debug_assert!(!self.mailboxes.is_empty(), "ChannelManager::bootstrap() must be called before use");
@@ -2607,6 +3027,37 @@ impl ChannelAcl {
       AclType::Publish => self.publish_acl.update(nids, action),
       AclType::Read => self.read_acl.update(nids, action),
     }
+  }
+}
+
+/// Visitor that captures a single log entry's seq, payload, and timestamp for
+/// the FIFO `POP` path. The visitor copies the payload into a pooled buffer
+/// so the entry borrow ends with `visit()`, leaving the captured tuple owned
+/// and usable past the read. The `seq` is kept so the POP handler can verify
+/// the entry it actually got matches the seq it asked for: a mismatch means
+/// the log has a gap below the tail and we must refuse to advance the
+/// cursor (would otherwise lead to duplicate delivery of the later entry).
+struct PopVisitor<'a> {
+  pool: &'a Pool,
+  captured: Option<PopEntry>,
+}
+
+struct PopEntry {
+  seq: u64,
+  payload: PoolBuffer,
+  length: u32,
+  timestamp: u64,
+}
+
+#[async_trait(?Send)]
+impl LogVisitor for PopVisitor<'_> {
+  async fn visit(&mut self, entry: LogEntry<'_>) -> anyhow::Result<()> {
+    let len = entry.payload.len();
+    let mut buf = self.pool.acquire_buffer().await;
+    buf.as_mut_slice()[..len].copy_from_slice(entry.payload);
+    let payload = buf.freeze(len);
+    self.captured = Some(PopEntry { seq: entry.seq, payload, length: len as u32, timestamp: entry.timestamp });
+    Ok(())
   }
 }
 

@@ -1387,15 +1387,18 @@ impl ConnTx {
   ///
   /// # Panics
   ///
-  /// Panics if the message is not a `Message::Message` or `Message::S2mForwardPayloadAck`.
+  /// Panics if the message is not a payload-bearing variant.
   pub fn send_message_with_payload(&self, message: Message, payload_opt: Option<PoolBuffer>) {
     assert!(
       payload_opt.is_none()
         || matches!(
           message,
-          Message::Message { .. } | Message::ModDirect { .. } | Message::S2mForwardBroadcastPayloadAck { .. }
+          Message::Message { .. }
+            | Message::ModDirect { .. }
+            | Message::S2mForwardBroadcastPayloadAck { .. }
+            | Message::PopAck { .. }
         ),
-      "a Message::Message, Message::ModDirect or Message::S2mForwardBroadcastPayloadAck variant is expected when payload is present"
+      "a payload-bearing message variant (Message, ModDirect, S2mForwardBroadcastPayloadAck, PopAck) is expected when payload is present"
     );
 
     match self.send_msg_tx.try_send((message, payload_opt)) {

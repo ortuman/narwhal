@@ -435,6 +435,72 @@ impl C2sClient {
     }
   }
 
+  /// PUSHes an element onto a FIFO channel. Owner-only.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if the channel is not FIFO, the caller is not the owner,
+  /// the queue is full, or the payload exceeds the channel's `max_payload_size`.
+  pub async fn push(&self, channel: StringAtom, payload: PoolBuffer) -> crate::Result<()> {
+    use narwhal_protocol::PushParameters;
+
+    let id = self.client.next_id().await;
+    let length = payload.len() as u32;
+    let message = Message::Push(PushParameters { id, channel, length });
+
+    let handle = self.client.send_message(message, Some(payload)).await?;
+    let (response, _) = handle.response().await?;
+
+    match response {
+      Message::PushAck(_) => Ok(()),
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to push request").into()),
+    }
+  }
+
+  /// POPs a single element off a FIFO channel. Returns the payload and the
+  /// timestamp at which the element was PUSHed.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if the channel is not FIFO, the caller is not a member,
+  /// the read ACL denies the caller, or the queue is empty.
+  pub async fn pop(&self, channel: StringAtom) -> crate::Result<(PoolBuffer, u64)> {
+    use narwhal_protocol::PopParameters;
+
+    let id = self.client.next_id().await;
+    let message = Message::Pop(PopParameters { id, channel });
+
+    let handle = self.client.send_message(message, None).await?;
+    let (response, payload_opt) = handle.response().await?;
+
+    match response {
+      Message::PopAck(params) => {
+        let payload = payload_opt.ok_or_else(|| anyhow!("POP_ACK without payload"))?;
+        Ok((payload, params.timestamp))
+      },
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to pop request").into()),
+    }
+  }
+
+  /// Queries the logical queue depth of a FIFO channel. Owner-only.
+  pub async fn get_chan_len(&self, channel: StringAtom) -> crate::Result<u32> {
+    use narwhal_protocol::GetChannelLenParameters;
+
+    let id = self.client.next_id().await;
+    let message = Message::GetChannelLen(GetChannelLenParameters { id, channel });
+
+    let handle = self.client.send_message(message, None).await?;
+    let (response, _) = handle.response().await?;
+
+    match response {
+      Message::ChannelLen(params) => Ok(params.count),
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to get channel len request").into()),
+    }
+  }
+
   /// Shuts down the client and closes all connections.
   ///
   /// This method gracefully shuts down the client, signalling cancellation to
