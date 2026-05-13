@@ -24,6 +24,7 @@ use super::common::{self, Handshaker};
 use super::dialer::TlsDialer;
 use crate::auth::{AuthMethod, AuthenticatorFactory};
 use crate::config::{C2sConfig, C2sSessionExtraInfo, SessionInfo};
+use crate::types::{ChannelConfiguration, HistoryEntry, PaginatedList};
 
 /// Handshaker implementation for C2S connections.
 #[derive(Clone)]
@@ -314,6 +315,176 @@ impl C2sClient {
     }
   }
 
+  /// Deletes a channel. Owner-only.
+  pub async fn delete_channel(&self, channel: StringAtom) -> crate::Result<()> {
+    use narwhal_protocol::DeleteChannelParameters;
+
+    let id = self.client.next_id().await;
+    let message = Message::DeleteChannel(DeleteChannelParameters { id, channel });
+
+    let handle = self.client.send_message(message, None).await?;
+    let (response, _) = handle.await.map_err(anyhow::Error::from)??;
+
+    match response {
+      Message::DeleteChannelAck(_) => Ok(()),
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to delete channel request").into()),
+    }
+  }
+
+  /// Lists channels visible to the caller.
+  pub async fn list_channels(
+    &self,
+    page: Option<u32>,
+    page_size: Option<u32>,
+    owner: bool,
+  ) -> crate::Result<PaginatedList<StringAtom>> {
+    use narwhal_protocol::ListChannelsParameters;
+
+    let id = self.client.next_id().await;
+    let message = Message::ListChannels(ListChannelsParameters { id, page, page_size, owner });
+
+    let handle = self.client.send_message(message, None).await?;
+    let (response, _) = handle.await.map_err(anyhow::Error::from)??;
+
+    match response {
+      Message::ListChannelsAck(params) => Ok(PaginatedList {
+        items: params.channels,
+        page: params.page,
+        page_size: params.page_size,
+        total_count: params.total_count,
+      }),
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to list channels request").into()),
+    }
+  }
+
+  /// Lists members of a channel.
+  pub async fn list_members(
+    &self,
+    channel: StringAtom,
+    page: Option<u32>,
+    page_size: Option<u32>,
+  ) -> crate::Result<PaginatedList<StringAtom>> {
+    use narwhal_protocol::ListMembersParameters;
+
+    let id = self.client.next_id().await;
+    let message = Message::ListMembers(ListMembersParameters { id, channel, page, page_size });
+
+    let handle = self.client.send_message(message, None).await?;
+    let (response, _) = handle.await.map_err(anyhow::Error::from)??;
+
+    match response {
+      Message::ListMembersAck(params) => Ok(PaginatedList {
+        items: params.members,
+        page: params.page,
+        page_size: params.page_size,
+        total_count: params.total_count,
+      }),
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to list members request").into()),
+    }
+  }
+
+  /// Reads the channel's ACL for a given type (`join`, `publish`, or `read`).
+  pub async fn get_channel_acl(
+    &self,
+    channel: StringAtom,
+    acl_type: AclType,
+    page: Option<u32>,
+    page_size: Option<u32>,
+  ) -> crate::Result<PaginatedList<StringAtom>> {
+    use narwhal_protocol::GetChannelAclParameters;
+
+    let id = self.client.next_id().await;
+    let message = Message::GetChannelAcl(GetChannelAclParameters {
+      id,
+      channel,
+      r#type: acl_type.as_str().into(),
+      page,
+      page_size,
+    });
+
+    let handle = self.client.send_message(message, None).await?;
+    let (response, _) = handle.await.map_err(anyhow::Error::from)??;
+
+    match response {
+      Message::ChannelAcl(params) => Ok(PaginatedList {
+        items: params.nids,
+        page: params.page,
+        page_size: params.page_size,
+        total_count: params.total_count,
+      }),
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to get channel ACL request").into()),
+    }
+  }
+
+  /// Reads the current configuration of a channel.
+  pub async fn get_channel_config(&self, channel: StringAtom) -> crate::Result<ChannelConfiguration> {
+    use narwhal_protocol::GetChannelConfigurationParameters;
+
+    let id = self.client.next_id().await;
+    let message = Message::GetChannelConfiguration(GetChannelConfigurationParameters { id, channel });
+
+    let handle = self.client.send_message(message, None).await?;
+    let (response, _) = handle.await.map_err(anyhow::Error::from)??;
+
+    match response {
+      Message::ChannelConfiguration(params) => Ok(ChannelConfiguration {
+        max_clients: params.max_clients,
+        max_payload_size: params.max_payload_size,
+        max_persist_messages: params.max_persist_messages,
+        persist: params.persist,
+        message_flush_interval: params.message_flush_interval,
+        r#type: params.r#type,
+      }),
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to get channel config request").into()),
+    }
+  }
+
+  /// Queries the available sequence range of a channel's message log. Returns
+  /// `(first_seq, last_seq)`; both are `0` for an empty log.
+  pub async fn channel_seq(&self, channel: StringAtom) -> crate::Result<(u64, u64)> {
+    use narwhal_protocol::ChannelSeqParameters;
+
+    let id = self.client.next_id().await;
+    let message = Message::ChannelSeq(ChannelSeqParameters { id, channel });
+
+    let handle = self.client.send_message(message, None).await?;
+    let (response, _) = handle.await.map_err(anyhow::Error::from)??;
+
+    match response {
+      Message::ChannelSeqAck(params) => Ok((params.first_seq, params.last_seq)),
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to channel seq request").into()),
+    }
+  }
+
+  /// Sends a direct message to the modulator attached to the server. The
+  /// modulator's response (if any) is delivered as a server-pushed
+  /// `MOD_DIRECT` via [`inbound_stream`](Self::inbound_stream).
+  pub async fn mod_direct(&self, payload: PoolBuffer) -> crate::Result<()> {
+    use narwhal_protocol::ModDirectParameters;
+
+    let id = self.client.next_id().await;
+    let length = payload.len() as u32;
+    // `from` is filled in server-side from the authenticated session nid;
+    // the protocol still requires the field on the wire, so we send an empty
+    // placeholder StringAtom and let the server overwrite it.
+    let message = Message::ModDirect(ModDirectParameters { id: Some(id), from: StringAtom::default(), length });
+
+    let handle = self.client.send_message(message, Some(payload)).await?;
+    let (response, _) = handle.await.map_err(anyhow::Error::from)??;
+
+    match response {
+      Message::ModDirectAck(_) => Ok(()),
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to mod_direct request").into()),
+    }
+  }
+
   /// Configures channel settings such as maximum clients and payload size.
   ///
   /// # Arguments
@@ -491,6 +662,51 @@ impl C2sClient {
       },
       Message::Error(err) => Err(err.into()),
       _ => Err(anyhow!("unexpected response to pop request").into()),
+    }
+  }
+
+  /// Requests historical messages from a persistent pub/sub channel. The
+  /// server replies with a stream of MESSAGE frames followed by a
+  /// HISTORY_ACK. The client collects the streamed entries and returns them
+  /// after the ACK arrives.
+  ///
+  /// # Arguments
+  ///
+  /// * `channel` - The channel to read history from.
+  /// * `from_seq` - The earliest sequence number to return (1-based, inclusive).
+  /// * `limit` - Maximum number of entries to return (server may cap further).
+  pub async fn history(&self, channel: StringAtom, from_seq: u64, limit: u32) -> crate::Result<Vec<HistoryEntry>> {
+    use narwhal_protocol::HistoryParameters;
+
+    let id = self.client.next_id().await;
+    // `history_id` is the client-invented per-request demultiplexing tag the
+    // server echoes on each MESSAGE frame. Derive it from the correlation id
+    // since both are unique per connection.
+    let history_id = StringAtom::from(format!("h{}", id));
+
+    let message = Message::History(HistoryParameters { id, history_id: history_id.clone(), channel, from_seq, limit });
+
+    let buffer_capacity = (limit as usize).saturating_add(1);
+    let (handle, collector) = self.client.send_history_request(history_id, message, buffer_capacity).await?;
+    let (response, _) = handle.await.map_err(anyhow::Error::from)??;
+
+    match response {
+      Message::HistoryAck(params) => {
+        let count = params.count as usize;
+        let mut entries = Vec::with_capacity(count);
+        // All MESSAGE frames are routed to `collector.entries_rx` BEFORE
+        // HISTORY_ACK arrives at the response handle (reader task is single-
+        // threaded), so a non-blocking drain after the ACK is sufficient.
+        for _ in 0..count {
+          match collector.entries_rx.try_recv() {
+            Ok(entry) => entries.push(entry),
+            Err(_) => break,
+          }
+        }
+        Ok(entries)
+      },
+      Message::Error(err) => Err(err.into()),
+      _ => Err(anyhow!("unexpected response to history request").into()),
     }
   }
 
