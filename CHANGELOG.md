@@ -4,7 +4,7 @@ All notable changes to Narwhal will be documented in this file.
 
 ## Unreleased
 
-* [ENHANCEMENT]: Add support for FIFO-type channels. A pub/sub channel can be promoted to a FIFO work-queue via `SET_CHAN_CONFIG type=fifo` (one-way; requires `persist=true` and `max_persist_messages > 0`); owners append elements with `PUSH`, members consume them atomically with `POP` (read-ACL gated; head cursor fsynced before `POP_ACK` for at-most-once delivery with no duplication), and owners query depth with `GET_CHAN_LEN`. Adds the `push()` / `pop()` / `get_chan_len()` client methods, `fifo_pushes` / `fifo_pops` / `fifo_cursor_fsync_seconds` metrics, error reasons `QUEUE_EMPTY` / `QUEUE_FULL` / `WRONG_TYPE` / `CURSOR_RECOVERY_REQUIRED`, the `CHANNEL_RECONFIGURED` event, and a `type` field on `CHAN_CONFIG` / `SET_CHAN_CONFIG`. CLEAR (owner-driven drain / cursor recovery) ships in a follow-up. [#292](https://github.com/ortuman/narwhal/pull/292), [#298](https://github.com/ortuman/narwhal/pull/298)
+* [ENHANCEMENT]: Add support for FIFO-type channels with at-most-once delivery via `PUSH` / `POP` / `GET_CHAN_LEN`. [#292](https://github.com/ortuman/narwhal/pull/292), [#298](https://github.com/ortuman/narwhal/pull/298)
 
 ## 0.6.1 (2026-05-01)
 
