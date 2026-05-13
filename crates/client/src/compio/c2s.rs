@@ -470,10 +470,14 @@ impl C2sClient {
 
     let id = self.client.next_id().await;
     let length = payload.len() as u32;
-    // `from` is filled in server-side from the authenticated session nid;
-    // the protocol still requires the field on the wire, so we send an empty
-    // placeholder StringAtom and let the server overwrite it.
-    let message = Message::ModDirect(ModDirectParameters { id: Some(id), from: StringAtom::default(), length });
+    // `from` is required non-empty on the wire. Fill it from the session's
+    // authenticated nid (the server ignores it and substitutes its own nid
+    // when forwarding to the modulator, but a missing/empty value here
+    // would fail protocol validation and trigger an uncorrelated server
+    // ERROR).
+    let (_, extra) = self.client.session_info().await?;
+    let from: StringAtom = (&extra.nid).into();
+    let message = Message::ModDirect(ModDirectParameters { id: Some(id), from, length });
 
     let handle = self.client.send_message(message, Some(payload)).await?;
     let (response, _) = handle.response().await?;

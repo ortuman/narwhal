@@ -19,7 +19,7 @@ use narwhal_client::compio::s2m::S2mClient;
 use narwhal_client::{AuthMethod, Authenticator, AuthenticatorFactory, C2sConfig};
 use narwhal_common::core_dispatcher::CoreDispatcher;
 use narwhal_modulator::create_s2m_listener;
-use narwhal_modulator::modulator::AuthResult;
+use narwhal_modulator::modulator::{AuthResult, SendPrivatePayloadResult};
 use narwhal_protocol::{AclAction, AclType};
 use narwhal_server::channel::file_message_log::{FileMessageLogFactory, MessageLogMetrics};
 use narwhal_server::channel::file_store::FileChannelStore;
@@ -63,6 +63,7 @@ impl AuthenticatorFactory for UsernameAuthFactory {
 fn make_auth_modulator() -> TestModulator {
   TestModulator::new()
     .with_auth_handler(|token| async move { Ok(AuthResult::Success { username: StringAtom::from(token.as_ref()) }) })
+    .with_send_private_payload_handler(|_payload, _from| async move { Ok(SendPrivatePayloadResult::Valid) })
 }
 
 async fn bootstrap_s2m(
@@ -296,21 +297,23 @@ async fn test_client_history() -> anyhow::Result<()> {
 }
 
 #[compio::test]
-async fn test_client_mod_direct_without_modulator_returns_error() -> anyhow::Result<()> {
-  // The test suite is not booted with a modulator, so a MOD_DIRECT request
-  // must surface an error from the client rather than hang or panic. This
-  // verifies the client correctly parses the ERROR response.
-  let (mut suite, client) = boot_with_client(TEST_USER).await?;
+async fn test_client_mod_direct() -> anyhow::Result<()> {
+  // Suite is booted with an auth modulator whose SendPrivatePayload handler
+  // returns Valid. mod_direct must round-trip cleanly: encode the request
+  // with a non-empty `from` (filled from the authenticated session nid),
+  // wait for MOD_DIRECT_ACK on the correlation id, and return Ok.
+  let (mut suite, mut s2m_ln, mut s2m_dispatcher, _tmp, client) = boot_with_auth_client(TEST_USER).await?;
 
   let pool = Pool::new(1, 1024);
   let mut buf = pool.acquire_buffer().await;
   buf.as_mut_slice()[..4].copy_from_slice(b"ping");
   let payload = buf.freeze(4);
 
-  let result = client.mod_direct(payload).await;
-  assert!(result.is_err(), "expected ERROR from server when no modulator is attached");
+  client.mod_direct(payload).await?;
 
   client.shutdown().await?;
   suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
   Ok(())
 }

@@ -224,10 +224,10 @@ where
   }
 
   /// Registers a HISTORY collector and sends `message` over the same
-  /// connection. Returns a `(JoinHandle<...>, HistoryCollector)` pair: the
-  /// handle resolves on `HISTORY_ACK`, the collector's `entries_rx` yields
-  /// the streamed entries, and the collector unregisters automatically on
-  /// drop.
+  /// connection. Returns a `JoinHandle` resolving to the eventual server
+  /// response paired with a `HistoryCollector`: the handle resolves on
+  /// `HISTORY_ACK`, the collector's `entries_rx` yields the streamed
+  /// entries, and the collector unregisters automatically on drop.
   ///
   /// Used internally by `C2sClient::history`; not intended for direct use.
   pub async fn send_history_request(
