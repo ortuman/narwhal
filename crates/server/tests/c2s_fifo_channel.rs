@@ -13,7 +13,7 @@ use narwhal_common::core_dispatcher::CoreDispatcher;
 use narwhal_modulator::create_s2m_listener;
 use narwhal_modulator::modulator::AuthResult;
 use narwhal_protocol::{
-  AclAction, AclType, BroadcastParameters, ChannelSeqParameters, ErrorReason, EventKind,
+  AclAction, AclType, BroadcastParameters, ChannelSeqParameters, ClearParameters, ErrorReason, EventKind,
   GetChannelConfigurationParameters, GetChannelLenParameters, HistoryParameters, LeaveChannelParameters,
   ListChannelsParameters, Message, PopParameters, PushParameters, SetChannelAclParameters,
   SetChannelConfigurationParameters,
@@ -1261,6 +1261,301 @@ async fn test_push_durable_with_zero_flush_interval() -> anyhow::Result<()> {
     suite.auth(TEST_USER_1, TEST_USER_1).await?;
     let (payload, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 10).await?;
     assert_eq!(payload, b"pre-restart");
+
+    suite.teardown().await?;
+    s2m_ln.shutdown().await?;
+    s2m_dispatcher.shutdown().await?;
+  }
+
+  Ok(())
+}
+
+// ---------- PR 3 CLEAR tests ----------
+
+/// Sends a CLEAR and asserts a CLEAR_ACK with the same correlation id.
+async fn clear_ok<CS: ChannelStore, MLF: MessageLogFactory>(
+  suite: &mut C2sSuite<CS, MLF>,
+  user: &str,
+  channel: &str,
+  id: u32,
+) -> anyhow::Result<()> {
+  suite.write_message(user, Message::Clear(ClearParameters { id, channel: StringAtom::from(channel) })).await?;
+  match suite.read_message(user).await? {
+    Message::ClearAck(p) => {
+      assert_eq!(p.id, id);
+      Ok(())
+    },
+    other => panic!("expected ClearAck, got: {:?}", other),
+  }
+}
+
+/// Recursively find every `cursor.bin` under `root` (test helper for the
+/// CLEAR-as-recovery scenario; avoids depending on the private SHA-256
+/// channel-hash routine that maps handlers to on-disk subdirectories).
+fn find_cursor_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+  let mut out = vec![];
+  let Ok(entries) = std::fs::read_dir(root) else {
+    return out;
+  };
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path.is_dir() {
+      let cursor = path.join("cursor.bin");
+      if cursor.is_file() {
+        out.push(cursor);
+      }
+      out.extend(find_cursor_files(&path));
+    }
+  }
+  out
+}
+
+/// PUSH N → CLEAR → GET_CHAN_LEN returns 0 → POP returns QUEUE_EMPTY → a
+/// fresh PUSH+POP cycle works (the queue is reusable after CLEAR, seq
+/// monotonicity holds).
+#[compio::test]
+async fn test_clear_semantics() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 1, b"one").await?;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 2, b"two").await?;
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 3, b"three").await?;
+  assert_eq!(get_chan_len_ok(&mut suite, TEST_USER_1, CHANNEL, 4).await?, 3);
+
+  clear_ok(&mut suite, TEST_USER_1, CHANNEL, 5).await?;
+
+  assert_eq!(get_chan_len_ok(&mut suite, TEST_USER_1, CHANNEL, 6).await?, 0);
+
+  // POP must fail with QUEUE_EMPTY, not return any of the cleared entries.
+  suite.write_message(TEST_USER_1, Message::Pop(PopParameters { id: 7, channel: StringAtom::from(CHANNEL) })).await?;
+  match suite.read_message(TEST_USER_1).await? {
+    Message::Error(p) => assert_eq!(p.reason, StringAtom::from(ErrorReason::QueueEmpty)),
+    other => panic!("expected Error(QUEUE_EMPTY), got: {:?}", other),
+  }
+
+  // The queue remains usable after CLEAR: a fresh PUSH delivers cleanly.
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 8, b"fresh").await?;
+  let (payload, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 9).await?;
+  assert_eq!(payload, b"fresh");
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// CLEAR on an empty queue is a no-op that still ACKs; back-to-back CLEAR
+/// is the retry-on-missing-ACK case and must also succeed without side
+/// effects.
+#[compio::test]
+async fn test_clear_idempotence() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+
+  clear_ok(&mut suite, TEST_USER_1, CHANNEL, 1).await?;
+  clear_ok(&mut suite, TEST_USER_1, CHANNEL, 2).await?;
+  assert_eq!(get_chan_len_ok(&mut suite, TEST_USER_1, CHANNEL, 3).await?, 0);
+
+  // After a PUSH+CLEAR, a second CLEAR is still a no-op ack.
+  push_ok(&mut suite, TEST_USER_1, CHANNEL, 4, b"x").await?;
+  clear_ok(&mut suite, TEST_USER_1, CHANNEL, 5).await?;
+  clear_ok(&mut suite, TEST_USER_1, CHANNEL, 6).await?;
+  assert_eq!(get_chan_len_ok(&mut suite, TEST_USER_1, CHANNEL, 7).await?, 0);
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// CLEAR authorization: non-owner member → FORBIDDEN; non-member auth'd
+/// client → USER_NOT_IN_CHANNEL; pub/sub channel → WRONG_TYPE.
+#[compio::test]
+async fn test_clear_authorization() -> anyhow::Result<()> {
+  let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+  let tmp = tempfile::tempdir()?;
+  let store = FileChannelStore::new(tmp.path().to_path_buf()).await?;
+  let mlf = FileMessageLogFactory::new(
+    tmp.path().to_path_buf(),
+    default_c2s_config().limits.max_payload_size,
+    MessageLogMetrics::noop(),
+  );
+
+  let mut suite = C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+  suite.setup().await?;
+
+  bootstrap_fifo(&mut suite, 10, None).await?;
+  suite.auth(TEST_USER_2, TEST_USER_2).await?;
+  suite.join_channel(TEST_USER_2, CHANNEL, None).await?;
+  // owner drains MEMBER_JOINED.
+  suite.ignore_reply(TEST_USER_1).await?;
+
+  // Non-owner CLEAR -> FORBIDDEN.
+  suite
+    .write_message(TEST_USER_2, Message::Clear(ClearParameters { id: 11, channel: StringAtom::from(CHANNEL) }))
+    .await?;
+  match suite.read_message(TEST_USER_2).await? {
+    Message::Error(p) => {
+      assert_eq!(p.id, Some(11));
+      assert_eq!(p.reason, StringAtom::from(ErrorReason::Forbidden));
+    },
+    other => panic!("expected Error(FORBIDDEN), got: {:?}", other),
+  }
+
+  // Non-member CLEAR -> USER_NOT_IN_CHANNEL. user_2 leaves first.
+  suite
+    .write_message(
+      TEST_USER_2,
+      Message::LeaveChannel(LeaveChannelParameters { id: 12, channel: StringAtom::from(CHANNEL), on_behalf: None }),
+    )
+    .await?;
+  match suite.read_message(TEST_USER_2).await? {
+    Message::LeaveChannelAck(p) => assert_eq!(p.id, 12),
+    other => panic!("expected LeaveChannelAck, got: {:?}", other),
+  }
+  // owner drains MEMBER_LEFT.
+  suite.ignore_reply(TEST_USER_1).await?;
+  suite
+    .write_message(TEST_USER_2, Message::Clear(ClearParameters { id: 13, channel: StringAtom::from(CHANNEL) }))
+    .await?;
+  match suite.read_message(TEST_USER_2).await? {
+    Message::Error(p) => {
+      assert_eq!(p.id, Some(13));
+      assert_eq!(p.reason, StringAtom::from(ErrorReason::UserNotInChannel));
+    },
+    other => panic!("expected Error(USER_NOT_IN_CHANNEL), got: {:?}", other),
+  }
+
+  // CLEAR on a pub/sub channel -> WRONG_TYPE.
+  let pubsub_channel = "!pubsub@localhost";
+  suite.join_channel(TEST_USER_1, pubsub_channel, None).await?;
+  suite
+    .write_message(TEST_USER_1, Message::Clear(ClearParameters { id: 14, channel: StringAtom::from(pubsub_channel) }))
+    .await?;
+  match suite.read_message(TEST_USER_1).await? {
+    Message::Error(p) => {
+      assert_eq!(p.id, Some(14));
+      assert_eq!(p.reason, StringAtom::from(ErrorReason::WrongType));
+    },
+    other => panic!("expected Error(WRONG_TYPE), got: {:?}", other),
+  }
+
+  suite.teardown().await?;
+  s2m_ln.shutdown().await?;
+  s2m_dispatcher.shutdown().await?;
+  Ok(())
+}
+
+/// CLEAR is the owner-driven recovery path for `CURSOR_RECOVERY_REQUIRED`.
+/// First boot: transition + PUSH + clean shutdown. Between boots, corrupt
+/// `cursor.bin` so recovery surfaces the channel as `NeedsRecovery`. Second
+/// boot: PUSH / POP / GET_CHAN_LEN must all reject with
+/// `CURSOR_RECOVERY_REQUIRED`, then CLEAR succeeds and brings the channel
+/// back to healthy (next PUSH+POP work).
+#[compio::test]
+async fn test_clear_as_recovery_path() -> anyhow::Result<()> {
+  let tmp = tempfile::tempdir()?;
+  let data_dir = tmp.path().to_path_buf();
+
+  // First boot: transition and PUSH some entries.
+  {
+    let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+    let store = FileChannelStore::new(data_dir.clone()).await?;
+    let mlf = FileMessageLogFactory::new(
+      data_dir.clone(),
+      default_c2s_config().limits.max_payload_size,
+      MessageLogMetrics::noop(),
+    );
+
+    let mut suite =
+      C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+    suite.setup().await?;
+
+    bootstrap_fifo(&mut suite, 10, None).await?;
+    push_ok(&mut suite, TEST_USER_1, CHANNEL, 1, b"alpha").await?;
+    push_ok(&mut suite, TEST_USER_1, CHANNEL, 2, b"beta").await?;
+
+    suite.teardown().await?;
+    s2m_ln.shutdown().await?;
+    s2m_dispatcher.shutdown().await?;
+  }
+
+  // Between boots: scramble cursor.bin. The CRC will fail to verify and
+  // the channel will come up in NeedsRecovery.
+  let cursor_files = find_cursor_files(&data_dir);
+  assert_eq!(cursor_files.len(), 1, "expected exactly one cursor.bin, found {:?}", cursor_files);
+  std::fs::write(&cursor_files[0], [0xFFu8; 16])?;
+
+  // Second boot: NeedsRecovery rejects FIFO data plane; CLEAR heals.
+  {
+    let (s2m_client, mut s2m_ln, mut s2m_dispatcher) = bootstrap_s2m(make_auth_modulator()).await?;
+    let store = FileChannelStore::new(data_dir.clone()).await?;
+    let mlf = FileMessageLogFactory::new(
+      data_dir.clone(),
+      default_c2s_config().limits.max_payload_size,
+      MessageLogMetrics::noop(),
+    );
+
+    let mut suite =
+      C2sSuite::with_modulator_and_stores(default_c2s_config(), Some(s2m_client), None, store, mlf).await?;
+    suite.setup().await?;
+
+    suite.auth(TEST_USER_1, TEST_USER_1).await?;
+
+    // PUSH, POP, GET_CHAN_LEN all reject with CURSOR_RECOVERY_REQUIRED.
+    write_push(&mut suite, TEST_USER_1, CHANNEL, 100, b"blocked").await?;
+    match suite.read_message(TEST_USER_1).await? {
+      Message::Error(p) => assert_eq!(p.reason, StringAtom::from(ErrorReason::CursorRecoveryRequired)),
+      other => panic!("expected Error(CURSOR_RECOVERY_REQUIRED), got: {:?}", other),
+    }
+    suite
+      .write_message(TEST_USER_1, Message::Pop(PopParameters { id: 101, channel: StringAtom::from(CHANNEL) }))
+      .await?;
+    match suite.read_message(TEST_USER_1).await? {
+      Message::Error(p) => assert_eq!(p.reason, StringAtom::from(ErrorReason::CursorRecoveryRequired)),
+      other => panic!("expected Error(CURSOR_RECOVERY_REQUIRED), got: {:?}", other),
+    }
+    suite
+      .write_message(
+        TEST_USER_1,
+        Message::GetChannelLen(GetChannelLenParameters { id: 102, channel: StringAtom::from(CHANNEL) }),
+      )
+      .await?;
+    match suite.read_message(TEST_USER_1).await? {
+      Message::Error(p) => assert_eq!(p.reason, StringAtom::from(ErrorReason::CursorRecoveryRequired)),
+      other => panic!("expected Error(CURSOR_RECOVERY_REQUIRED), got: {:?}", other),
+    }
+
+    // CLEAR heals: channel transitions back to Healthy.
+    clear_ok(&mut suite, TEST_USER_1, CHANNEL, 103).await?;
+
+    // After CLEAR, PUSH+POP work cleanly; the pre-corruption entries are
+    // gone (logically consumed) and a fresh PUSH is delivered.
+    push_ok(&mut suite, TEST_USER_1, CHANNEL, 104, b"after-heal").await?;
+    let (payload, _) = pop_ok(&mut suite, TEST_USER_1, CHANNEL, 105).await?;
+    assert_eq!(payload, b"after-heal");
 
     suite.teardown().await?;
     s2m_ln.shutdown().await?;

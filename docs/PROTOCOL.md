@@ -37,6 +37,8 @@
   - [POP_ACK](#pop_ack)
   - [GET_CHAN_LEN](#get_chan_len)
   - [CHAN_LEN](#chan_len)
+  - [CLEAR](#clear)
+  - [CLEAR_ACK](#clear_ack)
   - [MOD_DIRECT](#mod_direct)
   - [MOD_DIRECT_ACK](#mod_direct_ack)
   - [CHANNELS](#channels)
@@ -760,6 +762,47 @@ Returns the logical queue depth of a `fifo` channel.
 **Example**:
 ```
 CHAN_LEN id=9 channel=!queue@example.com count=42
+```
+
+---
+
+### CLEAR
+
+Discards every element currently queued on a `fifo` channel without destroying the channel. Owner-only, idempotent. Also the owner-driven recovery path for `CURSOR_RECOVERY_REQUIRED`.
+
+After `CLEAR_ACK`, `GET_CHAN_LEN` returns `0` and the next `POP` returns `QUEUE_EMPTY` until a fresh `PUSH` arrives. Channel membership, ACLs, and configuration are preserved. The seq counter is preserved as well: the next `PUSH` is assigned `log.last_seq() + 1`, so monotonicity holds across the operation (`CLEAR` does **not** reset seq to 1).
+
+**Direction**: Client → Server
+
+**Parameters**:
+- `id` (u32, required): Request identifier (must be non-zero)
+- `channel` (string, required): Target channel ID (must be non-empty)
+
+**Example**:
+```
+CLEAR id=10 channel=!queue@example.com
+```
+
+**Notes**:
+- Only valid on `fifo` channels. Returns `WRONG_TYPE` on a `pubsub` channel.
+- Caller must be the channel owner; non-owner members receive `FORBIDDEN`.
+- `CLEAR` is **not** rejected with `CURSOR_RECOVERY_REQUIRED`. When the head cursor failed recovery, `CLEAR` is the owner-driven heal path: the server flushes the log, writes a fresh `cursor.bin` with `next_seq = log.last_seq() + 1`, and transitions the channel from `NeedsRecovery` back to healthy.
+- Idempotent: clearing an already-empty queue succeeds with no externally visible effect. A producer retrying `CLEAR` on missing `CLEAR_ACK` cannot discard anything beyond what the original `CLEAR` would have.
+
+---
+
+### CLEAR_ACK
+
+Acknowledges a successful CLEAR. After this ACK the channel is healthy and the queue is empty.
+
+**Direction**: Server → Client
+
+**Parameters**:
+- `id` (u32, required): Request identifier matching the CLEAR message (must be non-zero)
+
+**Example**:
+```
+CLEAR_ACK id=10
 ```
 
 ---

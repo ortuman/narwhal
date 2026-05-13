@@ -42,6 +42,8 @@ pub enum Message {
   BroadcastAck(BroadcastAckParameters),
   ChannelAcl(ChannelAclParameters),
   ChannelConfiguration(ChannelConfigurationParameters),
+  Clear(ClearParameters),
+  ClearAck(ClearAckParameters),
   Connect(ConnectParameters),
   ConnectAck(ConnectAckParameters),
   DeleteChannel(DeleteChannelParameters),
@@ -167,6 +169,21 @@ pub struct ChannelConfigurationParameters {
 
   #[param(name = "type", validate = "non_empty")]
   pub r#type: StringAtom,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
+pub struct ClearParameters {
+  #[param(validate = "non_zero")]
+  pub id: u32,
+
+  #[param(validate = "non_empty")]
+  pub channel: StringAtom,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
+pub struct ClearAckParameters {
+  #[param(validate = "non_zero")]
+  pub id: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, ProtocolMessageParameters)]
@@ -738,6 +755,8 @@ impl Message {
       b"CONNECT_ACK" => Ok(Message::ConnectAck(ConnectAckParameters::default())),
       b"CHAN_ACL" => Ok(Message::ChannelAcl(ChannelAclParameters::default())),
       b"CHAN_CONFIG" => Ok(Message::ChannelConfiguration(ChannelConfigurationParameters::default())),
+      b"CLEAR" => Ok(Message::Clear(ClearParameters::default())),
+      b"CLEAR_ACK" => Ok(Message::ClearAck(ClearAckParameters::default())),
       b"DELETE" => Ok(Message::DeleteChannel(DeleteChannelParameters::default())),
       b"DELETE_ACK" => Ok(Message::DeleteChannelAck(DeleteChannelAckParameters::default())),
       b"ERROR" => Ok(Message::Error(ErrorParameters::default())),
@@ -807,6 +826,8 @@ impl Message {
       Message::ConnectAck { .. } => "CONNECT_ACK",
       Message::ChannelAcl { .. } => "CHAN_ACL",
       Message::ChannelConfiguration { .. } => "CHAN_CONFIG",
+      Message::Clear { .. } => "CLEAR",
+      Message::ClearAck { .. } => "CLEAR_ACK",
       Message::DeleteChannel { .. } => "DELETE",
       Message::DeleteChannelAck { .. } => "DELETE_ACK",
       Message::Error { .. } => "ERROR",
@@ -873,6 +894,8 @@ impl Message {
       ConnectAck(params) => params.encode(parameter_writer),
       ChannelAcl(params) => params.encode(parameter_writer),
       ChannelConfiguration(params) => params.encode(parameter_writer),
+      Clear(params) => params.encode(parameter_writer),
+      ClearAck(params) => params.encode(parameter_writer),
       DeleteChannel(params) => params.encode(parameter_writer),
       DeleteChannelAck(params) => params.encode(parameter_writer),
       Error(params) => params.encode(parameter_writer),
@@ -936,6 +959,8 @@ impl Message {
       BroadcastAck(params) => params.decode(parameter_reader),
       ChannelAcl(params) => params.decode(parameter_reader),
       ChannelConfiguration(params) => params.decode(parameter_reader),
+      Clear(params) => params.decode(parameter_reader),
+      ClearAck(params) => params.decode(parameter_reader),
       Connect(params) => params.decode(parameter_reader),
       ConnectAck(params) => params.decode(parameter_reader),
       DeleteChannel(params) => params.decode(parameter_reader),
@@ -1014,6 +1039,8 @@ impl Message {
         Ok(())
       },
       ChannelConfiguration(params) => params.validate(),
+      Clear(params) => params.validate(),
+      ClearAck(params) => params.validate(),
       Connect(params) => params.validate(),
       ConnectAck(params) => params.validate(),
       DeleteChannel(params) => params.validate(),
@@ -1129,6 +1156,8 @@ impl Message {
       Message::BroadcastAck(params) => Some(params.id),
       Message::ChannelAcl(params) => Some(params.id),
       Message::ChannelConfiguration(params) => Some(params.id),
+      Message::Clear(params) => Some(params.id),
+      Message::ClearAck(params) => Some(params.id),
       Message::DeleteChannel(params) => Some(params.id),
       Message::DeleteChannelAck(params) => Some(params.id),
       Message::GetChannelAcl(params) => Some(params.id),
@@ -1250,6 +1279,18 @@ mod tests {
   #[test]
   fn channel_len_round_trip() {
     let original = Message::ChannelLen(ChannelLenParameters { id: 9, channel: "!c@localhost".into(), count: 42 });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn clear_round_trip() {
+    let original = Message::Clear(ClearParameters { id: 11, channel: "!c@localhost".into() });
+    assert_eq!(roundtrip(original.clone()), original);
+  }
+
+  #[test]
+  fn clear_ack_round_trip() {
+    let original = Message::ClearAck(ClearAckParameters { id: 11 });
     assert_eq!(roundtrip(original.clone()), original);
   }
 

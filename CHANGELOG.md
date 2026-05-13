@@ -4,7 +4,7 @@ All notable changes to Narwhal will be documented in this file.
 
 ## Unreleased
 
-* [ENHANCEMENT]: Add support for FIFO-type channels with at-most-once delivery via `PUSH` / `POP` / `GET_CHAN_LEN`. [#292](https://github.com/ortuman/narwhal/pull/292), [#298](https://github.com/ortuman/narwhal/pull/298)
+* [ENHANCEMENT]: Add support for FIFO-type channels with at-most-once delivery via `PUSH` / `POP` / `GET_CHAN_LEN` / `CLEAR`. [#292](https://github.com/ortuman/narwhal/pull/292), [#298](https://github.com/ortuman/narwhal/pull/298), [#299](https://github.com/ortuman/narwhal/pull/299)
 
 ## 0.6.1 (2026-05-01)
 
