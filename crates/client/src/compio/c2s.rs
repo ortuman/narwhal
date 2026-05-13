@@ -20,6 +20,7 @@ use super::common::{self, Handshaker};
 use super::dialer::{TlsDialer, TlsStream};
 use crate::auth::{AuthMethod, AuthenticatorFactory};
 use crate::config::{C2sConfig, C2sSessionExtraInfo, SessionInfo};
+use crate::conn_state::INBOUND_QUEUE_SIZE;
 use crate::types::{ChannelConfiguration, HistoryEntry, PaginatedList};
 
 /// Handshaker implementation for C2S client.
@@ -678,7 +679,10 @@ impl C2sClient {
   ///
   /// * `channel` - The channel to read history from.
   /// * `from_seq` - The earliest sequence number to return (1-based, inclusive).
-  /// * `limit` - Maximum number of entries to return (server may cap further).
+  /// * `limit` - Maximum number of entries to return. The client clamps this
+  ///   at `INBOUND_QUEUE_SIZE` (16384) before sending so the bounded
+  ///   collector channel cannot be sized from raw caller input. The server
+  ///   may also cap the response per its `max_history_limit` setting.
   pub async fn history(&self, channel: StringAtom, from_seq: u64, limit: u32) -> crate::Result<Vec<HistoryEntry>> {
     use narwhal_protocol::HistoryParameters;
 
@@ -688,11 +692,24 @@ impl C2sClient {
     // since both are unique per connection.
     let history_id = StringAtom::from(format!("h{}", id));
 
-    let message = Message::History(HistoryParameters { id, history_id: history_id.clone(), channel, from_seq, limit });
+    // Clamp `limit` at INBOUND_QUEUE_SIZE so a caller passing `u32::MAX`
+    // cannot make us allocate a multi-billion-slot collector channel and
+    // OOM before the request is even sent. We clamp on the wire too so the
+    // server returns at most this many entries, guaranteeing the collector
+    // has room for the full reply.
+    let effective_limit = limit.min(INBOUND_QUEUE_SIZE as u32);
 
-    // Bound the collector channel by `limit` plus a small head-room so the
-    // reader task never blocks pushing entries before HISTORY_ACK arrives.
-    let buffer_capacity = (limit as usize).saturating_add(1);
+    let message = Message::History(HistoryParameters {
+      id,
+      history_id: history_id.clone(),
+      channel,
+      from_seq,
+      limit: effective_limit,
+    });
+
+    // Collector capacity matches the server's worst-case reply (also bounded
+    // by `effective_limit` because we clamped above); the +1 is head-room.
+    let buffer_capacity = (effective_limit as usize).saturating_add(1);
     let (handle, collector) = self.client.send_history_request(history_id, message, buffer_capacity).await?;
     let (response, _) = handle.response().await?;
 
