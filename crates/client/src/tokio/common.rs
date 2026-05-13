@@ -19,12 +19,16 @@ use tracing::{debug, error, trace, warn};
 
 use super::dialer::Dialer;
 use crate::config::{Config, SessionInfo};
-use crate::conn_state::{ErrorState, INBOUND_QUEUE_SIZE, OUTBOUND_QUEUE_SIZE, PendingRequest, PendingRequests};
+use crate::conn_state::{
+  ErrorState, INBOUND_QUEUE_SIZE, OUTBOUND_QUEUE_SIZE, PendingHistories, PendingRequest, PendingRequests,
+};
 use crate::object_pool;
+use crate::types::HistoryEntry;
 use narwhal_protocol::{Message, PongParameters, deserialize, serialize};
 use narwhal_util::backoff::ExponentialBackoff;
 use narwhal_util::codec_tokio::StreamReader;
 use narwhal_util::pool::{MutablePoolBuffer, Pool, PoolBuffer};
+use narwhal_util::string_atom::StringAtom;
 
 use narwhal_common::service::Service;
 
@@ -217,6 +221,59 @@ where
   pub async fn inbound_stream(&self) -> Receiver<(Message, Option<PoolBuffer>)> {
     let mut inner = self.0.lock().await;
     inner.inbound_rx.take().expect("inbound_stream can only be called once")
+  }
+
+  /// Registers a HISTORY collector and sends `message` over the same
+  /// connection. Returns a `JoinHandle` resolving to the eventual server
+  /// response paired with a `HistoryCollector`: the handle resolves on
+  /// `HISTORY_ACK`, the collector's `entries_rx` yields the streamed
+  /// entries, and the collector unregisters automatically on drop.
+  ///
+  /// Used internally by `C2sClient::history`; not intended for direct use.
+  pub async fn send_history_request(
+    &self,
+    history_id: StringAtom,
+    message: Message,
+    buffer_capacity: usize,
+  ) -> anyhow::Result<(JoinHandle<anyhow::Result<(Message, Option<PoolBuffer>)>>, HistoryCollector)> {
+    let mut inner = self.0.lock().await;
+    if inner.config.max_idle_connections == 1 {
+      let conn = inner.get_or_create_connection().await?;
+      Self::register_and_send_history(&conn, history_id, message, buffer_capacity).await
+    } else {
+      let conn = inner.get_connection().await?;
+      Self::register_and_send_history(&conn, history_id, message, buffer_capacity).await
+    }
+  }
+
+  async fn register_and_send_history(
+    conn: &ClientConn<S, HS, ST>,
+    history_id: StringAtom,
+    message: Message,
+    buffer_capacity: usize,
+  ) -> anyhow::Result<(JoinHandle<anyhow::Result<(Message, Option<PoolBuffer>)>>, HistoryCollector)> {
+    let (tx, rx) = async_channel::bounded(buffer_capacity.max(1));
+    let pending_histories = conn.pending_histories.clone();
+    pending_histories.register(history_id.clone(), tx);
+
+    let handle = conn.send_message(message, None).await;
+
+    Ok((handle, HistoryCollector { entries_rx: rx, pending_histories, history_id }))
+  }
+}
+
+/// RAII guard owning the receiving end of a HISTORY collector. Dropping the
+/// guard unregisters the `history_id` from the connection's `pending_histories`
+/// map, regardless of whether the caller drained `entries_rx`.
+pub struct HistoryCollector {
+  pub entries_rx: async_channel::Receiver<HistoryEntry>,
+  pending_histories: PendingHistories,
+  history_id: StringAtom,
+}
+
+impl Drop for HistoryCollector {
+  fn drop(&mut self) {
+    self.pending_histories.unregister(&self.history_id);
   }
 }
 
@@ -602,6 +659,9 @@ where
   /// Pending requests map, used to track requests that are waiting for a response.
   pending_requests: PendingRequests,
 
+  /// Pending HISTORY collectors, keyed by `history_id`.
+  pending_histories: PendingHistories,
+
   /// The sender for the writer task.
   writer_tx: Option<Sender<(Message, Option<PoolBuffer>)>>,
 
@@ -647,6 +707,7 @@ where
       session_info: None,
       inflight_requests_sem: None,
       pending_requests: PendingRequests::new(),
+      pending_histories: PendingHistories::new(),
       writer_tx: None,
       task_tracker,
       shutdown_token,
@@ -710,6 +771,7 @@ where
       message_pool.acquire_buffer().await,
       payload_pool,
       self.pending_requests.clone(),
+      self.pending_histories.clone(),
       self.error_state.clone(),
       writer_tx.clone(),
       self.inbound_tx.clone(),
@@ -867,6 +929,7 @@ where
     read_buffer: MutablePoolBuffer,
     payload_buffer_pool: Pool,
     pending_requests: PendingRequests,
+    pending_histories: PendingHistories,
     error_state: ErrorState,
     writer_tx: Sender<(Message, Option<PoolBuffer>)>,
     inbound_tx: Sender<(Message, Option<PoolBuffer>)>,
@@ -921,9 +984,30 @@ where
                             }
                         }
                     } else {
+                        // Unsolicited inbound message: no correlation id. May be
+                        // a broadcast `MESSAGE` to deliver to inbound_stream, or a
+                        // HISTORY-replay `MESSAGE` whose `history_id` is registered
+                        // for in-flight collection.
                         match res {
                             Ok((msg, payload_opt)) => {
-                                if let Err(e) = inbound_tx.try_send((msg, payload_opt)) {
+                                let history_sender = if let Message::Message(params) = &msg {
+                                    params.history_id.as_ref().and_then(|hid| pending_histories.get_sender(hid))
+                                } else {
+                                    None
+                                };
+                                if let Some(sender) = history_sender {
+                                    if let (Message::Message(params), Some(payload)) = (msg, payload_opt) {
+                                        let entry = HistoryEntry {
+                                            from: params.from,
+                                            seq: params.seq,
+                                            timestamp: params.timestamp,
+                                            payload,
+                                        };
+                                        if let Err(e) = sender.try_send(entry) {
+                                            warn!(client_id = client_id.as_str(), connection_id = conn_id, service_type = ST::NAME, error = ?e, "dropped history entry: collector channel full or closed");
+                                        }
+                                    }
+                                } else if let Err(e) = inbound_tx.try_send((msg, payload_opt)) {
                                     warn!(client_id = client_id.as_str(), connection_id = conn_id, service_type = ST::NAME, error = ?e, "dropped inbound message: channel full or closed");
                                 }
                             },

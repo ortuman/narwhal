@@ -42,6 +42,7 @@ pub(crate) mod config;
 pub(crate) mod conn_state;
 pub mod error;
 pub(crate) mod object_pool;
+pub mod types;
 
 pub mod compio;
 pub mod tokio;
@@ -54,3 +55,5 @@ pub use config::{
 };
 
 pub use error::{Error, Result};
+
+pub use types::{ChannelConfiguration, HistoryEntry, PaginatedList};

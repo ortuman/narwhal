@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_channel::Sender as AcSender;
 use async_lock::SemaphoreGuardArc;
 use futures_channel::oneshot;
 use parking_lot::Mutex as PlMutex;
@@ -10,6 +11,9 @@ use parking_lot::RwLock as PlRwLock;
 
 use narwhal_protocol::Message;
 use narwhal_util::pool::PoolBuffer;
+use narwhal_util::string_atom::StringAtom;
+
+use crate::types::HistoryEntry;
 
 pub(crate) const OUTBOUND_QUEUE_SIZE: usize = 4 * 1024;
 
@@ -87,5 +91,37 @@ impl PendingRequests {
   #[inline]
   pub fn remove(&self, correlation_id: &u32) -> Option<PendingRequest> {
     self.0.write().remove(correlation_id)
+  }
+}
+
+/// Thread-safe map of `history_id` → `Sender<HistoryEntry>` for in-flight
+/// `HISTORY` requests. The reader task routes inbound `MESSAGE` frames whose
+/// `history_id` is registered here to the per-request channel instead of the
+/// general `inbound_stream`, so callers of `history()` see a coherent reply
+/// even while concurrent broadcasts are flowing.
+#[derive(Clone)]
+pub(crate) struct PendingHistories(Arc<PlRwLock<HashMap<StringAtom, AcSender<HistoryEntry>>>>);
+
+impl PendingHistories {
+  pub fn new() -> Self {
+    Self(Arc::new(PlRwLock::new(HashMap::new())))
+  }
+
+  #[inline]
+  pub fn register(&self, history_id: StringAtom, sender: AcSender<HistoryEntry>) {
+    self.0.write().insert(history_id, sender);
+  }
+
+  /// Returns a clone of the `Sender` registered for `history_id`, if any.
+  /// The reader task uses this to route a single MESSAGE frame; the entry is
+  /// not removed from the map (multiple frames share the same collector).
+  #[inline]
+  pub fn get_sender(&self, history_id: &StringAtom) -> Option<AcSender<HistoryEntry>> {
+    self.0.read().get(history_id).cloned()
+  }
+
+  #[inline]
+  pub fn unregister(&self, history_id: &StringAtom) {
+    self.0.write().remove(history_id);
   }
 }

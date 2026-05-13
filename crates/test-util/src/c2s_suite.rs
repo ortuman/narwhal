@@ -186,6 +186,14 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> C2sSuite<CS, MLF> {
     self.config.clone()
   }
 
+  /// Returns the listener's bound socket address. Available after `setup()`
+  /// completes; useful for tests that connect a real `narwhal_client::*::c2s::C2sClient`
+  /// to the suite-managed server instead of using the suite's raw test
+  /// connections.
+  pub fn local_address(&self) -> Option<std::net::SocketAddr> {
+    self.ln.local_address()
+  }
+
   pub async fn setup(&mut self) -> anyhow::Result<()> {
     if let Some(m2s_payload_rx) = self.m2s_payload_rx.take() {
       self.m2s_router_task_handle = Some(c2s::route_m2s_private_payload(m2s_payload_rx, self.local_router.clone()));
