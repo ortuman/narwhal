@@ -1948,7 +1948,13 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
       return Err(narwhal_protocol::Error::new(QueueFull).with_id(correlation_id).into());
     }
 
-    let seq = channel.next_seq();
+    // Peek the next seq WITHOUT bumping the counter. If append fails the
+    // counter must stay put: otherwise the next successful PUSH leaves a gap
+    // in the log between the previous tail and the new tail, and POP would
+    // read past the gap and double-deliver the later entry (cursor advances
+    // by one, but `read(from_seq=N, 1, ...)` returns the entry at the next
+    // seq >= N, not strictly at N).
+    let seq = channel.seq;
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
     let msg = Message::Message(MessageParameters {
       from: (&nid).into(),
@@ -1962,6 +1968,8 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
     // FIFO mode disables tail-eviction inside the log; pass 0 to make the
     // intent explicit (no `max_messages`-driven eviction on PUSH).
     channel.message_log.append(&msg, &payload, 0).await?;
+    // Append committed: claim the seq by bumping the channel counter.
+    channel.seq = seq + 1;
 
     let flush_interval = channel.config.message_flush_interval.unwrap_or(0);
     if flush_interval == 0 {
@@ -1997,7 +2005,7 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
 
     let handler = channel_id.handler.clone();
 
-    let captured = {
+    let (cursor_next_seq, captured) = {
       let Some(channel) = self.channels.get(&handler) else {
         self.metrics.fifo_pops.get_or_create(&FIFO_CHANNEL_NOT_FOUND).inc();
         return Err(narwhal_protocol::Error::new(ChannelNotFound).with_id(correlation_id).into());
@@ -2044,12 +2052,37 @@ impl<CS: ChannelStore, MLF: MessageLogFactory> ChannelShard<CS, MLF> {
 
       let mut visitor = PopVisitor { pool: &self.history_pool, captured: None };
       channel.message_log.read(cursor_next_seq, 1, &mut visitor).await?;
-      visitor
+      let entry = visitor
         .captured
-        .ok_or_else(|| anyhow::anyhow!("fifo pop: log.read returned no entry at seq {cursor_next_seq}"))?
+        .ok_or_else(|| anyhow::anyhow!("fifo pop: log.read returned no entry at seq {cursor_next_seq}"))?;
+      (cursor_next_seq, entry)
     };
 
-    let (payload, length, timestamp) = captured;
+    // `MessageLog::read(from_seq, ...)` returns the first entry with
+    // `seq >= from_seq`, NOT strictly at `from_seq`. If the log has a gap at
+    // the cursor (e.g. a prior failed append left `channel.seq` ahead of the
+    // log tail before that path was fixed, or external corruption), the read
+    // would silently return a later entry. Advancing the cursor by one in
+    // that case would re-read the same later entry on the next POP, causing
+    // duplicate delivery. Refuse to advance and bubble up an internal error
+    // instead; an operator-driven path (DELETE / CLEAR in PR 3) can heal it.
+    if captured.seq != cursor_next_seq {
+      let entry_seq = captured.seq;
+      tracing::error!(
+        channel = %handler,
+        cursor_next_seq,
+        entry_seq,
+        "fifo pop: log returned an entry at a higher seq than the cursor; refusing to advance to avoid duplicate delivery"
+      );
+      return Err(
+        narwhal_protocol::Error::new(InternalServerError)
+          .with_id(correlation_id)
+          .with_detail("fifo log has a gap at the head cursor")
+          .into(),
+      );
+    }
+
+    let PopEntry { payload, length, timestamp, .. } = captured;
 
     let new_next_seq = {
       let channel = self.channels.get_mut(&handler).expect("channel disappeared between pop phases");
@@ -2996,13 +3029,23 @@ impl ChannelAcl {
   }
 }
 
-/// Visitor that captures a single log entry's payload + timestamp for the FIFO
-/// `POP` path. The visitor copies the payload into a pooled buffer so the
-/// entry borrow ends with `visit()`, leaving the captured tuple owned and
-/// usable past the read.
+/// Visitor that captures a single log entry's seq, payload, and timestamp for
+/// the FIFO `POP` path. The visitor copies the payload into a pooled buffer
+/// so the entry borrow ends with `visit()`, leaving the captured tuple owned
+/// and usable past the read. The `seq` is kept so the POP handler can verify
+/// the entry it actually got matches the seq it asked for: a mismatch means
+/// the log has a gap below the tail and we must refuse to advance the
+/// cursor (would otherwise lead to duplicate delivery of the later entry).
 struct PopVisitor<'a> {
   pool: &'a Pool,
-  captured: Option<(PoolBuffer, u32, u64)>,
+  captured: Option<PopEntry>,
+}
+
+struct PopEntry {
+  seq: u64,
+  payload: PoolBuffer,
+  length: u32,
+  timestamp: u64,
 }
 
 #[async_trait(?Send)]
@@ -3012,7 +3055,7 @@ impl LogVisitor for PopVisitor<'_> {
     let mut buf = self.pool.acquire_buffer().await;
     buf.as_mut_slice()[..len].copy_from_slice(entry.payload);
     let payload = buf.freeze(len);
-    self.captured = Some((payload, len as u32, entry.timestamp));
+    self.captured = Some(PopEntry { seq: entry.seq, payload, length: len as u32, timestamp: entry.timestamp });
     Ok(())
   }
 }
