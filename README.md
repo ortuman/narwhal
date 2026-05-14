@@ -4,9 +4,9 @@
        alt="walrus"
        width="25%">
 
-[![CI](https://img.shields.io/github/actions/workflow/status/lonewolf-io/narwhal/ci.yaml?branch=main)](https://github.com/lonewolf-io/narwhal/actions)
-[![Releases](https://img.shields.io/github/v/release/lonewolf-io/narwhal?include_prereleases)](https://github.com/lonewolf-io/narwhal/releases)
-[![LICENSE](https://img.shields.io/github/license/lonewolf-io/narwhal)](https://github.com/lonewolf-io/narwhal/blob/master/LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/ortuman/narwhal/ci.yaml?branch=main)](https://github.com/ortuman/narwhal/actions)
+[![Releases](https://img.shields.io/github/v/release/ortuman/narwhal?include_prereleases)](https://github.com/ortuman/narwhal/releases)
+[![LICENSE](https://img.shields.io/github/license/ortuman/narwhal)](https://github.com/ortuman/narwhal/blob/master/LICENSE)
 
 </div>
 
@@ -60,7 +60,7 @@ https://github.com/user-attachments/assets/bda491a0-a51b-4aaf-9ec8-3b3e7948d5ce
 #### Building from Source
 
 ```bash
-git clone https://github.com/lonewolf-io/narwhal.git
+git clone https://github.com/ortuman/narwhal.git
 cd narwhal
 cargo build --release
 ```
@@ -253,5 +253,5 @@ This project is licensed under the BSD-3-Clause License - see the [LICENSE](LICE
 
 ## Community
 
-- **Issues**: [GitHub Issues](https://github.com/lonewolf-io/narwhal/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/lonewolf-io/narwhal/discussions)
+- **Issues**: [GitHub Issues](https://github.com/ortuman/narwhal/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/ortuman/narwhal/discussions)

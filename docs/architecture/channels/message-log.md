@@ -1,7 +1,7 @@
 # Message Log: Architecture Specification
 
 > **Status:** Implemented.
-> **Related PRs:** [#221](https://github.com/lonewolf-io/narwhal/pull/221) (HISTORY/CHAN_SEQ protocol), [#227](https://github.com/lonewolf-io/narwhal/pull/227) (FileMessageLog implementation)
+> **Related PRs:** [#221](https://github.com/ortuman/narwhal/pull/221) (HISTORY/CHAN_SEQ protocol), [#227](https://github.com/ortuman/narwhal/pull/227) (FileMessageLog implementation)
 
 ## Table of Contents
 
